@@ -124,3 +124,7 @@ $ cargo test -p ferricdb-storage -- --include-ignored ms1_   # begin milestone 1
 Then open `course/index.html`, read the Milestone 0 page, and work forward.
 Keep [`docs/api-spec.md`](docs/api-spec.md) open in a tab —
 it is the contract every test compiles against.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
