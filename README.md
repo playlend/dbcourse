@@ -83,3 +83,13 @@ The course design draws on [CMU 15-445/BusTub](https://github.com/cmu-db/bustub)
 and [mini-lsm](https://github.com/skyzh/mini-lsm). Attribution and
 academic-integrity rules for adapted code are spelled out in the
 [starter README](course/ferricdb/README.md).
+
+## License
+
+Everything in this repository — course text, diagrams, and code — is released
+under the [MIT License](LICENSE). The starter workspace carries
+[its own copy](course/ferricdb/LICENSE) so the split-out starter repository
+stays licensed.
+
+FerricDB is an independent educational project, not affiliated with or
+endorsed by the PostgreSQL Global Development Group.
