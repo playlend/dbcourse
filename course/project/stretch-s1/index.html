@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stretch S1 · Lock Manager and Row Locks (SELECT FOR UPDATE) — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Stretch S1</span>
+  </nav>
+  <span class="badge stretch">Stretch S1</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Stretch S1 · Lock Manager and Row Locks (SELECT FOR UPDATE)</h1>
+  <p class="subtitle">Add pessimistic concurrency control to FerricDB: a shared/exclusive row-lock
+  manager with wait queues, <code>SELECT ... FOR UPDATE</code> from SQL, and deadlock handling on
+  top of the MVCC engine you built in Milestone 8.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <p>Milestone 8 gave FerricDB <em>optimistic</em> concurrency control: every transaction reads
+  from its own snapshot, and write-write conflicts are caught at commit time by
+  first-committer-wins. That is also the shape of CMU's current concurrency-control project, which
+  detects conflicts through tuple timestamps instead of locks.<sup class="cite"><a href="#ref-5">5</a></sup>
+  This stretch builds the <em>pessimistic</em> counterpart that earlier editions of the same
+  project made famous:<sup class="cite"><a href="#ref-2">2</a></sup> a centralized lock manager
+  that grants shared and exclusive row locks, queues the transactions it cannot yet serve, and
+  breaks the deadlocks that queuing inevitably creates.</p>
+
+  <p>Fair warning: this is concurrent systems programming. The failure modes are hangs, races,
+  and tests that pass 99 times out of 100 — not wrong answers. It is also one of the most
+  satisfying pieces of the whole project to get right. Unlike the core milestones, this page is a
+  spec with pointers rather than a walkthrough: you design the internals.</p>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li>Implement a lock manager that grants shared and exclusive row locks, with a per-row wait
+        queue and strict two-phase release at commit/abort.</li>
+    <li>Extend the lexer, parser, planner, and executor so <code>SELECT ... FOR UPDATE</code>
+        acquires exclusive row locks on the rows it returns.</li>
+    <li>Explain how row locks coexist with MVCC snapshot reads: plain readers never block, while
+        writers and lockers of the same row serialize.</li>
+    <li>Handle deadlocks by waits-for-graph detection or wound-wait prevention, aborting a victim
+        transaction with a clear, retryable error.</li>
+    <li>Distinguish latches (short-term, protect the lock manager's own structures) from locks
+        (transaction-lifetime, protect database rows) — and never hold the former while waiting
+        for the latter.</li>
+    <li>Write multi-threaded tests that assert blocking, parallelism, deadlock recovery, and lock
+        release without depending on timing luck.</li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m09-transactions-mvcc/index.html">M09 · Transactions &amp; MVCC</a>
+        — snapshots, visibility, and first-committer-wins; everything here layers on top of
+        it.</li>
+    <li>CMU 15-445 Lecture #18 notes, “Two-Phase Locking” — lock modes, strict 2PL, waits-for
+        graphs, wait-die and wound-wait.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li>CMU 15-445 Project #4 (Fall 2022 edition), “Concurrency Control” — the classic
+        lock-manager project spec: request queues, condition variables, and deadlock detection.
+        (The current Fall 2025 edition builds MVCC instead — that is your Milestone 8.)<sup
+        class="cite"><a href="#ref-2">2</a></sup></li>
+    <li>PostgreSQL docs §13.2, “Transaction Isolation” — what <code>FOR UPDATE</code> does when
+        the row it wants is concurrently updated, at each isolation level.<sup class="cite"><a
+        href="#ref-3">3</a></sup></li>
+    <li>PostgreSQL docs §13.3, “Explicit Locking” — the four row-level lock modes, their conflict
+        table, and Postgres's deadlock behavior.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — FerricDB architecture. Every component is built; this stretch deepens
+    three of them: <code>crates/txn</code> gains a <code>LockManager</code> beside the
+    <code>TransactionManager</code>, <code>crates/sql</code> learns the <code>FOR UPDATE</code>
+    clause, and <code>crates/exec</code> acquires locks during execution.</figcaption>
+  </figure>
+
+  <p>Nothing new appears on the diagram because a lock manager is invisible plumbing: it is a
+  service the executor and transaction manager call into. The lock manager's state is pure memory
+  and deliberately non-durable — any transaction still active at a crash is aborted by recovery
+  anyway, so there is nothing to persist.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <h2 id="sec-spec">Specification</h2>
+
+  <h3 id="spec-scope">Scope</h3>
+  <p>Real lock managers support a granularity hierarchy — database, table, page, tuple — glued
+  together with intention locks (IS, IX, SIX) so that coarse and fine locks can coexist,<sup
+  class="cite"><a href="#ref-1">1</a></sup> and the BusTub project requires all five modes plus
+  table/row leveling.<sup class="cite"><a href="#ref-2">2</a></sup> FerricDB scopes this down as a
+  course choice: <strong>row locks only, two modes</strong> (<code>Shared</code>,
+  <code>Exclusive</code>). Our DDL is not concurrency-safe anyway, so table-level protection buys
+  little here; the interesting machinery — queues, blocking, deadlocks — is all present at row
+  granularity.</p>
+  <ul>
+    <li><strong>Modes.</strong> A shared lock lets multiple transactions hold it on the same row
+        simultaneously; an exclusive lock admits exactly one holder and conflicts with every other
+        request.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Release policy.</strong> Strong strict 2PL: a transaction releases locks only when
+        it commits or aborts, never earlier. This forgoes some concurrency but rules out cascading
+        aborts.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Plain <code>SELECT</code> never locks.</strong> Snapshot visibility already gives
+        consistent reads; this mirrors Postgres, where “row-level locks do not affect data
+        querying; they block only writers and lockers to the same row”.<sup class="cite"><a
+        href="#ref-4">4</a></sup></li>
+    <li><strong><code>SELECT ... FOR UPDATE</code> takes exclusive locks</strong> on the rows it
+        returns, so a read-modify-write sequence holds the row from the read onward. In Postgres,
+        <code>FOR UPDATE</code> is the strongest of four row modes and conflicts with all of
+        them.<sup class="cite"><a href="#ref-4">4</a></sup> We implement only this one (course
+        choice; <code>FOR SHARE</code> maps onto <code>lock_shared</code> if you want it).</li>
+    <li><strong><code>UPDATE</code>/<code>DELETE</code> also lock.</strong> Give them exclusive
+        locks on the rows they modify, or <code>FOR UPDATE</code> would exclude other lockers but
+        not actual writers. First-committer-wins stays on as the commit-time backstop.</li>
+    <li><strong>Lock table lives in memory.</strong> Postgres avoids a per-row lock table by
+        marking locked tuples on disk, which is why it can lock unlimited rows at the cost of disk
+        writes;<sup class="cite"><a href="#ref-4">4</a></sup> FerricDB keeps an in-memory map —
+        simpler, bounded by memory, fine at our scale (course choice).</li>
+  </ul>
+
+  <h3 id="spec-api">Existing surface you build on (from <code>api-spec.md</code>)</h3>
+  <pre><code>// crates/common
+pub type TxnId = u64;                        // 0 = "invalid/none"
+
+/// Physical tuple address: (page, slot) — Postgres calls this the ctid.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct RecordId { pub page_id: PageId, pub slot: u16 }
+
+// crates/txn
+pub struct TransactionManager { /* next txid, states, active set */ }
+impl TransactionManager {
+    pub fn new() -> Self;
+    pub fn begin(&amp;self) -&gt; std::sync::Arc&lt;Transaction&gt;;
+    /// First-committer-wins: Err(Error::Serialization) if the write set
+    /// intersects a concurrently-committed transaction's writes.
+    pub fn commit(&amp;self, txn: &amp;Transaction) -&gt; Result&lt;()&gt;;
+    pub fn abort(&amp;self, txn: &amp;Transaction);
+}</code></pre>
+
+  <h3 id="spec-sketch">Suggested API additions (design sketch — not a provided stub)</h3>
+  <p>The starter workspace ships no lock-manager code and no S1 tests. The sketch below is one
+  reasonable surface, in the style of <code>api-spec.md</code>; you own this design and may change
+  anything about it.</p>
+  <pre><code>// crates/txn — SUGGESTED design sketch for Stretch S1 (you own this API)
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LockMode { Shared, Exclusive }
+
+/// Row-granularity lock manager: strong strict 2PL over RecordIds.
+/// Locks are held until commit/abort and released all at once.
+pub struct LockManager { /* latched map: RecordId -&gt; per-row queue */ }
+
+impl LockManager {
+    pub fn new() -&gt; Self;
+
+    /// Block until `txn` holds a shared lock on `rid`. Returns
+    /// Err(Error::Serialization) if `txn` is chosen as a deadlock
+    /// victim while waiting.
+    pub fn lock_shared(&amp;self, txn: TxnId, rid: RecordId) -&gt; Result&lt;()&gt;;
+
+    /// Block until `txn` holds an exclusive lock on `rid`.
+    /// Same error contract as lock_shared.
+    pub fn lock_exclusive(&amp;self, txn: TxnId, rid: RecordId) -&gt; Result&lt;()&gt;;
+
+    /// Release every lock `txn` holds and wake affected waiters.
+    /// Called from TransactionManager::commit and ::abort so that
+    /// every exit path releases locks.
+    pub fn unlock_all(&amp;self, txn: TxnId);
+}
+
+// crates/sql — suggested AST change: one new field
+pub struct Select {
+    /* existing fields unchanged (see api-spec.md) */
+    pub for_update: bool,    // SELECT ... FOR UPDATE
+}</code></pre>
+  <p>Semantic notes on the sketch:</p>
+  <ul>
+    <li>Reusing <code>Error::Serialization</code> for deadlock victims is a course choice: it is
+        already FerricDB's “retry the transaction” error, matching how Postgres clients are told
+        to handle serialization failures (SQLSTATE 40001) by retrying from the start.<sup
+        class="cite"><a href="#ref-3">3</a></sup> Make the message unmistakable, e.g.
+        <code>"deadlock detected: transaction 42 aborted"</code>.</li>
+    <li>Both <code>lock_*</code> calls must be idempotent for a lock already held by
+        <code>txn</code>, and <code>&amp;self</code> throughout — the manager is shared across
+        threads behind an <code>Arc</code>, like the other managers in
+        <code>ExecContext</code>.</li>
+    <li>In BusTub's version, any failed lock request implicitly aborts the transaction;<sup
+        class="cite"><a href="#ref-2">2</a></sup> mirror that: once <code>lock_*</code> returns an
+        error, the executor stops and the session runs <code>TransactionManager::abort</code>.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table>
+      <caption>Lock compatibility — request vs. locks already granted on the same row.<sup class="cite"><a href="#ref-1">1</a></sup></caption>
+      <thead>
+        <tr><th>requesting ↓ / granted →</th><th>Shared</th><th>Exclusive</th></tr>
+      </thead>
+      <tbody>
+        <tr><th>Shared</th><td>grant</td><td>wait</td></tr>
+        <tr><th>Exclusive</th><td>wait</td><td>wait</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 940 330" role="img">
+      <title>Lock table structure: a latched map from RecordId to per-row queues, each holding granted requests and waiting requests that sleep on a condition variable.</title>
+      <text x="150" y="34" text-anchor="middle" class="d-text">lock table — one latched map</text>
+      <rect x="24" y="46" width="252" height="252" rx="8" class="d-box"/>
+      <text x="150" y="74" text-anchor="middle" class="d-mono-sm">Mutex&lt;HashMap&lt;RecordId, …&gt;&gt;</text>
+      <rect x="48" y="96" width="204" height="44" rx="6" class="d-box"/>
+      <text x="150" y="122" text-anchor="middle" class="d-mono-sm">{ page_id: 3, slot: 7 }</text>
+      <rect x="48" y="200" width="204" height="44" rx="6" class="d-box"/>
+      <text x="150" y="226" text-anchor="middle" class="d-mono-sm">{ page_id: 5, slot: 2 }</text>
+      <text x="150" y="284" text-anchor="middle" class="d-text-sm">latch held only to find or</text>
+      <text x="150" y="298" text-anchor="middle" class="d-text-sm">insert a queue — never to wait</text>
+
+      <path d="M 252 118 H 324" class="d-line"/>
+      <polygon points="332,118 320,112 320,124" style="fill: var(--text-muted)"/>
+      <path d="M 252 222 H 324" class="d-line"/>
+      <polygon points="332,222 320,216 320,228" style="fill: var(--text-muted)"/>
+
+      <rect x="332" y="78" width="584" height="102" rx="8" class="d-box"/>
+      <text x="348" y="100" class="d-text-sm">per-row queue — own Mutex + Condvar; waiters sleep here</text>
+      <text x="348" y="120" class="d-text-sm">granted</text>
+      <rect x="348" y="128" width="110" height="38" rx="6" class="d-box-good"/>
+      <text x="403" y="152" text-anchor="middle" class="d-mono-sm">T17 · S</text>
+      <rect x="470" y="128" width="110" height="38" rx="6" class="d-box-good"/>
+      <text x="525" y="152" text-anchor="middle" class="d-mono-sm">T22 · S</text>
+      <path d="M 616 110 V 172" class="d-line" stroke-dasharray="4 4"/>
+      <text x="640" y="120" class="d-text-sm">waiting (FIFO)</text>
+      <rect x="640" y="128" width="110" height="38" rx="6" class="d-box-warn"/>
+      <text x="695" y="152" text-anchor="middle" class="d-mono-sm">T31 · X</text>
+
+      <rect x="332" y="196" width="584" height="102" rx="8" class="d-box"/>
+      <text x="348" y="218" class="d-text-sm">per-row queue</text>
+      <text x="348" y="238" class="d-text-sm">granted</text>
+      <rect x="348" y="246" width="110" height="38" rx="6" class="d-box-good"/>
+      <text x="403" y="270" text-anchor="middle" class="d-mono-sm">T35 · X</text>
+      <path d="M 616 228 V 290" class="d-line" stroke-dasharray="4 4"/>
+      <text x="640" y="238" class="d-text-sm">waiting (FIFO)</text>
+      <rect x="640" y="246" width="110" height="38" rx="6" class="d-box-warn"/>
+      <text x="695" y="270" text-anchor="middle" class="d-mono-sm">T17 · S</text>
+    </svg>
+    <figcaption>Figure 2 — Suggested two-level lock table. The map latch is short-term: look up or
+    create the row's queue, then release it. All blocking happens on the queue's own condition
+    variable. In the state shown, T17 and T22 share row {3,7} while T31 queues for exclusive
+    access; T35 holds row {5,2} exclusively while T17 waits — so T31 waits for T17 and T22, and
+    T17 waits for T35. No cycle yet.</figcaption>
+  </figure>
+
+  <h3 id="spec-mvcc">Interaction with MVCC</h3>
+  <p>Locking a row and reading a version of it are different things, and the seam between them is
+  where the design work lives. When your <code>FOR UPDATE</code> finally gets its lock, the row
+  may have been updated by the transaction you were waiting on. Postgres resolves this per
+  isolation level, and both behaviors are worth knowing:<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  <ul>
+    <li><strong>Read Committed</strong>: the waiter re-evaluates the <code>WHERE</code> clause
+        against the <em>updated</em> version of the row, and if it still matches, it is the
+        updated version that gets locked and returned.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>Repeatable Read</strong>: if the transaction you waited on committed a real change
+        to the row, you fail with <code>ERROR: could not serialize access due to concurrent
+        update</code> and must retry the whole transaction.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+  </ul>
+  <p><strong>Course choice: implement the Repeatable Read rule.</strong> FerricDB transactions
+  read from a fixed snapshot (Milestone 8), which is Repeatable Read's model, and the rule is much
+  simpler: after the lock is granted, re-read the tuple's <code>TupleMeta</code>; if a committed
+  transaction set <code>xmax</code> on the version your snapshot saw, return
+  <code>Error::Serialization</code>. No <code>WHERE</code> re-evaluation machinery needed.</p>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <ol>
+    <li><strong>Write your scope down first.</strong> One paragraph in
+        <code>crates/txn/src/lock.rs</code>: modes, granularity, release policy, deadlock
+        strategy, and what happens to a victim. Every hang you debug later gets measured against
+        this paragraph. <em>Hint:</em> decide now whether a transaction re-requesting a lock it
+        already holds is a no-op (recommended) and what <code>S</code>-then-<code>X</code> on the
+        same row does (see the pitfalls).</li>
+    <li><strong>Build the two-level lock table.</strong> An outer latched map from
+        <code>RecordId</code> to a per-row queue; each queue has its own mutex, a condition
+        variable, a granted set (txn + mode), and a FIFO list of waiters (Figure 2). This is
+        BusTub's <code>LockRequestQueue</code> shape, condition variable included.<sup
+        class="cite"><a href="#ref-2">2</a></sup> <em>Hint:</em> wrap the queue in an
+        <code>Arc</code> so you can clone it out of the map and drop the map latch before doing
+        anything slow.</li>
+    <li><strong>Implement <code>lock_shared</code> / <code>lock_exclusive</code>.</strong> Grant
+        when the mode is compatible with all granted requests <em>and</em> no one is ahead in the
+        queue — plain FIFO (course choice) keeps writers from starving behind a stream of readers.
+        Otherwise append a waiter and loop on the condition variable:
+        <code>wait → recheck grant condition → wait…</code>. <em>Hint:</em> use
+        <code>Condvar::wait_while</code>; spurious wakeups are real.</li>
+    <li><strong>Implement <code>unlock_all</code> and wire it into commit and abort.</strong>
+        Strong strict 2PL means this is the <em>only</em> release path.<sup class="cite"><a
+        href="#ref-1">1</a></sup> Keep a per-transaction set of held <code>RecordId</code>s so
+        release is O(locks held), then <code>notify_all</code> each affected queue and let waiters
+        re-check. Call it from <code>TransactionManager::commit</code> (success <em>and</em>
+        first-committer-wins failure) and <code>TransactionManager::abort</code>.</li>
+    <li><strong>Pick a deadlock strategy and build it.</strong> Both are acceptable; say which you
+        chose in your scope paragraph.
+      <ul>
+        <li><em>Detection:</em> build a waits-for graph — one node per transaction, an edge
+            T<sub>i</sub> → T<sub>j</sub> when T<sub>i</sub> waits for a lock T<sub>j</sub> holds
+            — and check it for cycles periodically from a background thread.<sup class="cite"><a
+            href="#ref-1">1</a></sup> On a cycle, abort a victim; BusTub mandates the youngest
+            transaction.<sup class="cite"><a href="#ref-2">2</a></sup> Outline, paraphrasing the
+            lecture's description<sup class="cite"><a href="#ref-1">1</a></sup> and BusTub's
+            victim rule:<sup class="cite"><a href="#ref-2">2</a></sup>
+            <pre><code>every T ms (background thread):
+    G ← empty digraph
+    for each row queue Q:
+        for each waiting request w in Q:
+            for each granted g in Q incompatible with w:
+                add edge (w.txn → g.txn) to G
+    while G contains a cycle (DFS):
+        v ← youngest txn on the cycle
+        mark v as victim; notify v's queue
+        remove v from G</code></pre></li>
+        <li><em>Prevention (wound-wait, “young waits for old”):</em> priorities come from
+            transaction age — older means higher priority. If the requester is older than an
+            incompatible holder, the younger holder is wounded (aborted) and releases its locks;
+            otherwise the requester waits. A restarted transaction keeps its original timestamp so
+            it cannot starve.<sup class="cite"><a href="#ref-1">1</a></sup> FerricDB's
+            monotonically increasing <code>TxnId</code> is a ready-made age.</li>
+      </ul>
+        <em>Hint:</em> a victim is, by definition, blocked inside <code>lock_*</code>. Deliver the
+        verdict through a <code>victim</code> flag on its wait entry, <code>notify_all</code>, and
+        have the wait loop check the flag and return <code>Err(Error::Serialization)</code>.</li>
+    <li><strong>Parse <code>SELECT ... FOR UPDATE</code>.</strong> Add a <code>FOR</code> keyword
+        to the lexer (<code>UPDATE</code> already exists), accept the clause only at the end of a
+        top-level <code>SELECT</code>, and set <code>Select::for_update</code>. Reject it inside
+        subqueries or on aggregate queries — locking “the rows” of a <code>GROUP BY</code> result
+        has no meaning (Postgres restricts the locking clause similarly).</li>
+    <li><strong>Acquire locks in the executor.</strong> Thread <code>for_update</code> through the
+        binder and planner to the scan. For each row that passes visibility and the filter, call
+        <code>lock_exclusive(txn, rid)</code>, then apply the Repeatable Read re-check from the
+        specification before emitting the row. <em>Hint:</em> lock <em>after</em> the predicate
+        passes — locking every scanned row turns a selective query into a table lock in
+        disguise.</li>
+    <li><strong>Give <code>UPDATE</code> and <code>DELETE</code> the same treatment.</strong>
+        Exclusive-lock each target row before writing the new version. Watch what changes in the
+        Milestone 8 conflict tests: write-write conflicts that used to abort at commit now mostly
+        surface earlier as lock waits — one writer blocks, then hits the re-check or
+        first-committer-wins. The final outcome (one winner, one
+        <code>Error::Serialization</code>) must not change.</li>
+    <li><strong>Stress it.</strong> N threads, each: <code>BEGIN</code>; <code>SELECT balance FROM
+        acct WHERE id = 1 FOR UPDATE</code>; add 1; <code>UPDATE</code>; <code>COMMIT</code>
+        (retry on serialization errors). The final balance must be exactly N. This is the
+        read-modify-write pattern <code>FOR UPDATE</code> exists for: taking the exclusive lock at
+        the read means you never grab S first and then fail upgrading to X.<sup class="cite"><a
+        href="#ref-1">1</a></sup></li>
+  </ol>
+
+  <figure>
+    <svg viewBox="0 0 700 230" role="img">
+      <title>Waits-for graph with a two-transaction cycle: T8 waits for T9 and T9 waits for T8; the younger transaction T9 is chosen as the deadlock victim and aborted.</title>
+      <rect x="100" y="70" width="150" height="64" rx="10" class="d-box"/>
+      <text x="175" y="96" text-anchor="middle" class="d-text">T8 (older)</text>
+      <text x="175" y="116" text-anchor="middle" class="d-text-sm">holds X on r1</text>
+      <rect x="450" y="70" width="150" height="64" rx="10" class="d-box"/>
+      <text x="525" y="96" text-anchor="middle" class="d-text">T9 (younger)</text>
+      <text x="525" y="116" text-anchor="middle" class="d-text-sm">holds X on r2</text>
+
+      <path d="M 250 86 H 442" class="d-line-hl"/>
+      <polygon points="450,86 438,80 438,92" style="fill: var(--accent)"/>
+      <text x="350" y="76" text-anchor="middle" class="d-text-sm">waits for X on r2</text>
+
+      <path d="M 450 118 H 258" class="d-line-hl"/>
+      <polygon points="250,118 262,112 262,124" style="fill: var(--accent)"/>
+      <text x="350" y="140" text-anchor="middle" class="d-text-sm">waits for X on r1</text>
+
+      <path d="M 525 134 V 170" class="d-line" stroke-dasharray="4 4"/>
+      <rect x="415" y="170" width="220" height="44" rx="8" class="d-box-bad"/>
+      <text x="525" y="188" text-anchor="middle" class="d-text-sm">victim: T9 (youngest on cycle)</text>
+      <text x="525" y="204" text-anchor="middle" class="d-text-sm">woken with Err(Serialization)</text>
+    </svg>
+    <figcaption>Figure 3 — A waits-for cycle: T8 → T9 → T8. Detection finds the cycle and aborts a
+    victim (here the youngest, per the BusTub policy<sup class="cite"><a href="#ref-2">2</a></sup>);
+    the survivor's lock request is then grantable. This is exactly the two-updates-in-opposite-order
+    deadlock from the Postgres docs, which Postgres likewise resolves by aborting one
+    transaction.<sup class="cite"><a href="#ref-4">4</a></sup></figcaption>
+  </figure>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <p>Stretch milestones ship no skeleton tests, so this suite is yours to write. Keep the
+  workspace convention: core-milestone tests arrive marked <code>#[ignore = "milestone N"]</code>
+  and get un-ignored per milestone with
+  <code>cargo test -- --include-ignored msN_</code>; name your new tests with an
+  <code>s1_</code> prefix (no <code>#[ignore]</code> needed — you are writing them when you need
+  them) and keep the Milestone 8 group green as your regression net.</p>
+  <pre><code>cargo test -p ferricdb-txn s1_                        # your new suite
+cargo test --workspace -- --include-ignored ms8_      # MVCC must still hold</code></pre>
+  <p>Five scenarios that together cover the definition of done:</p>
+  <ol>
+    <li><strong><code>s1_x_blocks_x</code> — blocking.</strong> Thread A takes X on row r and
+        parks; thread B requests X on r and must not return until A commits. Prove ordering with
+        an <code>mpsc</code> channel of events (<code>"B-requested"</code>,
+        <code>"A-committed"</code>, <code>"B-granted"</code>), not with sleeps.</li>
+    <li><strong><code>s1_no_conflict_parallelism</code> — no false blocking.</strong> Two
+        transactions take X on <em>different</em> rows concurrently; both grant immediately. Also:
+        three transactions take S on the <em>same</em> row concurrently; all grant. A lock manager
+        that serializes everything passes test 1 and fails this one.</li>
+    <li><strong><code>s1_deadlock_detected</code> — the constructed deadlock.</strong> T1 locks
+        r1 then r2; T2 locks r2 then r1, synchronized with a <code>std::sync::Barrier</code> after
+        the first lock so the cycle is guaranteed. Assert exactly one transaction gets
+        <code>Error::Serialization</code> (with a message naming the deadlock) and the other
+        commits normally.</li>
+    <li><strong><code>s1_release_on_abort</code> — the abort path.</strong> A takes X on r and
+        aborts; B's pending request must grant promptly. Repeat with A being killed as a deadlock
+        victim rather than aborting voluntarily — both paths must release.</li>
+    <li><strong><code>s1_for_update_stress</code> — end to end through SQL.</strong> The
+        counter-increment stress from guidance step 9, run through <code>execute()</code> with
+        real <code>BEGIN</code>/<code>COMMIT</code>. Final value N proves lost updates are gone;
+        as a control, document that the same loop <em>without</em> <code>FOR UPDATE</code> loses
+        updates under first-committer-wins retries only if you don't retry — with retries it also
+        reaches N, just slower. Timing note: never assert "B was still blocked after 50 ms";
+        assert event <em>order</em>, and give any genuine timeout seconds, not milliseconds.</li>
+  </ol>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Holding the map latch while you wait</span>
+    <p><strong>Why it happens:</strong> the obvious implementation locks the outer
+    <code>HashMap</code> mutex, finds the queue, sees a conflict, and calls
+    <code>Condvar::wait</code> right there — still holding the map. <strong>Symptom:</strong> the
+    entire database freezes: transactions touching completely unrelated rows hang, because nobody
+    can even <em>look up</em> their queue. Remember the lecture's distinction: latches protect the
+    DBMS's internal structures for short critical sections; locks protect database objects for
+    transaction lifetimes.<sup class="cite"><a href="#ref-1">1</a></sup> The map mutex is a latch.
+    Clone the <code>Arc</code> to the row's queue, drop the map latch, and block only on the
+    queue's own condition variable (Figure 2).</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Upgrade deadlocks: S then X on the same row</span>
+    <p><strong>Why it happens:</strong> two transactions both take S on a row (a read), then both
+    request X on it (a write). Each upgrade must wait for the <em>other's</em> S to go away — a
+    perfect two-cycle that pure FIFO queuing cannot resolve. <strong>Symptom:</strong> any two
+    concurrent read-then-update transactions on the same row hang (or both die as victims, if your
+    detector is eager), reliably, every run. This is precisely the failure <code>FOR UPDATE</code>
+    exists to avoid: for read-modify-write, take the exclusive lock at the read instead of
+    acquiring S and then failing to upgrade.<sup class="cite"><a href="#ref-1">1</a></sup> Pick an
+    explicit upgrade policy — simplest is to treat S→X by the same transaction as an error or as a
+    fresh X request that waits for other S holders — and make sure your deadlock handler counts an
+    upgrader as <em>waiting for</em> every other current S holder, so the cycle is visible.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Locks leak on abort paths</span>
+    <p><strong>Why it happens:</strong> release is coded into the <code>COMMIT</code> handler, but
+    transactions die in many other places — explicit <code>ROLLBACK</code>, a first-committer-wins
+    failure inside <code>commit()</code>, a statement error mid-execution, a deadlock victim
+    unwinding with <code>?</code>. Miss one path and the dead transaction keeps its locks forever.
+    <strong>Symptom:</strong> the system works, then minutes later an unrelated transaction hangs
+    on a row nobody living holds; under test, suites pass alone and deadlock in CI.
+    <strong>Fix:</strong> route every ending through <code>TransactionManager::commit</code> /
+    <code>abort</code> and call <code>unlock_all</code> there and only there — that is what
+    "release at transaction end" means in strong strict 2PL,<sup class="cite"><a
+    href="#ref-1">1</a></sup> and BusTub's spec likewise makes any failed lock request abort the
+    whole transaction rather than limp on.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li>Two concurrent <code>SELECT ... FOR UPDATE</code> on the same row serialize correctly: the
+        second blocks until the first commits or aborts, then proceeds (or fails the version
+        re-check with <code>Error::Serialization</code>) — never returns stale data, never
+        interleaves.</li>
+    <li>A constructed deadlock (two transactions locking two rows in opposite order) is detected
+        or prevented: exactly one transaction aborts with a clear, retryable error message; the
+        other commits.</li>
+    <li>A plain <code>SELECT</code> never calls the lock manager and never blocks behind any
+        writer.</li>
+    <li><code>unlock_all</code> runs on every transaction ending — commit, rollback, conflict
+        abort, deadlock victim — verified by <code>s1_release_on_abort</code>.</li>
+    <li>The <code>FOR UPDATE</code> counter stress reaches exactly N with N concurrent
+        incrementers.</li>
+    <li><code>cargo test --workspace -- --include-ignored ms8_</code> still passes: MVCC snapshots
+        and first-committer-wins are unchanged underneath the locks.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="Shared is compatible with shared: both readers may hold the lock simultaneously. An exclusive request must wait for all shared holders to finish, and an upgrade from S to X by one of the holders must wait for the *other* S holders — which is exactly how two upgraders deadlock each other.">
+    <legend class="quiz-q">T1 holds a shared lock on a row. Which new request can the lock manager grant immediately?</legend>
+    <label><input type="radio" name="q1"> T2 requests an exclusive lock on the row</label>
+    <label><input type="radio" name="q1" data-correct> T2 requests a shared lock on the row</label>
+    <label><input type="radio" name="q1"> T1 requests an upgrade to exclusive while T2 also holds a shared lock</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="T3 → T5 → T3 is a cycle: each transaction waits for a lock the other holds, so neither can ever proceed on its own. Detection picks one victim (the CMU project says the youngest), wakes its blocked lock request with an error, and its released locks let the survivor continue. Granting both requests would hand out conflicting locks; aborting both wastes a transaction that could have committed.">
+    <legend class="quiz-q">The waits-for graph contains edges T3 → T5 and T5 → T3. Under deadlock detection, what should happen?</legend>
+    <label><input type="radio" name="q2"> Grant both waiting requests to break the tie — the conflict is only advisory</label>
+    <label><input type="radio" name="q2"> Abort both transactions, since both are part of the cycle</label>
+    <label><input type="radio" name="q2" data-correct> Pick one victim (e.g. the youngest), abort it with a retryable error, and let the other proceed</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="MVCC already gives a plain SELECT a consistent view: it reads the versions visible to its snapshot, regardless of concurrent writers. Locking on read would destroy the readers-don't-block property that motivated MVCC in the first place — Postgres states that row-level locks block only writers and lockers of the same row, never plain queries.">
+    <legend class="quiz-q">Why must a plain <code>SELECT</code> (without <code>FOR UPDATE</code>) never acquire row locks in FerricDB?</legend>
+    <label><input type="radio" name="q3"> Because read-only statements are automatically serializable, so locks would be redundant</label>
+    <label><input type="radio" name="q3" data-correct> Because snapshot visibility already gives it a consistent read, and locking would make readers block writers</label>
+    <label><input type="radio" name="q3"> Because shared locks can only be taken on rows that are already exclusively locked</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Andy Pavlo, “Lecture #18: Two-Phase Locking”, CMU 15-445/645 Fall 2025 lecture notes.
+          <a href="https://15445.courses.cs.cmu.edu/fall2025/notes/18-twophaselocking.pdf" rel="external">https://15445.courses.cs.cmu.edu/fall2025/notes/18-twophaselocking.pdf</a></li>
+        <li id="ref-2">CMU 15-445/645, “Project #4 — Concurrency Control” (Fall 2022 edition: the lock-manager project).
+          <a href="https://15445.courses.cs.cmu.edu/fall2022/project4/" rel="external">https://15445.courses.cs.cmu.edu/fall2022/project4/</a></li>
+        <li id="ref-3">PostgreSQL documentation, “13.2. Transaction Isolation”.
+          <a href="https://www.postgresql.org/docs/current/transaction-iso.html" rel="external">https://www.postgresql.org/docs/current/transaction-iso.html</a></li>
+        <li id="ref-4">PostgreSQL documentation, “13.3. Explicit Locking”.
+          <a href="https://www.postgresql.org/docs/current/explicit-locking.html" rel="external">https://www.postgresql.org/docs/current/explicit-locking.html</a></li>
+        <li id="ref-5">CMU 15-445/645, “Project #4 — Concurrency Control” (Fall 2025 edition: OCC over MVCC).
+          <a href="https://15445.courses.cs.cmu.edu/fall2025/project4/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project4/</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>The slide deck behind the Lecture #18 notes — the waits-for and wound-wait animations are worth the click.
+        <a href="https://15445.courses.cs.cmu.edu/fall2025/slides/18-twophaselocking.pdf" rel="external">15445.courses.cs.cmu.edu/fall2025/slides/18-twophaselocking.pdf</a></li>
+      <li>PostgreSQL <code>SELECT</code> reference, “The Locking Clause” — the full <code>FOR UPDATE</code> grammar, including <code>NOWAIT</code> and <code>SKIP LOCKED</code>, if you want stretch-on-stretch features.
+        <a href="https://www.postgresql.org/docs/current/sql-select.html" rel="external">postgresql.org/docs/current/sql-select.html</a></li>
+      <li>How serializable isolation removes the need for <code>FOR UPDATE</code> entirely — the bridge to Stretch S2.
+        <a href="https://www.postgresql.org/docs/current/transaction-iso.html" rel="external">postgresql.org/docs/current/transaction-iso.html</a></li>
+    </ul>
+
+    <nav class="prevnext">
+      <a href="../../modules/m12-advanced-topics/index.html"><span class="dir">← Previous</span> M12 · Advanced Topics</a>
+      <a class="next" href="../stretch-s2/index.html"><span class="dir">Next →</span> Stretch S2 · Serializable Isolation (SSI)</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "planner",
+           "executor", "index", "txn", "wal", "protocol", "client"],
+    current: [],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

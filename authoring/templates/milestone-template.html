@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone X · MILESTONE TITLE — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone X</span>
+  </nav>
+  <span class="badge milestone">Milestone X</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone X · MILESTONE TITLE</h1>
+  <p class="subtitle">One-sentence description of what gets built.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li>Objective phrased as a capability ("Explain…", "Implement…", "Measure…").</li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/mXX-slug/index.html">Module XX — Title</a> (the concept module for this milestone)</li>
+    <li>Specific primary source sections with URLs.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>FerricDB architecture — components highlighted are built in this milestone.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+  <p>Public API the learner implements (crate, types, signatures). Keep to spec + semantics; no solution code.</p>
+  <pre><code>// crates/xxx/src/lib.rs — public surface to implement
+</code></pre>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <p>Ordered steps with hints, not solutions.</p>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <p>Which provided tests to un-ignore, what they check, how to run them.</p>
+  <pre><code>cargo test -p ferricdb-xxx -- --include-ignored milestone_x</code></pre>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall</span>
+    <p>…</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li>Checklist items, mechanically verifiable where possible.</li>
+  </ul>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Author, “Title”. <a href="https://example.com" rel="external">https://example.com</a></li>
+      </ol>
+    </div>
+
+    <nav class="prevnext">
+      <a href="PREV_HREF"><span class="dir">← Previous</span> PREV LABEL</a>
+      <a class="next" href="NEXT_HREF"><span class="dir">Next →</span> NEXT LABEL</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: [],            // component ids finished in earlier milestones
+    current: [],         // component ids built in THIS milestone
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FerricDB — Database Systems, Built From Scratch</title>
+<link rel="stylesheet" href="assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs"><span>FerricDB Course</span></nav>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Database Systems, Built From Scratch</h1>
+  <p class="subtitle">A concept curriculum on database internals paired with a milestone project:
+  build <strong>FerricDB</strong>, a toy Postgres in Rust that real <code>psql</code> clients can talk to.</p>
+
+  <p>This course teaches database internals the way CMU 15-445 and Berkeley CS186 do —
+  buffer pools, B+Trees, query execution, MVCC, ARIES recovery — but organizes everything
+  around one running system that you build yourself. Every concept module is paired with a
+  project milestone, so theory is applied immediately. By the end, your database speaks the
+  PostgreSQL wire protocol: <code>psql -h localhost -p 5433</code> connects to <em>your</em> code.</p>
+
+  <div class="callout note">
+    <span class="callout-title">Who this is for</span>
+    <p>Comfortable programmers who know SQL basics and Rust at the level of
+    <em>The Rust Programming Language</em> book (ownership, traits, error handling, basic
+    concurrency). No prior database-internals knowledge is assumed. Module 0 includes a Rust
+    refresher reading list.</p>
+  </div>
+
+  <h2 id="path">The recommended path</h2>
+  <p>Concept modules (blue) are numbered by topic area, mirroring the CMU lecture order.
+  Project milestones (green) are built strictly in sequence — each builds on the last.
+  The two interleave: read the module, then build its milestone.</p>
+
+  <div class="pathmap" id="pathmap"><!-- filled by script; static fallback below --></div>
+  <noscript>
+    <p class="muted">M00 → MS0 → M01 → M02 → MS1 → M03 → MS2 → M05 → MS3 → M06 → MS4 →
+    M04 → MS5 → M07 → MS6 → M08 → MS7 → M09 → MS8 → M10 → MS9 → M11 → MS10 → M12 → S1–S4</p>
+  </noscript>
+
+  <h2 id="modules">Concept modules</h2>
+  <div class="cards">
+    <a class="card" href="modules/m00-orientation/index.html">
+      <span class="card-kicker">Module 00</span><h3>Orientation</h3>
+      <p>Anatomy of a relational DBMS; how this course and the FerricDB project fit together.</p></a>
+    <a class="card" href="modules/m01-relational-model-sql/index.html">
+      <span class="card-kicker">Module 01</span><h3>The Relational Model &amp; SQL Semantics</h3>
+      <p>Relations, keys, relational algebra as the executor's vocabulary, NULL semantics.</p></a>
+    <a class="card" href="modules/m02-storage/index.html">
+      <span class="card-kicker">Module 02</span><h3>Storage: Files, Pages, Tuples</h3>
+      <p>Slotted pages, tuple headers, heap tables, free space, TOAST-style large values.</p></a>
+    <a class="card" href="modules/m03-buffer-pool/index.html">
+      <span class="card-kicker">Module 03</span><h3>The Buffer Pool</h3>
+      <p>Why a DBMS manages its own cache; pins, dirty pages, CLOCK and LRU-K eviction.</p></a>
+    <a class="card" href="modules/m04-data-structures-indexes/index.html">
+      <span class="card-kicker">Module 04</span><h3>B+Trees (and Friends)</h3>
+      <p>Node layout on pages, splits and merges, latch crabbing, hash indexes, LSM survey.</p></a>
+    <a class="card" href="modules/m05-sql-parsing/index.html">
+      <span class="card-kicker">Module 05</span><h3>SQL Front-End</h3>
+      <p>Lexing, recursive descent + Pratt parsing, ASTs, binding against the catalog.</p></a>
+    <a class="card" href="modules/m06-query-execution/index.html">
+      <span class="card-kicker">Module 06</span><h3>Query Execution</h3>
+      <p>Logical vs physical plans and the Volcano open/next/close iterator model.</p></a>
+    <a class="card" href="modules/m07-joins-sorting-aggregation/index.html">
+      <span class="card-kicker">Module 07</span><h3>Joins, Sorting, Aggregation</h3>
+      <p>Nested loop, merge and hash joins; external merge sort; hash aggregation.</p></a>
+    <a class="card" href="modules/m08-query-optimization/index.html">
+      <span class="card-kicker">Module 08</span><h3>Query Optimization</h3>
+      <p>Rewrites, statistics, selectivity, Selinger dynamic programming, EXPLAIN.</p></a>
+    <a class="card" href="modules/m09-transactions-mvcc/index.html">
+      <span class="card-kicker">Module 09</span><h3>Transactions &amp; MVCC</h3>
+      <p>Serializability, anomalies, 2PL, snapshots, visibility rules, vacuum.</p></a>
+    <a class="card" href="modules/m10-logging-recovery/index.html">
+      <span class="card-kicker">Module 10</span><h3>Logging &amp; Recovery</h3>
+      <p>The WAL rule, LSNs, and ARIES: analysis, redo "repeating history", undo with CLRs.</p></a>
+    <a class="card" href="modules/m11-wire-protocol-server/index.html">
+      <span class="card-kicker">Module 11</span><h3>The Postgres Wire Protocol</h3>
+      <p>Startup, simple and extended query flows, and why protocol compatibility matters.</p></a>
+    <a class="card" href="modules/m12-advanced-topics/index.html">
+      <span class="card-kicker">Module 12</span><h3>Advanced Topics</h3>
+      <p>LSM engines, column stores, Raft and distributed SQL, what production Postgres adds.</p></a>
+  </div>
+
+  <h2 id="project">Project: build FerricDB</h2>
+  <p>The project lives in <code>course/ferricdb/</code> — a Cargo workspace with the crate
+  skeletons, public API stubs, and test suites already in place. Each milestone page specifies
+  what to implement, how to test it, and what "done" means. Start with the
+  <a href="project/index.html">project overview</a> for the architecture and ground rules.</p>
+
+  <div class="cards">
+    <a class="card milestone" href="project/milestone-00/index.html">
+      <span class="card-kicker">Milestone 0</span><h3>Skeleton, REPL, Test Harness</h3>
+      <p>Cargo workspace, rustyline REPL with meta-commands, CI.</p></a>
+    <a class="card milestone" href="project/milestone-01/index.html">
+      <span class="card-kicker">Milestone 1</span><h3>Pages, Tuples, Heap Storage</h3>
+      <p>8 KB slotted pages, tuple serialization, DiskManager, HeapFile.</p></a>
+    <a class="card milestone" href="project/milestone-02/index.html">
+      <span class="card-kicker">Milestone 2</span><h3>Buffer Pool Manager</h3>
+      <p>Frames, page table, pin counts, CLOCK eviction, dirty-page flushing.</p></a>
+    <a class="card milestone" href="project/milestone-03/index.html">
+      <span class="card-kicker">Milestone 3</span><h3>SQL Front-End</h3>
+      <p>Lexer, recursive-descent + Pratt parser, AST, self-hosted catalog, binder.</p></a>
+    <a class="card milestone" href="project/milestone-04/index.html">
+      <span class="card-kicker">Milestone 4</span><h3>Planner &amp; Volcano Executor</h3>
+      <p>Logical plans, iterator operators, expression evaluation — queries run end to end.</p></a>
+    <a class="card milestone" href="project/milestone-05/index.html">
+      <span class="card-kicker">Milestone 5</span><h3>B+Tree Index</h3>
+      <p>Disk-resident B+Tree with splits, range iterators, IndexScan.</p></a>
+    <a class="card milestone" href="project/milestone-06/index.html">
+      <span class="card-kicker">Milestone 6</span><h3>Joins, Aggregation, External Sort</h3>
+      <p>NestedLoopJoin, HashJoin, GROUP BY aggregates, spill-to-disk sorting.</p></a>
+    <a class="card milestone" href="project/milestone-07/index.html">
+      <span class="card-kicker">Milestone 7</span><h3>Query Optimization</h3>
+      <p>Rewrite rules, ANALYZE statistics, cost model, join ordering, EXPLAIN.</p></a>
+    <a class="card milestone" href="project/milestone-08/index.html">
+      <span class="card-kicker">Milestone 8</span><h3>Transactions &amp; MVCC</h3>
+      <p>Snapshots, visibility checks, first-committer-wins, VACUUM.</p></a>
+    <a class="card milestone" href="project/milestone-09/index.html">
+      <span class="card-kicker">Milestone 9</span><h3>WAL &amp; ARIES Recovery</h3>
+      <p>Append-only log, CLRs, checkpoints, crash-injection testing.</p></a>
+    <a class="card milestone" href="project/milestone-10/index.html">
+      <span class="card-kicker">Milestone 10</span><h3>Wire Protocol Server</h3>
+      <p>Tokio TCP server speaking the PG protocol; psql connects to your database.</p></a>
+  </div>
+
+  <h3 id="stretch">Stretch milestones (optional)</h3>
+  <div class="cards">
+    <a class="card stretch" href="project/stretch-s1/index.html">
+      <span class="card-kicker">Stretch S1</span><h3>Lock Manager &amp; Row Locks</h3>
+      <p>SELECT FOR UPDATE via a lock manager, deadlock handling.</p></a>
+    <a class="card stretch" href="project/stretch-s2/index.html">
+      <span class="card-kicker">Stretch S2</span><h3>Serializable Isolation (SSI)</h3>
+      <p>Why snapshot isolation admits write skew, and a simplified SSI.</p></a>
+    <a class="card stretch" href="project/stretch-s3/index.html">
+      <span class="card-kicker">Stretch S3</span><h3>LSM Storage Engine</h3>
+      <p>Swap the heap for an LSM tree, following Mini-LSM.</p></a>
+    <a class="card stretch" href="project/stretch-s4/index.html">
+      <span class="card-kicker">Stretch S4</span><h3>Raft Replication</h3>
+      <p>Replicate FerricDB with Raft, following toyDB's architecture.</p></a>
+  </div>
+
+  <h2 id="how">How to work through the course</h2>
+  <ol>
+    <li>Follow the recommended path above: read a module, then build its milestone.</li>
+    <li>Each module page ends with a <em>Milestone link</em> telling you what to build;
+        each milestone page starts with <em>Required reading</em> pointing back at its module
+        and the primary sources.</li>
+    <li>Run the provided tests as you go — every milestone lists exactly which test group to
+        un-ignore (e.g. <code>cargo test -- --include-ignored ms2_</code>).</li>
+    <li>Everything cites primary sources — course notes from CMU and Berkeley, the ARIES and
+        Selinger papers, PostgreSQL documentation and internals guides. The citations are the
+        "go deeper" trail; use them.</li>
+  </ol>
+
+  <footer class="page-footer">
+    <p class="muted">All pages work offline via <code>file://</code> — external links appear
+    only as citations and further reading. Built as an original curriculum; primary sources
+    are cited per page and collected on each page's "Primary sources" list.</p>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  var PATH = [
+    ["M00", "modules/m00-orientation/", "module", "Orientation"],
+    ["MS0", "project/milestone-00/", "milestone", "Skeleton & REPL"],
+    ["M01", "modules/m01-relational-model-sql/", "module", "Relational Model"],
+    ["M02", "modules/m02-storage/", "module", "Storage"],
+    ["MS1", "project/milestone-01/", "milestone", "Heap Storage"],
+    ["M03", "modules/m03-buffer-pool/", "module", "Buffer Pool"],
+    ["MS2", "project/milestone-02/", "milestone", "Buffer Pool Manager"],
+    ["M05", "modules/m05-sql-parsing/", "module", "SQL Front-End"],
+    ["MS3", "project/milestone-03/", "milestone", "Parser & Catalog"],
+    ["M06", "modules/m06-query-execution/", "module", "Query Execution"],
+    ["MS4", "project/milestone-04/", "milestone", "Executor"],
+    ["M04", "modules/m04-data-structures-indexes/", "module", "B+Trees"],
+    ["MS5", "project/milestone-05/", "milestone", "B+Tree Index"],
+    ["M07", "modules/m07-joins-sorting-aggregation/", "module", "Joins & Sorting"],
+    ["MS6", "project/milestone-06/", "milestone", "Joins & Ext. Sort"],
+    ["M08", "modules/m08-query-optimization/", "module", "Optimization"],
+    ["MS7", "project/milestone-07/", "milestone", "Optimizer"],
+    ["M09", "modules/m09-transactions-mvcc/", "module", "Transactions & MVCC"],
+    ["MS8", "project/milestone-08/", "milestone", "MVCC"],
+    ["M10", "modules/m10-logging-recovery/", "module", "Logging & Recovery"],
+    ["MS9", "project/milestone-09/", "milestone", "WAL & ARIES"],
+    ["M11", "modules/m11-wire-protocol-server/", "module", "Wire Protocol"],
+    ["MS10", "project/milestone-10/", "milestone", "PG Server"],
+    ["M12", "modules/m12-advanced-topics/", "module", "Advanced Topics"],
+    ["S1–S4", "project/index.html#sec-stretch", "stretch", "Stretch goals"]
+  ];
+  var map = document.getElementById("pathmap");
+  PATH.forEach(function (p, i) {
+    if (i > 0) {
+      var arrow = document.createElement("span");
+      arrow.className = "arrow"; arrow.textContent = "→";
+      map.appendChild(arrow);
+    }
+    var a = document.createElement("a");
+    a.className = p[2];
+    a.href = p[1].indexOf(".html") === -1 ? p[1] + "index.html" : p[1];
+    a.textContent = p[0];
+    a.title = p[3];
+    map.appendChild(a);
+  });
+});
+</script>
+</body>
+</html>

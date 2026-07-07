@@ -1,0 +1,9 @@
+[package]
+name = "ferricdb-common"
+description = "Shared foundation types for FerricDB (provided fully implemented)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }

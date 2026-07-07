@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M0X · MODULE TITLE — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+/* set theme before first paint to avoid flashing */
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<!-- include arch.js ONLY if the page renders the shared architecture diagram -->
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M0X Short Name</span>
+  </nav>
+  <span class="badge">Module 0X</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M0X · MODULE TITLE</h1>
+  <p class="subtitle">One-sentence description of what this module teaches and why it matters for the build.</p>
+
+  <noscript><p class="noscript-warn">Interactive demos and self-check quizzes on this page need JavaScript;
+  all explanatory content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-1">Section one</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-1">Section one</h2>
+  <p>Body prose with citations like this claim about heap pages.<sup class="cite"><a href="#ref-1">1</a></sup>
+  Every factual claim carries one.</p>
+
+  <!-- SVG figure convention -->
+  <figure>
+    <svg viewBox="0 0 700 300" role="img">
+      <title>Accessible description of the diagram.</title>
+      <rect x="10" y="10" width="200" height="60" rx="8" class="d-box"/>
+      <text x="110" y="45" text-anchor="middle" class="d-text">Example box</text>
+    </svg>
+    <figcaption>Figure 1 — caption describing what to look at.</figcaption>
+  </figure>
+
+  <!-- callout conventions: note | tip | pitfall | source -->
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall</span>
+    <p>Common mistake learners make here.</p>
+  </div>
+
+  <!-- interactive widget shell convention -->
+  <div class="widget" id="widget-example">
+    <p class="widget-title">Widget title</p>
+    <p class="widget-sub">What the learner can do with it.</p>
+    <div class="controls">
+      <button class="btn primary" type="button" id="ex-btn">Do thing</button>
+    </div>
+    <div id="ex-canvas"></div>
+  </div>
+
+  <!-- quiz convention -->
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="Explanation of the right answer, with the same rigor as body text.">
+    <legend class="quiz-q">Question text?</legend>
+    <label><input type="radio" name="q1"> Wrong answer</label>
+    <label><input type="radio" name="q1" data-correct> Right answer</label>
+    <label><input type="radio" name="q1"> Wrong answer</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Author, “Title”, source name. <a href="https://example.com" rel="external">https://example.com</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>Optional reading with a one-line reason to read it. <a href="https://example.com">link</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>What to build now: <a href="../../project/milestone-0X/index.html">Milestone X — Name</a>.</p>
+
+    <nav class="prevnext">
+      <a href="PREV_HREF"><span class="dir">← Previous</span> PREV LABEL</a>
+      <a class="next" href="NEXT_HREF"><span class="dir">Next →</span> NEXT LABEL</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+/* Page-specific widget code. ALWAYS wrap in DOMContentLoaded so shared
+   deferred scripts (site.js/arch.js) have run; keep everything inside an
+   IIFE; use only vanilla JS. */
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  // var stepper = Course.stepper(document.getElementById("ex-canvas"), {...});
+});
+</script>
+</body>
+</html>

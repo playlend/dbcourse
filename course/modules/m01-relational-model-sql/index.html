@@ -1,0 +1,835 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M01 · The Relational Model and SQL Semantics — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+/* set theme before first paint to avoid flashing */
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<!-- include arch.js ONLY if the page renders the shared architecture diagram -->
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M01 Relational Model &amp; SQL</span>
+  </nav>
+  <span class="badge">Module 01</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M01 · The Relational Model and SQL Semantics</h1>
+  <p class="subtitle">What tables really are, what SQL really promises, and why a declarative
+  query language is the entire reason a query optimizer can exist. This module builds the
+  vocabulary that every later layer of FerricDB — planner, executor, catalog — is written in.</p>
+
+  <noscript><p class="noscript-warn">Interactive demos and self-check quizzes on this page need JavaScript;
+  all explanatory content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-why">Why start with a data model?</a></li>
+      <li><a href="#sec-relations">Relations, tuples, attributes</a></li>
+      <li><a href="#sec-keys">Keys and integrity constraints</a></li>
+      <li><a href="#sec-algebra">Relational algebra: the executor's vocabulary</a></li>
+      <li><a href="#sec-sql-to-algebra">Mapping SQL clauses onto algebra</a></li>
+      <li><a href="#sec-null">NULL and three-valued logic</a></li>
+      <li><a href="#sec-declarative">Why declarative queries enable optimization</a></li>
+      <li><a href="#sec-winning">Why the relational model keeps winning</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+      <li><a href="#sec-milestone">Milestone link</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-why">Why start with a data model?</h2>
+
+  <p>Suppose you skip the theory and build the most obvious database imaginable: one CSV file
+  per entity, plus application code that opens the file, reads it line by line, and parses each
+  record when it wants anything.<sup class="cite"><a href="#ref-1">1</a></sup> This strawman fails in three
+  distinct ways. <strong>Integrity</strong>: nothing stops two records from spelling the same artist
+  differently, or someone overwriting a year with a random string.<sup class="cite"><a href="#ref-1">1</a></sup>
+  <strong>Implementation</strong>: every application re-implements record lookup, and two threads
+  writing the same file at the same time corrupt it.<sup class="cite"><a href="#ref-1">1</a></sup>
+  <strong>Durability</strong>: a crash in the middle of an update leaves the file in a state nobody
+  can reason about.<sup class="cite"><a href="#ref-1">1</a></sup> Most of this course is about the machinery
+  that fixes those three failures; this module is about the abstraction that makes the machinery
+  buildable at all.</p>
+
+  <p>The database systems of the late 1960s — IDS, IMS, CODASYL — were only a partial fix.
+  Queries were procedural code: the developer chose access paths and execution ordering by hand,
+  based on how the data happened to be laid out at the time.<sup class="cite"><a href="#ref-1">1</a></sup>
+  When the data grew or its physical organization changed, hard-coded query programs became
+  inefficient or simply wrong, and had to be rewritten.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>Ted Codd, at IBM Research, watched people rebuild their database systems every time the
+  physical layer changed and in 1969 proposed the relational model as the way out.<sup class="cite"><a href="#ref-1">1</a></sup>
+  The model defines three things: <strong>structure</strong> — relations and their contents, defined
+  independently of physical representation; <strong>integrity</strong> — constraints the stored data must
+  satisfy; and <strong>manipulation</strong> — a declarative interface where the programmer specifies the
+  desired result and the system decides how to compute it.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>The payoff is <strong>data independence</strong>: applications see only relations, so the DBMS is
+  free to lay data out however suits the environment, contents, and workload — and to re-organize
+  later without breaking a single query.<sup class="cite"><a href="#ref-1">1</a></sup> Fifty years on, that
+  property is still the reason the relational model outlives every challenger, a story we return
+  to <a href="#sec-winning">at the end of this module</a>.<sup class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <h2 id="sec-relations">Relations, tuples, attributes</h2>
+
+  <p>A <strong>relation</strong> is an unordered set of tuples, where each tuple describes one entity as
+  a set of attribute values.<sup class="cite"><a href="#ref-1">1</a></sup> An <strong>attribute</strong> has a name
+  and a <strong>domain</strong> — the set of values it may take.<sup class="cite"><a href="#ref-1">1</a></sup>
+  A relation with <em>n</em> attributes is an <em>n-ary</em> relation, which is exactly a table with
+  <em>n</em> columns; "relation" and "table" are interchangeable from here on.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>A <strong>tuple</strong> is one row: a set of attribute values drawn from those domains. Values were
+  classically required to be atomic scalars, though modern systems also permit lists and nested
+  structures; and every attribute can hold the special value <code>NULL</code>, meaning the attribute is
+  undefined for that tuple.<sup class="cite"><a href="#ref-1">1</a></sup> NULL will earn
+  <a href="#sec-null">its own section</a>.</p>
+
+  <p>The word <em>unordered</em> is load-bearing. Because a relation imposes no tuple order, the DBMS
+  may store rows in whatever physical arrangement it finds efficient,<sup class="cite"><a href="#ref-1">1</a></sup>
+  and query results come back in no particular order unless you demand one with
+  <code>ORDER BY</code>.<sup class="cite"><a href="#ref-2">2</a></sup> When FerricDB's heap files (module
+  <a href="../m02-storage/index.html">M02</a>) scatter tuples across pages in insertion order, they are
+  exploiting exactly this freedom.</p>
+
+  <p>One more distinction you need before the algebra: <strong>sets versus bags</strong>. The
+  mathematical model and the algebra operate on sets, which cannot contain duplicate
+  tuples.<sup class="cite"><a href="#ref-5">5</a></sup> SQL, by contrast, operates on bags — unordered
+  collections that allow duplicates — because deduplicating every intermediate result would be
+  wasted work; you opt back into set semantics explicitly with
+  <code>DISTINCT</code>.<sup class="cite"><a href="#ref-2">2</a></sup> Keep this in mind whenever a theory
+  statement and an engine behavior seem to disagree.</p>
+
+  <figure>
+    <svg viewBox="0 0 960 330" role="img">
+      <title>Two tables, artists and albums, annotated with the terms relation, attribute, tuple, primary key, and a foreign-key arrow from albums.artist_id to artists.artist_id.</title>
+      <!-- artists table -->
+      <text x="60" y="78" class="d-text">artists</text>
+      <rect x="60" y="90" width="330" height="30" class="d-box"/>
+      <rect x="60" y="90" width="100" height="30" class="d-box-hl"/>
+      <rect x="60" y="120" width="330" height="84" fill="none" class="d-line"/>
+      <line x1="160" y1="90" x2="160" y2="204" class="d-line"/>
+      <line x1="300" y1="90" x2="300" y2="204" class="d-line"/>
+      <line x1="60" y1="148" x2="390" y2="148" class="d-line"/>
+      <line x1="60" y1="176" x2="390" y2="176" class="d-line"/>
+      <text x="70" y="110" class="d-mono">artist_id</text>
+      <text x="170" y="110" class="d-mono">name</text>
+      <text x="310" y="110" class="d-mono">country</text>
+      <text x="70" y="138" class="d-mono-sm">101</text><text x="170" y="138" class="d-mono-sm">Nirvana</text><text x="310" y="138" class="d-mono-sm">US</text>
+      <text x="70" y="166" class="d-mono-sm">102</text><text x="170" y="166" class="d-mono-sm">Portishead</text><text x="310" y="166" class="d-mono-sm">UK</text>
+      <text x="70" y="194" class="d-mono-sm">103</text><text x="170" y="194" class="d-mono-sm">Oasis</text><text x="310" y="194" class="d-mono-sm">UK</text>
+      <!-- albums table -->
+      <text x="540" y="78" class="d-text">albums</text>
+      <rect x="540" y="90" width="400" height="30" class="d-box"/>
+      <rect x="540" y="90" width="90" height="30" class="d-box-hl"/>
+      <rect x="630" y="90" width="90" height="30" class="d-box-warn"/>
+      <rect x="540" y="120" width="400" height="84" fill="none" class="d-line"/>
+      <line x1="630" y1="90" x2="630" y2="204" class="d-line"/>
+      <line x1="720" y1="90" x2="720" y2="204" class="d-line"/>
+      <line x1="880" y1="90" x2="880" y2="204" class="d-line"/>
+      <line x1="540" y1="148" x2="940" y2="148" class="d-line"/>
+      <line x1="540" y1="176" x2="940" y2="176" class="d-line"/>
+      <text x="550" y="110" class="d-mono">album_id</text>
+      <text x="640" y="110" class="d-mono">artist_id</text>
+      <text x="730" y="110" class="d-mono">title</text>
+      <text x="890" y="110" class="d-mono">year</text>
+      <text x="550" y="138" class="d-mono-sm">9001</text><text x="640" y="138" class="d-mono-sm">101</text><text x="730" y="138" class="d-mono-sm">In Utero</text><text x="890" y="138" class="d-mono-sm">1993</text>
+      <text x="550" y="166" class="d-mono-sm">9002</text><text x="640" y="166" class="d-mono-sm">102</text><text x="730" y="166" class="d-mono-sm">Dummy</text><text x="890" y="166" class="d-mono-sm">1994</text>
+      <text x="550" y="194" class="d-mono-sm">9003</text><text x="640" y="194" class="d-mono-sm">103</text><text x="730" y="194" class="d-mono-sm">Be Here Now</text><text x="890" y="194" class="d-mono-sm">NULL</text>
+      <!-- annotations -->
+      <text x="180" y="56" class="d-text-sm">primary key</text>
+      <line x1="180" y1="62" x2="112" y2="88" class="d-line"/>
+      <text x="640" y="52" class="d-text-sm">primary key · foreign key</text>
+      <line x1="640" y1="58" x2="592" y2="88" class="d-line"/>
+      <line x1="700" y1="58" x2="672" y2="88" class="d-line"/>
+      <text x="465" y="45" text-anchor="middle" class="d-text-sm">attribute (column)</text>
+      <path d="M 430 50 C 340 62, 280 72, 234 86" class="d-line" stroke-dasharray="5 4"/>
+      <text x="465" y="250" text-anchor="middle" class="d-text-sm">tuple (one row)</text>
+      <path d="M 442 238 C 420 210, 408 190, 394 168" class="d-line" stroke-dasharray="5 4"/>
+      <!-- FK arrow -->
+      <path d="M 675 206 C 675 300, 110 300, 110 212" class="d-line-hl"/>
+      <polygon points="110,206 104,218 116,218" fill="currentColor"/>
+      <text x="392" y="302" text-anchor="middle" class="d-text-sm">foreign key: every albums.artist_id equals some artists.artist_id</text>
+    </svg>
+    <figcaption>Figure 1 — the running example schema. <code>artists</code> and <code>albums</code> are relations;
+    each column is an attribute with a domain; each row is a tuple. <code>artist_id</code> and
+    <code>album_id</code> are primary keys, and <code>albums.artist_id</code> is a foreign key referencing
+    <code>artists</code>. The <code>NULL</code> in the last album's <code>year</code> means "unknown", not zero or empty.</figcaption>
+  </figure>
+
+  <h2 id="sec-keys">Keys and integrity constraints</h2>
+
+  <p>Within a relation, some attribute sets uniquely identify tuples. Any minimal such set is
+  called a <strong>candidate key</strong>; you designate one of them as the <strong>primary key</strong>, the
+  identity by which a single tuple can be named.<sup class="cite"><a href="#ref-1">1</a></sup> The other
+  candidate keys are typically declared with <code>UNIQUE</code> constraints. In PostgreSQL a table may
+  carry many unique constraints but at most one primary key, and the primary key is exactly a
+  unique constraint plus not-null, enforced through an automatically created B-tree
+  index.<sup class="cite"><a href="#ref-9">9</a></sup> If you do not define a primary key, some systems
+  quietly make one for you: a DBMS can auto-generate identity values,<sup class="cite"><a href="#ref-1">1</a></sup>
+  and every ordinary SQLite table is keyed internally by a 64-bit signed integer
+  <code>rowid</code>, with the table's B-tree using that rowid as its key.<sup class="cite"><a href="#ref-11">11</a></sup></p>
+
+  <p>A <strong>foreign key</strong> declares that an attribute in one relation maps to a tuple of
+  another relation, generally by matching that relation's primary
+  key.<sup class="cite"><a href="#ref-1">1</a></sup> This is <em>referential integrity</em>: PostgreSQL
+  requires the referenced columns to be a primary key or unique constraint, and lets you choose
+  what happens to referencing rows when the referenced row disappears — <code>NO ACTION</code> (the
+  default, checkable at end of transaction), <code>RESTRICT</code>, <code>CASCADE</code>,
+  <code>SET NULL</code>, or <code>SET DEFAULT</code>.<sup class="cite"><a href="#ref-9">9</a></sup> In Figure 1,
+  deleting artist 101 under <code>CASCADE</code> would delete albums 9001 and 9003 with it.</p>
+
+  <p>Keys are the most common instances of a more general idea. An <strong>integrity
+  constraint</strong> is a user-defined condition that must hold for <em>every</em> instance of the
+  database, with unique-key and referential constraints being the most widely
+  used.<sup class="cite"><a href="#ref-1">1</a></sup> The rest of the toolbox: <code>NOT NULL</code> forbids
+  missing values (and is more efficient than the equivalent check
+  constraint),<sup class="cite"><a href="#ref-9">9</a></sup> and a <code>CHECK</code> constraint attaches an
+  arbitrary boolean expression to the table — with the subtlety that it is satisfied when the
+  expression evaluates to true <em>or</em> to NULL.<sup class="cite"><a href="#ref-9">9</a></sup> That last
+  clause is your first hint that SQL's logic has three truth values, not two.</p>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall</span>
+    <p>"Primary key implies NOT NULL" is not portable folklore — it is true in PostgreSQL but
+    <em>not</em> in SQLite, where a historical bug allows NULLs in primary-key columns unless the
+    column is an <code>INTEGER PRIMARY KEY</code>, the table is <code>WITHOUT ROWID</code> or
+    <code>STRICT</code>, or the column is separately declared <code>NOT NULL</code>.<sup class="cite"><a href="#ref-11">11</a></sup>
+    The <a href="#sec-null">NULL section</a> compares the two engines' NULL rules side by side.</p>
+  </div>
+
+  <p>For FerricDB we make a deliberately narrow course choice: Milestone 3's catalog supports
+  a single-column primary key and <code>NOT NULL</code> per column, and defers foreign keys and
+  <code>CHECK</code> to the stretch goals — enough to exercise the concepts without drowning the
+  parser. The semantics we implement follow PostgreSQL's, as cited above.</p>
+
+  <h2 id="sec-algebra">Relational algebra: the executor's vocabulary</h2>
+
+  <p>Relational algebra is a small set of operators over relations: each operator consumes one
+  or two relations and produces a new relation, so operators compose into arbitrarily deep
+  expressions.<sup class="cite"><a href="#ref-1">1</a></sup> Where SQL is declarative, the algebra is
+  procedural — an algebra expression states an <em>order of steps</em>, which is precisely why it is
+  the language query plans are written in.<sup class="cite"><a href="#ref-5">5</a></sup> When you build
+  FerricDB's executor in Milestone 4, every operator struct you write is one of the symbols
+  below.</p>
+
+  <p><strong>Selection (σ)</strong> emits the subset of input tuples that satisfy a predicate; predicates
+  combine with conjunction and disjunction.<sup class="cite"><a href="#ref-1">1</a></sup> The SQL
+  counterpart is the <code>WHERE</code> clause: σ<sub>year=1994</sub>(albums) is
+  <code>SELECT * FROM albums WHERE year = 1994</code>.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p><strong>Projection (π)</strong> emits tuples containing only the listed attributes; it can also
+  reorder attributes and compute derived values, as in
+  π<sub>album_id−9000,&nbsp;title</sub>(albums).<sup class="cite"><a href="#ref-1">1</a></sup> Under the algebra's
+  set semantics, projection also eliminates any duplicates it exposes<sup class="cite"><a href="#ref-5">5</a></sup> —
+  whereas SQL's bag-based <code>SELECT</code> list keeps them unless you say
+  <code>DISTINCT</code>.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p><strong>Cross product (×)</strong> pairs every tuple of one relation with every tuple of the other,
+  concatenating their attributes; the schemas need not be
+  compatible.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-5">5</a></sup> On its own it is
+  rarely what you want — |R| · |S| rows — but it is the formal foundation of joins.</p>
+
+  <p><strong>Join (⋈)</strong> comes in flavors that are all definable from what you already have. The
+  theta join is a cross product followed by a selection:
+  R ⋈<sub>θ</sub> S = σ<sub>θ</sub>(R × S).<sup class="cite"><a href="#ref-5">5</a></sup> An <em>equi-join</em> is a
+  theta join whose predicate is pure equality, and the <em>natural join</em> equi-joins on every
+  attribute name the two relations share.<sup class="cite"><a href="#ref-1">1</a></sup> SQL's
+  <code>INNER JOIN … ON</code> is likewise syntactic sugar for a cross join plus a join
+  condition.<sup class="cite"><a href="#ref-4">4</a></sup> Outer joins additionally preserve unmatched rows
+  from the left, right, or both inputs, padding the missing side with
+  NULLs<sup class="cite"><a href="#ref-4">4</a></sup> — survey-level here; you implement join algorithms in
+  <a href="../m07-joins-sorting-aggregation/index.html">M07</a>.</p>
+
+  <p><strong>Rename (ρ)</strong> renames relations or attributes — the algebra's version of SQL aliasing —
+  and matters mostly for disambiguating self-joins and nested
+  expressions.<sup class="cite"><a href="#ref-5">5</a></sup></p>
+
+  <p><strong>Aggregation (γ)</strong> partitions its input by grouping columns and computes aggregate
+  functions such as <code>COUNT</code>, <code>SUM</code>, <code>MIN</code>, <code>MAX</code> per group, optionally
+  filtering groups — it is the algebraic home of both <code>GROUP BY</code> and
+  <code>HAVING</code>.<sup class="cite"><a href="#ref-5">5</a></sup> An aggregate function takes a bag of tuples
+  in and produces a single scalar out.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p><strong>Set operations</strong>, at survey level: union (∪) keeps tuples appearing in either input,
+  intersection (∩) keeps tuples appearing in both, and difference (−) keeps tuples of the first
+  input absent from the second; all three require the two inputs to have identical
+  attributes.<sup class="cite"><a href="#ref-1">1</a></sup> Their SQL surface is
+  <code>UNION</code>/<code>UNION ALL</code>, <code>INTERSECT</code>, and
+  <code>EXCEPT</code>.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Operator</th><th>Symbol</th><th>Meaning</th><th>SQL surface</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Selection</td><td>σ<sub>pred</sub>(R)</td><td>keep tuples satisfying pred<sup class="cite"><a href="#ref-1">1</a></sup></td><td><code>WHERE</code></td></tr>
+        <tr><td>Projection</td><td>π<sub>a,b,…</sub>(R)</td><td>keep/derive listed attributes<sup class="cite"><a href="#ref-1">1</a></sup></td><td><code>SELECT</code> list</td></tr>
+        <tr><td>Cross product</td><td>R × S</td><td>all pairings of tuples<sup class="cite"><a href="#ref-1">1</a></sup></td><td><code>CROSS JOIN</code>, <code>FROM R, S</code></td></tr>
+        <tr><td>Theta / inner join</td><td>R ⋈<sub>θ</sub> S</td><td>σ<sub>θ</sub>(R × S)<sup class="cite"><a href="#ref-5">5</a></sup></td><td><code>JOIN … ON</code></td></tr>
+        <tr><td>Rename</td><td>ρ(R)</td><td>rename relation/attributes<sup class="cite"><a href="#ref-5">5</a></sup></td><td><code>AS</code> aliases</td></tr>
+        <tr><td>Aggregation</td><td>γ<sub>cols,&nbsp;fns</sub>(R)</td><td>group and summarize<sup class="cite"><a href="#ref-5">5</a></sup></td><td><code>GROUP BY</code>/<code>HAVING</code></td></tr>
+        <tr><td>Union / intersect / difference</td><td>∪&nbsp;&nbsp;∩&nbsp;&nbsp;−</td><td>set combination of compatible relations<sup class="cite"><a href="#ref-1">1</a></sup></td><td><code>UNION</code>/<code>INTERSECT</code>/<code>EXCEPT</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="sec-sql-to-algebra">Mapping SQL clauses onto algebra</h2>
+
+  <p>A SQL query reads top-to-bottom in exactly the wrong order. Its <em>logical</em> processing
+  order — the order that defines what the query means — is: <code>FROM</code> (and joins), then
+  <code>WHERE</code>, then <code>GROUP BY</code>, then <code>HAVING</code>, then the <code>SELECT</code> list, then
+  <code>ORDER BY</code>, then <code>LIMIT</code>.<sup class="cite"><a href="#ref-3">3</a></sup> A real engine is free
+  to execute in some other order — that freedom is the subject of
+  <a href="#sec-declarative">the optimization section</a> — but the result must match this
+  specification.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall</span>
+    <p>The worst-named clause in computing: SQL's <code>SELECT</code> list is the algebra's
+    <em>projection</em> π. The algebra's <em>selection</em> σ corresponds to <code>WHERE</code>, not to
+    <code>SELECT</code>.<sup class="cite"><a href="#ref-5">5</a></sup> Interviewers love this one; so do bugs.</p>
+  </div>
+
+  <p>Two grouping rules complete the mapping. First, <code>WHERE</code> filters tuples <em>before</em>
+  grouping, while <code>HAVING</code> filters whole groups <em>after</em> aggregation — <code>HAVING</code>
+  behaves like a <code>WHERE</code> for <code>GROUP BY</code>.<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-2">2</a></sup>
+  Second, every non-aggregated expression in the <code>SELECT</code> list must appear in
+  <code>GROUP BY</code>, because a group has no single value for any other column.<sup class="cite"><a href="#ref-3">3</a></sup>
+  Most systems reject violations, but SQLite permits them and picks an arbitrary value from the
+  group, behavior the SQL:2023 standard legitimized with the <code>ANY_VALUE</code> aggregate.<sup class="cite"><a href="#ref-2">2</a></sup>
+  Note also that the standard-compliant way to filter on an aggregate is to repeat the aggregate
+  expression inside <code>HAVING</code> rather than referencing its output alias.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p><code>ORDER BY</code> and <code>LIMIT</code> sit at the edge of the algebra rather than inside it:
+  relations are unordered, so <code>ORDER BY</code> imposes a presentation order on the final result,
+  and a <code>LIMIT</code> without <code>ORDER BY</code> may legitimately return different rows on every
+  execution.<sup class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-3">3</a></sup> FerricDB still
+  implements them as executor operators (Sort, Limit) — a course choice that mirrors how the
+  Volcano-style engines you will study treat them, as plan nodes above the algebraic core.</p>
+
+  <figure>
+    <svg viewBox="0 0 960 440" role="img">
+      <title>A SQL query on the left with dashed lines connecting each clause to the corresponding operator in a relational algebra tree on the right: FROM to the scans, JOIN ON to the join node, WHERE to the selection node, SELECT to the projection node.</title>
+      <text x="40" y="45" class="d-text">SQL (declarative)</text>
+      <rect x="40" y="60" width="380" height="300" rx="10" class="d-box"/>
+      <text x="64" y="110" class="d-mono">SELECT ar.name, al.title</text>
+      <text x="64" y="155" class="d-mono">FROM artists AS ar</text>
+      <text x="64" y="200" class="d-mono">JOIN albums AS al</text>
+      <text x="64" y="245" class="d-mono">  ON ar.artist_id = al.artist_id</text>
+      <text x="64" y="290" class="d-mono">WHERE al.year = 1994</text>
+      <text x="560" y="45" class="d-text">Algebra tree (one possible plan)</text>
+      <!-- tree nodes -->
+      <rect x="600" y="70" width="200" height="50" rx="8" class="d-box"/>
+      <text x="700" y="90" text-anchor="middle" class="d-text">π ar.name, al.title</text>
+      <text x="700" y="108" text-anchor="middle" class="d-text-sm">projection</text>
+      <rect x="600" y="160" width="200" height="50" rx="8" class="d-box-hl"/>
+      <text x="700" y="180" text-anchor="middle" class="d-text">σ al.year = 1994</text>
+      <text x="700" y="198" text-anchor="middle" class="d-text-sm">selection</text>
+      <rect x="600" y="250" width="200" height="50" rx="8" class="d-box"/>
+      <text x="700" y="270" text-anchor="middle" class="d-text">⋈ on artist_id</text>
+      <text x="700" y="288" text-anchor="middle" class="d-mono-sm">ar.artist_id = al.artist_id</text>
+      <rect x="540" y="350" width="130" height="44" rx="8" class="d-box"/>
+      <text x="605" y="377" text-anchor="middle" class="d-mono">artists ar</text>
+      <rect x="730" y="350" width="130" height="44" rx="8" class="d-box"/>
+      <text x="795" y="377" text-anchor="middle" class="d-mono">albums al</text>
+      <!-- tree edges -->
+      <line x1="700" y1="160" x2="700" y2="120" class="d-line"/>
+      <line x1="700" y1="250" x2="700" y2="210" class="d-line"/>
+      <line x1="605" y1="350" x2="660" y2="300" class="d-line"/>
+      <line x1="795" y1="350" x2="740" y2="300" class="d-line"/>
+      <!-- clause-to-operator connectors -->
+      <path d="M 300 106 C 460 106, 480 95, 596 95" class="d-line" stroke-dasharray="5 4"/>
+      <path d="M 290 286 C 450 286, 450 185, 596 185" class="d-line" stroke-dasharray="5 4"/>
+      <path d="M 330 220 C 480 220, 470 275, 596 275" class="d-line" stroke-dasharray="5 4"/>
+      <path d="M 260 151 C 440 151, 420 372, 536 372" class="d-line" stroke-dasharray="5 4"/>
+      <text x="480" y="425" text-anchor="middle" class="d-text-sm">logical order: FROM / JOIN first, then WHERE, then SELECT — the tree evaluates bottom-up</text>
+    </svg>
+    <figcaption>Figure 2 — the same query twice. Each SQL clause maps to one algebra operator; the tree
+    is read bottom-up: scan both tables, join, filter, project. This is only <em>one</em> of the equivalent
+    trees for this query — the widget below explores the others.</figcaption>
+  </figure>
+
+  <h3 id="sec-worked">Worked example: one query, counted tuple by tuple</h3>
+
+  <p>Fix concrete numbers for the schema of Figure 1: <code>artists</code> holds 5,000 rows and
+  <code>albums</code> holds 40,000 rows, of which 800 (2%) have <code>year = 1994</code>; every album
+  references exactly one artist. Evaluate the canonical tree of Figure 2 bottom-up:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Step</th><th>Operator</th><th>Rows out</th><th>Why</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>1</td><td>× (conceptually)</td><td>200,000,000</td><td>5,000 × 40,000 pairings — the definition of the cross product<sup class="cite"><a href="#ref-1">1</a></sup></td></tr>
+        <tr><td>2</td><td>σ<sub>ar.artist_id&nbsp;=&nbsp;al.artist_id</sub></td><td>40,000</td><td>each album pairs with exactly one artist (foreign key)</td></tr>
+        <tr><td>3</td><td>σ<sub>al.year&nbsp;=&nbsp;1994</sub></td><td>800</td><td>2% selectivity on the filter</td></tr>
+        <tr><td>4</td><td>π<sub>name,&nbsp;title</sub></td><td>800</td><td>projection changes width, not (here) count</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Step 1 is why no engine evaluates joins by materializing the cross product: the identity
+  R ⋈<sub>θ</sub> S = σ<sub>θ</sub>(R × S) defines the join's <em>meaning</em>,<sup class="cite"><a href="#ref-5">5</a></sup> while the executor computes
+  the combined operation directly — steps 1 and 2 fuse into a single join operator that outputs
+  40,000 rows without ever holding 200 million. Even so, this
+  plan does 50× more join work than necessary; the fix is the subject of
+  <a href="#sec-declarative">the optimization section</a>.</p>
+
+  <h2 id="sec-null">NULL and three-valued logic</h2>
+
+  <p>Every attribute may be NULL, meaning that the value is unknown or undefined for that
+  tuple.<sup class="cite"><a href="#ref-1">1</a></sup> Because NULL is an <em>unknown</em>, comparing anything
+  to it cannot honestly yield true or false: <code>7 = NULL</code> evaluates to NULL, and so does
+  <code>NULL = NULL</code> — it is not known whether two unknown values are
+  equal.<sup class="cite"><a href="#ref-8">8</a></sup> That gives SQL's boolean expressions three possible
+  values — true, false, and unknown (NULL) — with the following truth
+  tables:<sup class="cite"><a href="#ref-7">7</a></sup></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>a</th><th>b</th><th>a AND b</th><th>a OR b</th></tr></thead>
+      <tbody>
+        <tr><td>TRUE</td><td>TRUE</td><td>TRUE</td><td>TRUE</td></tr>
+        <tr><td>TRUE</td><td>FALSE</td><td>FALSE</td><td>TRUE</td></tr>
+        <tr><td>TRUE</td><td><strong>NULL</strong></td><td><strong>NULL</strong></td><td>TRUE</td></tr>
+        <tr><td>FALSE</td><td>FALSE</td><td>FALSE</td><td>FALSE</td></tr>
+        <tr><td>FALSE</td><td><strong>NULL</strong></td><td>FALSE</td><td><strong>NULL</strong></td></tr>
+        <tr><td><strong>NULL</strong></td><td><strong>NULL</strong></td><td><strong>NULL</strong></td><td><strong>NULL</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>a</th><th>NOT a</th></tr></thead>
+      <tbody>
+        <tr><td>TRUE</td><td>FALSE</td></tr>
+        <tr><td>FALSE</td><td>TRUE</td></tr>
+        <tr><td><strong>NULL</strong></td><td><strong>NULL</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>The tables encode one intuition: a result is NULL only when the unknown input could change
+  the answer. <code>TRUE OR NULL</code> is TRUE — the expression is true no matter what the unknown
+  turns out to be — and <code>FALSE AND NULL</code> is FALSE for the same
+  reason.<sup class="cite"><a href="#ref-7">7</a></sup> A <code>WHERE</code> clause then keeps only rows whose
+  predicate evaluates to TRUE; rows that evaluate to NULL are excluded just like FALSE
+  ones.<sup class="cite"><a href="#ref-3">3</a></sup> So a row with <code>age = NULL</code> and
+  <code>num_dogs = 3</code> <em>does</em> satisfy <code>WHERE age &lt;= 20 OR num_dogs = 3</code> — the second
+  disjunct settles the question regardless of the unknown age.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <div class="callout tip">
+    <span class="callout-title">Tip</span>
+    <p>To test for NULL, use the predicates built for it: <code>IS NULL</code> and
+    <code>IS NOT NULL</code>.<sup class="cite"><a href="#ref-8">8</a></sup> When you need equality that treats
+    NULL as an ordinary comparable value, use <code>IS [NOT] DISTINCT FROM</code>:
+    <code>NULL IS DISTINCT FROM NULL</code> is <em>false</em>, not NULL.<sup class="cite"><a href="#ref-8">8</a></sup>
+    And <code>IS TRUE / IS FALSE / IS UNKNOWN</code> always return true or false, never
+    NULL<sup class="cite"><a href="#ref-8">8</a></sup> — handy at the top of a predicate tree. FerricDB's
+    expression evaluator in Milestone 4 must implement exactly these rules.</p>
+  </div>
+
+  <p>Aggregates add one more wrinkle: every aggregate function ignores NULL inputs, except
+  <code>COUNT(*)</code>, which counts rows.<sup class="cite"><a href="#ref-3">3</a></sup> Concretely: in a
+  6-row table whose <code>email</code> column contains 2 NULLs, <code>COUNT(*)</code> returns 6 while
+  <code>COUNT(email)</code> returns 4,<sup class="cite"><a href="#ref-3">3</a></sup> and an <code>AVG</code> over a
+  column with NULLs averages only the non-NULL values.<sup class="cite"><a href="#ref-3">3</a></sup>
+  (<code>COUNT(*)</code>, <code>COUNT(1)</code>, and <code>COUNT(login)</code> on a NULL-free column are
+  equivalent ways to count rows.<sup class="cite"><a href="#ref-2">2</a></sup>)</p>
+
+  <p>Where things get genuinely inconsistent is <em>duplicate detection</em>. For <code>UNIQUE</code>
+  constraints, NULLs are treated as distinct — two NULLs do not collide — yet for
+  <code>SELECT DISTINCT</code> and <code>UNION</code>, NULLs are treated as <em>indistinct</em> and collapse
+  into one; SQLite's documentation flags this asymmetry as puzzling — yet every engine it surveys
+  behaves this way — and SQLite was deliberately modified to match Oracle, PostgreSQL, and DB2 on
+  it.<sup class="cite"><a href="#ref-10">10</a></sup></p>
+
+  <div class="tabs">
+    <div class="tab-list" role="tablist">
+      <button role="tab" aria-selected="true" type="button">PostgreSQL</button>
+      <button role="tab" aria-selected="false" type="button">SQLite</button>
+    </div>
+    <div class="tab-panel">
+      <ul>
+        <li>Primary key = unique + not-null; at most one per table; NULL never allowed in PK
+        columns.<sup class="cite"><a href="#ref-9">9</a></sup></li>
+        <li><code>UNIQUE</code> treats NULLs as distinct by default (many NULL rows allowed), but you can
+        opt into <code>UNIQUE NULLS NOT DISTINCT</code> to allow at most one NULL.<sup class="cite"><a href="#ref-9">9</a></sup></li>
+        <li>A foreign-key row with a NULL referencing column escapes the constraint check by
+        default; <code>MATCH FULL</code> or <code>NOT NULL</code> tighten this.<sup class="cite"><a href="#ref-9">9</a></sup></li>
+        <li><code>CHECK</code> constraints pass on true <em>or NULL</em> — a NULL price satisfies
+        <code>CHECK (price &gt; 0)</code>.<sup class="cite"><a href="#ref-9">9</a></sup></li>
+      </ul>
+    </div>
+    <div class="tab-panel" hidden>
+      <ul>
+        <li>NULLs are allowed in <code>PRIMARY KEY</code> columns (historical bug, kept for backward
+        compatibility) unless the column is <code>INTEGER PRIMARY KEY</code>, declared
+        <code>NOT NULL</code>, or the table is <code>WITHOUT ROWID</code> or <code>STRICT</code>.<sup class="cite"><a href="#ref-11">11</a></sup></li>
+        <li>For <code>UNIQUE</code> constraints, NULL is distinct from every value including other
+        NULLs — many NULLs coexist, matching PostgreSQL's default.<sup class="cite"><a href="#ref-11">11</a></sup><sup class="cite"><a href="#ref-10">10</a></sup></li>
+        <li><code>SELECT DISTINCT</code> and <code>UNION</code> treat NULLs as indistinct — one NULL survives —
+        matching Oracle, PostgreSQL, and DB2.<sup class="cite"><a href="#ref-10">10</a></sup></li>
+        <li>Ordinary tables are <em>rowid tables</em>: a 64-bit signed integer rowid keys the table's
+        B-tree even if you never declared it.<sup class="cite"><a href="#ref-11">11</a></sup></li>
+      </ul>
+    </div>
+  </div>
+
+  <p>FerricDB's course choice: our <code>UNIQUE</code> and NULL semantics follow PostgreSQL's defaults
+  (NULLs distinct in unique indexes, excluded by WHERE unless the predicate is TRUE), because
+  that is the behavior the test harness asserts from Milestone 4 onward.</p>
+
+  <h2 id="sec-declarative">Why declarative queries enable optimization</h2>
+
+  <p>Here is the payoff of everything above. Consider
+  σ<sub>b_id=102</sub>(R ⋈ S) versus R ⋈ (σ<sub>b_id=102</sub>(S)): the first joins everything and then
+  filters; the second filters S first and joins only the survivors. The two expressions
+  <em>always</em> produce the same answer — but if S has a billion tuples and one of them has
+  <code>b_id = 102</code>, the second is dramatically faster.<sup class="cite"><a href="#ref-1">1</a></sup>
+  If you were writing procedural code against a data-structure API, choosing between these would
+  be your job, forever, for every query, re-done whenever the data changed.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>SQL's contract is that you state <em>what</em> you want and never <em>how</em> to compute it; the
+  DBMS finds the best strategy through query optimization, and this abstraction is what made SQL
+  the de facto standard for querying relational systems.<sup class="cite"><a href="#ref-1">1</a></sup>
+  The mechanism is algebraic: because many different algebra expressions are equivalent — filter
+  before or after a join, project early or late — one SQL query admits many plans, and the
+  optimizer's job is to search that space for a cheap one.<sup class="cite"><a href="#ref-5">5</a></sup>
+  Honesty from the field: the first SQL optimizers were slow and ineffective, they improved
+  immensely over five decades, and the optimizer remains the hardest part of a DBMS to
+  build.<sup class="cite"><a href="#ref-6">6</a></sup> You will build a small one in
+  <a href="../m08-query-optimization/index.html">M08</a>.</p>
+
+  <p>The widget below makes the search space tangible with the worked example's numbers
+  (5,000 artists ⋈ 40,000 albums, 800 albums from 1994). Even without running it, the arithmetic
+  tells the story: pushing the selection below the join shrinks the join's album-side input from
+  40,000 rows to 800 — a 50× reduction — and pruning unused columns at the scans narrows every
+  intermediate tuple, together cutting the cells (row × column values) flowing through the plan
+  from 462,200 to 138,000. Same answer, roughly 3.3× less data touched.</p>
+
+  <div class="widget" id="widget-ra-tree">
+    <p class="widget-title">Interactive: one query, four equivalent plans</p>
+    <p class="widget-sub">The query from Figure 2. Toggle rewrites and watch the algebra tree re-render
+    with estimated row counts on every operator. Both rewrites preserve the result — only cost changes.</p>
+    <div class="controls">
+      <label><input type="checkbox" id="ra-push"> Push selection below the join</label>
+      <label><input type="checkbox" id="ra-prune"> Prune projections into the scans</label>
+      <button class="btn" type="button" id="ra-reset">↺ Reset</button>
+    </div>
+    <div class="stat-row">
+      <span class="stat">Join output rows: <b id="ra-join-rows">40,000</b></span>
+      <span class="stat">Cells flowing through the plan: <b id="ra-cells">462,200</b></span>
+      <span class="stat">vs. canonical plan: <b id="ra-factor">1.0×</b></span>
+    </div>
+    <div id="ra-note" class="stepper-caption" role="status">Canonical plan straight from the SQL:
+    join everything, then filter, then project. (Enable JavaScript to interact.)</div>
+    <div id="ra-canvas"></div>
+  </div>
+
+  <p>What to notice while toggling: the σ node's <em>position</em> changes but its predicate does
+  not; the row counts on every edge above it change; and the projection rewrite changes no row
+  count at all — only tuple width. Pushing selections and projections down as far as they can go
+  is the first heuristic an optimizer applies, precisely because it only ever shrinks
+  intermediate results.<sup class="cite"><a href="#ref-12">12</a></sup> In FerricDB these arrive as rewrite
+  rules over the plan tree in Milestone 7's planner work, but the executor you write in
+  Milestone 4 must already treat plans as arbitrary operator trees so that any equivalent shape
+  runs correctly.</p>
+
+  <h2 id="sec-winning">Why the relational model keeps winning</h2>
+
+  <p>You are about to spend months building a relational engine, so it is fair to ask whether
+  the model is worth the investment. In 2005, Stonebraker co-authored a Red Book chapter arguing
+  that the relational model and SQL had prevailed over every alternative data model to date; the
+  2024 sequel by Stonebraker and Pavlo revisits two more decades and reaches the same verdict —
+  the relational model remains dominant, and SQL keeps absorbing the best ideas from its
+  challengers.<sup class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <p>The case studies rhyme. MapReduce arrived with enormous enthusiasm, but Google itself moved
+  its crawl processing off MR and announced in 2014 that the technology had no future place in
+  its stack; Hadoop's market cratered.<sup class="cite"><a href="#ref-6">6</a></sup> Key-value stores either
+  matured into relational systems or settled into niches — an RDBMS can easily emulate a KV
+  store, while re-engineering a KV store into a full data model is much
+  harder.<sup class="cite"><a href="#ref-6">6</a></sup> The NoSQL document databases marketed themselves on
+  two claims — SQL and joins are slow, and ACID transactions are unnecessary (BASE suffices) —
+  yet by the end of the 2010s almost every NoSQL DBMS had added a SQL interface, with MongoDB the
+  last holdout in 2021, and many added strongly consistent transactions as
+  well.<sup class="cite"><a href="#ref-6">6</a></sup> The slogan itself retreated from "do not use SQL — it
+  is too slow" to "Not only SQL".<sup class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <p>The paper's explanation is the one this module has been building: higher-level declarative
+  languages require less code and provide greater data independence than record-at-a-time
+  interfaces, and the historical burden of writing an optimizer — the price of going declarative —
+  is likely part of why early NoSQL systems skipped SQL in the first
+  place.<sup class="cite"><a href="#ref-6">6</a></sup> Stonebraker and Pavlo predict the cycle will continue:
+  new waves will declare SQL and the relational model insufficient, propose replacements, and end
+  up donating their good ideas to the SQL standard, without supplanting the
+  model.<sup class="cite"><a href="#ref-6">6</a></sup> For this course the conclusion is practical: the
+  relational core you are building is the durable center of the field, not a historical
+  curiosity.</p>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="SQL's SELECT list corresponds to projection π (choosing and computing output columns). The algebra's selection σ filters rows by a predicate, which is what WHERE does. The names are historical and permanently confusing — internalize the mapping now, because FerricDB's plan nodes are named Filter (σ) and Project (π).">
+    <legend class="quiz-q">In relational algebra, which operator corresponds to SQL's <code>WHERE</code> clause?</legend>
+    <label><input type="radio" name="q1"> Projection π — it selects which parts of the data survive</label>
+    <label><input type="radio" name="q1" data-correct> Selection σ — it keeps the tuples whose predicate is true</label>
+    <label><input type="radio" name="q1"> Cross product × — it pairs tuples before filtering</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Evaluate with three-valued logic: age <= 20 is NULL (unknown), num_dogs = 3 is TRUE, and NULL OR TRUE is TRUE — the unknown operand cannot change the outcome. WHERE keeps rows whose predicate is TRUE, so the row qualifies. Had the predicate used AND, TRUE AND NULL would be NULL and the row would be excluded.">
+    <legend class="quiz-q">A row has <code>age = NULL</code> and <code>num_dogs = 3</code>. Does it satisfy
+    <code>WHERE age &lt;= 20 OR num_dogs = 3</code>?</legend>
+    <label><input type="radio" name="q2" data-correct> Yes — the second disjunct is TRUE, so the whole predicate is TRUE</label>
+    <label><input type="radio" name="q2"> No — any predicate touching a NULL evaluates to NULL and is excluded</label>
+    <label><input type="radio" name="q2"> The query raises an error because NULL cannot be compared</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="COUNT(*) counts rows regardless of content, so it returns 6. Every other aggregate — including COUNT(email) — ignores NULL inputs, so it counts only the 4 non-NULL emails. The same rule means AVG, SUM, MIN, and MAX silently skip NULLs rather than poisoning the result.">
+    <legend class="quiz-q">A table has 6 rows; its <code>email</code> column contains 2 NULLs. What do
+    <code>COUNT(*)</code> and <code>COUNT(email)</code> return?</legend>
+    <label><input type="radio" name="q3"> 6 and 6 — COUNT always counts rows</label>
+    <label><input type="radio" name="q3" data-correct> 6 and 4 — COUNT(*) counts rows, COUNT(email) counts non-NULL values</label>
+    <label><input type="radio" name="q3"> 4 and 4 — rows with NULLs are excluded from aggregation entirely</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="A table may have many candidate keys, each declarable as a UNIQUE constraint, but at most one is designated the primary key. In PostgreSQL a primary key implies NOT NULL, so the third option is false there — and it is exactly the property SQLite historically fails to enforce for non-INTEGER primary keys in ordinary rowid tables. Foreign keys must reference a primary key or unique constraint, so the second option is backwards.">
+    <legend class="quiz-q">Which statement about keys is correct?</legend>
+    <label><input type="radio" name="q4" data-correct> A table can have several unique (candidate) keys, but at most one primary key</label>
+    <label><input type="radio" name="q4"> A foreign key may reference any column, constrained or not</label>
+    <label><input type="radio" name="q4"> In PostgreSQL, primary-key columns may contain NULLs</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="The rewrite is legal because the two expressions are algebraically equivalent — they produce identical results on every possible database instance, while their costs can differ by orders of magnitude. SQL's clause order defines the meaning of a query, not its execution order, and selection certainly does not commute with everything (pushing a filter on an aggregate's output below the aggregation would change the answer).">
+    <legend class="quiz-q">Why may the planner rewrite σ above a join into σ below the join?</legend>
+    <label><input type="radio" name="q5"> Because SQL prescribes that WHERE executes before FROM</label>
+    <label><input type="radio" name="q5" data-correct> Because the two trees are algebraically equivalent: same result guaranteed, potentially very different cost</label>
+    <label><input type="radio" name="q5"> Because selection commutes with every other operator, including aggregation</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Pure relational algebra operates on sets, which cannot contain duplicates — projection deduplicates automatically. SQL chose bags (duplicates allowed) to avoid paying for deduplication on every operation; DISTINCT is the explicit opt-in back to set semantics. So duplicate output rows are normal, standard-conforming SQL behavior.">
+    <legend class="quiz-q">Your SQL query returns duplicate rows. Which statement is true?</legend>
+    <label><input type="radio" name="q6" data-correct> SQL relations are bags: duplicates are allowed unless you request DISTINCT</label>
+    <label><input type="radio" name="q6"> Pure relational algebra also allows duplicate tuples in a relation</label>
+    <label><input type="radio" name="q6"> Duplicates mean the table is missing a primary key, which is illegal</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Andy Pavlo, “Lecture #01: Relational Model &amp; Algebra”, CMU 15-445/645 Database Systems (Fall 2025) lecture notes. <a href="https://15445.courses.cs.cmu.edu/fall2025/notes/01-relationalmodel.pdf" rel="external">https://15445.courses.cs.cmu.edu/fall2025/notes/01-relationalmodel.pdf</a></li>
+        <li id="ref-2">Andy Pavlo, “Lecture #02: Modern SQL”, CMU 15-445/645 Database Systems (Fall 2025) lecture notes. <a href="https://15445.courses.cs.cmu.edu/fall2025/notes/02-modernsql.pdf" rel="external">https://15445.courses.cs.cmu.edu/fall2025/notes/02-modernsql.pdf</a></li>
+        <li id="ref-3">Berkeley CS186 course staff, “Note 1: SQL Part I”, CS186 Database Systems notes. <a href="https://cs186berkeley.net/notes/note1/" rel="external">https://cs186berkeley.net/notes/note1/</a></li>
+        <li id="ref-4">Berkeley CS186 course staff, “Note 2: SQL Part II — Joins &amp; Subqueries”, CS186 Database Systems notes. <a href="https://cs186berkeley.net/notes/note2/" rel="external">https://cs186berkeley.net/notes/note2/</a></li>
+        <li id="ref-5">Berkeley CS186 course staff, “Note 6: Relational Algebra”, CS186 Database Systems notes. <a href="https://cs186berkeley.net/notes/note6/" rel="external">https://cs186berkeley.net/notes/note6/</a></li>
+        <li id="ref-6">Michael Stonebraker and Andrew Pavlo, “What Goes Around Comes Around... And Around...”, SIGMOD Record 53(2), 2024. <a href="https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf" rel="external">https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf</a></li>
+        <li id="ref-7">PostgreSQL documentation, “9.1. Logical Operators”. <a href="https://www.postgresql.org/docs/current/functions-logical.html" rel="external">https://www.postgresql.org/docs/current/functions-logical.html</a></li>
+        <li id="ref-8">PostgreSQL documentation, “9.2. Comparison Functions and Operators”. <a href="https://www.postgresql.org/docs/current/functions-comparison.html" rel="external">https://www.postgresql.org/docs/current/functions-comparison.html</a></li>
+        <li id="ref-9">PostgreSQL documentation, “5.5. Constraints”. <a href="https://www.postgresql.org/docs/current/ddl-constraints.html" rel="external">https://www.postgresql.org/docs/current/ddl-constraints.html</a></li>
+        <li id="ref-10">SQLite documentation, “NULL Handling in SQLite”. <a href="https://sqlite.org/nulls.html" rel="external">https://sqlite.org/nulls.html</a></li>
+        <li id="ref-11">SQLite documentation, “CREATE TABLE”. <a href="https://sqlite.org/lang_createtable.html" rel="external">https://sqlite.org/lang_createtable.html</a></li>
+        <li id="ref-12">Berkeley CS186 course staff, “Note 10: Query Optimization”, CS186 Database Systems notes. <a href="https://cs186berkeley.net/notes/note10/" rel="external">https://cs186berkeley.net/notes/note10/</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>Window functions, common table expressions, and lateral joins — the modern SQL surface beyond
+      the core mapped in this module. <a href="https://15445.courses.cs.cmu.edu/fall2025/notes/02-modernsql.pdf">CMU 15-445 Lecture #02: Modern SQL</a></li>
+      <li>Outer joins, correlated subqueries, and <code>EXISTS</code>/<code>ANY</code>/<code>ALL</code> with worked
+      examples. <a href="https://cs186berkeley.net/notes/note2/">CS186 Note 2: SQL Part II</a></li>
+      <li>The cross-engine NULL behavior chart — how a dozen SQL engines disagree on NULL corner cases.
+      <a href="https://sqlite.org/nulls.html">SQLite: NULL Handling</a></li>
+      <li>Section 3 of the Stonebraker/Pavlo survey: how columnar storage, the cloud, and data lakes
+      reshaped relational <em>implementations</em> while the model stood still.
+      <a href="https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf">What Goes Around Comes Around... And Around...</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>No milestone builds relational algebra directly — this module is pure vocabulary. The place
+    that vocabulary becomes load-bearing is
+    <a href="../../project/milestone-04/index.html">Milestone 4 — Volcano Executor</a>: its operator
+    tree implements exactly this algebra (sequential scan, filter σ, projection π, nested-loop join ⋈,
+    aggregation γ, sort, limit), and every module and milestone from there onward speaks it. Nothing
+    to build right now: continue to <a href="../m02-storage/index.html">M02</a> and then
+    <a href="../../project/milestone-01/index.html">Milestone 1</a>.</p>
+
+    <nav class="prevnext">
+      <a href="../../project/milestone-00/index.html"><span class="dir">← Previous</span> Milestone 0 · Skeleton, REPL, Test Harness</a>
+      <a class="next" href="../m02-storage/index.html"><span class="dir">Next →</span> M02 · Storage: Files, Pages, Tuples</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+/* M01 widget: interactive relational-algebra tree with equivalence toggles. */
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  (function () {
+    var canvas = document.getElementById("ra-canvas");
+    if (!canvas || !window.Course) return;
+
+    var pushBox = document.getElementById("ra-push");
+    var pruneBox = document.getElementById("ra-prune");
+    var resetBtn = document.getElementById("ra-reset");
+    var joinStat = document.getElementById("ra-join-rows");
+    var cellStat = document.getElementById("ra-cells");
+    var factorStat = document.getElementById("ra-factor");
+    var note = document.getElementById("ra-note");
+
+    var NODE_W = 220, NODE_H = 62, ROW_H = 105, X0 = 250, LEAF_GAP = 400;
+
+    var NOTES = [
+      "Canonical plan straight from the SQL: join everything, then filter, then project. The join processes 50× more rows than the query needs.",
+      "Selection pushed below the join: the filter runs against the albums scan, so only 800 of 40,000 albums ever reach the join.",
+      "Projections pruned into the scans: identical row counts everywhere, but every intermediate tuple is narrower — fewer cells move.",
+      "Both rewrites: the join sees 50× fewer rows and every tuple is narrower. Same answer as the canonical plan, a fraction of the work."
+    ];
+
+    function fmt(n) {
+      return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+    }
+
+    function makePlan(push, prune) {
+      var artists = {
+        op: prune ? "Scan artists (pruned)" : "Scan artists",
+        rows: 5000, cols: prune ? 2 : 3,
+        cls: prune ? "d-box-good" : "d-box", children: []
+      };
+      var albums = {
+        op: prune ? "Scan albums (pruned)" : "Scan albums",
+        rows: 40000, cols: prune ? 3 : 4,
+        cls: prune ? "d-box-good" : "d-box", children: []
+      };
+      var joinCols = artists.cols + albums.cols;
+      var sigma, join;
+      if (push) {
+        sigma = { op: "σ year = 1994", rows: 800, cols: albums.cols, cls: "d-box-hl", children: [albums] };
+        join = { op: "⋈ on artist_id", rows: 800, cols: joinCols, cls: "d-box", children: [artists, sigma] };
+        return { op: "π name, title", rows: 800, cols: 2, cls: "d-box", children: [join] };
+      }
+      join = { op: "⋈ on artist_id", rows: 40000, cols: joinCols, cls: "d-box", children: [artists, albums] };
+      sigma = { op: "σ year = 1994", rows: 800, cols: joinCols, cls: "d-box-hl", children: [join] };
+      return { op: "π name, title", rows: 800, cols: 2, cls: "d-box", children: [sigma] };
+    }
+
+    /* Assign x by leaf order, y by depth; internal nodes centered over children. */
+    function layout(root) {
+      var leafIdx = 0, maxDepth = 0, nodes = [];
+      function walk(node, depth) {
+        node.depth = depth;
+        nodes.push(node);
+        if (depth > maxDepth) maxDepth = depth;
+        if (node.children.length === 0) {
+          node.x = X0 + leafIdx * LEAF_GAP;
+          leafIdx += 1;
+        } else {
+          var sum = 0;
+          node.children.forEach(function (c) { sum += walk(c, depth + 1); });
+          node.x = sum / node.children.length;
+        }
+        return node.x;
+      }
+      walk(root, 0);
+      return { nodes: nodes, maxDepth: maxDepth };
+    }
+
+    function totals(nodes) {
+      var cells = 0, joinRows = 0;
+      nodes.forEach(function (n) {
+        cells += n.rows * n.cols;
+        if (n.op.charAt(0) === "⋈") joinRows = n.rows;
+      });
+      return { cells: cells, joinRows: joinRows };
+    }
+
+    var BASE_CELLS = totals(layout(makePlan(false, false)).nodes).cells;
+
+    function render() {
+      var push = pushBox.checked, prune = pruneBox.checked;
+      var info = layout(makePlan(push, prune));
+      var height = 30 + (info.maxDepth + 1) * ROW_H;
+      var svg = Course.svgEl("svg", { viewBox: "0 0 900 " + height, role: "img", width: "100%" });
+      svg.appendChild(Course.svgEl("title", null,
+        "Relational algebra plan tree; each operator is annotated with estimated output rows and columns."));
+
+      function yOf(node) { return 15 + node.depth * ROW_H; }
+
+      /* edges first, so nodes paint over them */
+      info.nodes.forEach(function (n) {
+        n.children.forEach(function (c) {
+          svg.appendChild(Course.svgEl("line", {
+            x1: c.x, y1: yOf(c), x2: n.x, y2: yOf(n) + NODE_H, "class": "d-line"
+          }));
+        });
+      });
+
+      info.nodes.forEach(function (n) {
+        var y = yOf(n);
+        svg.appendChild(Course.svgEl("rect", {
+          x: n.x - NODE_W / 2, y: y, width: NODE_W, height: NODE_H, rx: 8, "class": n.cls
+        }));
+        svg.appendChild(Course.svgEl("text", {
+          x: n.x, y: y + 25, "text-anchor": "middle", "class": "d-text"
+        }, n.op));
+        svg.appendChild(Course.svgEl("text", {
+          x: n.x, y: y + 46, "text-anchor": "middle", "class": "d-mono-sm"
+        }, "out: " + fmt(n.rows) + " rows × " + n.cols + " cols"));
+      });
+
+      while (canvas.firstChild) canvas.removeChild(canvas.firstChild);
+      canvas.appendChild(svg);
+
+      var t = totals(info.nodes);
+      joinStat.textContent = fmt(t.joinRows);
+      cellStat.textContent = fmt(t.cells);
+      factorStat.textContent = t.cells === BASE_CELLS
+        ? "1.0× (baseline)"
+        : (BASE_CELLS / t.cells).toFixed(1) + "× less data";
+      note.textContent = NOTES[(push ? 1 : 0) + (prune ? 2 : 0)];
+    }
+
+    pushBox.addEventListener("change", render);
+    pruneBox.addEventListener("change", render);
+    resetBtn.addEventListener("click", function () {
+      pushBox.checked = false;
+      pruneBox.checked = false;
+      render();
+    });
+
+    render();
+  })();
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+[package]
+name = "ferricdb-server"
+description = "FerricDB network server (Milestone 10): hand-rolled PostgreSQL wire protocol v3 over tokio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferricdb-common = { workspace = true }
+ferricdb-exec = { workspace = true }
+ferricdb-catalog = { workspace = true }
+ferricdb-txn = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }

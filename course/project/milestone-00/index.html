@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 0 · Skeleton, REPL, and Test Harness — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 0</span>
+  </nav>
+  <span class="badge milestone">Milestone 0</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 0 · Skeleton, REPL, and Test Harness</h1>
+  <p class="subtitle">Get the machinery running: tour the workspace, implement the interactive
+  shell every later milestone is driven from, and turn on CI so quality never regresses.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <p>SQLite's tutorial-clone lineage starts every build-a-database project the same way: with a
+  REPL — read a line, decide whether it is a command for the shell or a statement for the engine,
+  loop.<sup class="cite"><a href="#ref-1">1</a></sup> There is a reason. The shell is the harness
+  you will live in for the next ten milestones: every layer you build gets poked from this prompt
+  minutes after it compiles. This milestone is deliberately light on database theory — it is
+  about owning your tools before the real work starts.</p>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li><strong>Navigate</strong> the FerricDB workspace: what each crate owns, what is provided,
+      what is stubbed, and how the crates depend on each other.</li>
+    <li><strong>Implement</strong> an interactive REPL with <code>rustyline</code>: line editing,
+      history, and a meta-command dispatcher.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Explain</strong> the front-end/engine split — why meta-commands are dispatched
+      before SQL ever reaches a parser.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Operate</strong> the provided test inventory: run it, list what is ignored, and
+      un-ignore a milestone group on purpose.</li>
+    <li><strong>Wire</strong> CI so <code>fmt</code>, <code>clippy</code>, and the test suite
+      gate every change.</li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m00-orientation/index.html">M00 · Orientation</a> — the course map
+      and the anatomy of the system you are about to build. Read it first.</li>
+    <li>cstack, <em>Let's Build a Simple Database</em>, Part 1 — the canonical "REPL first"
+      opening move, mirroring how SQLite itself greets the world.
+      <a href="https://cstack.github.io/db_tutorial/parts/part1.html" rel="external">cstack.github.io/db_tutorial/parts/part1.html</a></li>
+    <li>rustyline API documentation — the editor loop, history, and error variants
+      (<code>ReadlineError::Interrupted</code>, <code>Eof</code>) you will handle.
+      <a href="https://docs.rs/rustyline" rel="external">docs.rs/rustyline</a></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — the full system. Nothing lights up yet: the REPL you build in this
+    milestone is the shell <em>around</em> all of it, and every later milestone lights boxes up
+    one by one.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+  <p>The workspace at <code>course/ferricdb/</code> is provided: the root manifest pins the
+  <a href="../index.html#sec-rules">allowed dependencies</a>, <code>crates/common</code> ships
+  fully implemented (values, schemas, errors — run its tests now), and every other crate declares
+  its public API as documented stubs. Your work lives in <code>crates/ferricdb</code>:</p>
+
+  <pre><code>// crates/ferricdb/src/repl.rs — the surface you implement
+// (signatures from the workspace API contract, docs/api-spec.md;
+// the stub file has the full doc comments)
+
+/// Interactive shell: reads SQL lines / meta-commands, prints result tables.
+/// Meta-commands: .help  .exit  .tables  .schema &lt;table&gt;  .ast &lt;sql&gt;  .open &lt;path&gt;
+pub struct Repl { /* ExecContext + rustyline editor */ }
+
+impl Repl {
+    pub fn new(db_path: Option&lt;&amp;Path&gt;) -&gt; Result&lt;Self&gt;;
+    pub fn run(&amp;mut self) -&gt; Result&lt;()&gt;;
+}
+
+// crates/ferricdb/src/main.rs — already sketched:
+// ferricdb [--db &lt;path&gt;] [--serve [addr]]     (--serve activates in MS10)</code></pre>
+
+  <p>Behavior contract for this milestone:</p>
+  <ul>
+    <li>Lines starting with <code>.</code> are meta-commands, dispatched <em>before</em> any SQL
+      handling — the same split SQLite's shell makes.<sup class="cite"><a href="#ref-1">1</a></sup>
+      Unknown meta-commands print an error and a pointer to <code>.help</code>.</li>
+    <li><code>.help</code> lists all six meta-commands with one-line descriptions.</li>
+    <li><code>.exit</code> ends the session cleanly; so do <kbd>Ctrl-D</kbd> (EOF) and
+      <kbd>Ctrl-C</kbd> at an empty prompt.</li>
+    <li><code>.tables</code> and <code>.schema</code> will read the catalog from Milestone 3
+      onward; today they print a friendly "no catalog yet" message.</li>
+    <li><code>.ast</code> activates in Milestone 3 (it pretty-prints the parse tree);
+      <code>.open</code> switches the database file once storage exists in Milestone 1.</li>
+    <li>Anything else is a statement: for now, echo it back with a note that execution arrives in
+      Milestone 4. Statements may span lines until a terminating <code>;</code> — build that
+      buffering now and the parser slots in later without touching the loop.</li>
+  </ul>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <ol>
+    <li><strong>Tour before you type.</strong> <code>cargo test --workspace</code> — green, with a
+      long list of ignored tests. That list is the course contents in test form:
+      <code>cargo test --workspace -- --list --ignored</code>. Skim <code>crates/common</code>'s
+      source; you own its types (<code>Value</code>, <code>Schema</code>, <code>RecordId</code>)
+      from here on.</li>
+    <li><strong>Parse the flags by hand.</strong> A small loop over <code>std::env::args()</code>
+      is enough for <code>--db</code> and <code>--serve</code>; the course crate policy leaves no
+      room for an argument-parsing dependency, and you will not need one.</li>
+    <li><strong>Build the loop.</strong> Construct the <code>rustyline</code> editor in
+      <code>Repl::new</code>, then loop on <code>readline("ferricdb&gt; ")</code>. Match the three
+      outcomes explicitly: a line, <code>Interrupted</code>, <code>Eof</code>.<sup class="cite"><a href="#ref-2">2</a></sup>
+      Feed every accepted line into the editor history.</li>
+    <li><strong>Dispatch on the first byte.</strong> Trim, skip empty lines, and route
+      <code>.</code>-prefixed input to a <code>match</code> over the command word. Keep the
+      dispatcher a pure function from input string to a small <code>MetaCommand</code> enum — it
+      makes the smoke tests trivial.</li>
+    <li><strong>Buffer statements until <code>;</code>.</strong> Keep a pending-statement string;
+      show a continuation prompt (<code>      ...&gt; </code>) while it is non-empty. This is
+      exactly how psql behaves, and your muscle memory will thank you.</li>
+    <li><strong>Print through one function.</strong> Route all output through a
+      <code>print_result</code> helper now, even though it only echoes today — in Milestone 4 it
+      grows column-aligned result tables and you will not have to hunt for print sites.</li>
+    <li><strong>Turn on CI.</strong> The provided workflow file runs <code>cargo fmt --check</code>,
+      <code>clippy</code>, and the test suite. Push a branch, watch it go green, and keep it green
+      for the rest of the course.</li>
+  </ol>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <p>This milestone's finish line is behavioral rather than a big ignored-test group:</p>
+  <pre><code># the whole provided suite stays green
+cargo test --workspace
+
+# the non-ignored smoke test checks .help lists all six meta-commands
+cargo test -p ferricdb
+
+# your inventory of what is coming
+cargo test --workspace -- --list --ignored</code></pre>
+  <p>Manual session to reproduce before calling it done:</p>
+  <pre><code>$ cargo run -- --db /tmp/demo.db
+ferricdb 0.1.0 — type .help for help
+ferricdb&gt; .help
+.help              show this help
+.exit              leave the shell
+...
+ferricdb&gt; SELECT 1
+      ...&gt; ;
+(statement parsed in Milestone 3, executed in Milestone 4 — echoing for now)
+ferricdb&gt; .exit</code></pre>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Meta-commands routed through the SQL path</span>
+    <p>If <code>.help</code> reaches the (future) parser you will "fix" it in Milestone 3 by
+    special-casing the lexer — the wrong place. Dispatch on the leading dot before anything else
+    touches the line; the shell language and SQL are different languages.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Ctrl-C kills the process</span>
+    <p><code>rustyline</code> surfaces <kbd>Ctrl-C</kbd> as <code>ReadlineError::Interrupted</code>,
+    not a signal you can ignore. Swallow it at an empty prompt, clear the pending statement buffer
+    at a continuation prompt — never <code>std::process::exit</code> from inside the loop.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Skipping the workspace tour</span>
+    <p>Learners who jump straight to code discover in Milestone 2 that they re-implemented a type
+    <code>common</code> already provides. Twenty minutes reading <code>crates/common</code> and the
+    stub rustdoc now saves hours later.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li>REPL starts with and without <code>--db</code>, echoes multi-line statements terminated by
+      <code>;</code>, and exits cleanly on <code>.exit</code>, <kbd>Ctrl-D</kbd>, and double
+      <kbd>Ctrl-C</kbd>.</li>
+    <li>All six meta-commands respond (<code>.tables</code>/<code>.schema</code>/<code>.ast</code>/
+      <code>.open</code> with their honest "not yet" messages).</li>
+    <li><code>cargo test --workspace</code>, <code>cargo fmt --check</code>, and
+      <code>cargo clippy</code> are green locally and in CI.</li>
+    <li>You can name, from memory, which crate you will touch in each of the next three
+      milestones.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="The dot prefix marks shell-language commands, which the REPL dispatches itself. SQL is a separate language handled by the (future) parser — mixing the two languages in one grammar is how shells grow unmaintainable special cases. SQLite's shell makes exactly this split.">
+    <legend class="quiz-q">Why are meta-commands dispatched before the input is treated as SQL?</legend>
+    <label><input type="radio" name="q0-1"> Because the SQL grammar cannot express identifiers starting with a dot</label>
+    <label><input type="radio" name="q0-1" data-correct> Because the shell language and SQL are different languages with different owners — the REPL owns one, the parser the other</label>
+    <label><input type="radio" name="q0-1"> Because meta-commands must run before the database file is opened</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+  <fieldset class="quiz" data-explain="Ignored tests compile against the stub APIs on every build — so the workspace enforces that your signatures stay compatible from day one, and each milestone's finish line is a pre-written test group you un-ignore, not a spec you interpret.">
+    <legend class="quiz-q">What do the provided #[ignore = "milestone N"] tests give you before you implement anything?</legend>
+    <label><input type="radio" name="q0-2"> Nothing until they are un-ignored</label>
+    <label><input type="radio" name="q0-2" data-correct> Compile-time pressure on the public API plus a concrete, pre-written finish line per milestone</label>
+    <label><input type="radio" name="q0-2"> They run in CI as expected failures</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">cstack, "Let's Build a Simple Database", Part 1 — Introduction and Setting
+          up the REPL (the meta-command/statement split, modeled on SQLite's shell).
+          <a href="https://cstack.github.io/db_tutorial/parts/part1.html" rel="external">https://cstack.github.io/db_tutorial/parts/part1.html</a></li>
+        <li id="ref-2">rustyline crate documentation — Editor, readline, and ReadlineError
+          semantics.
+          <a href="https://docs.rs/rustyline" rel="external">https://docs.rs/rustyline</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>cstack Part 2 — the world's simplest SQL front-end and virtual machine; a preview of the
+        split you will build properly in Milestones 3-4.
+        <a href="https://cstack.github.io/db_tutorial/parts/part2.html" rel="external">cstack.github.io/db_tutorial/parts/part2.html</a></li>
+      <li>The SQLite shell's dot-command reference — forty years of accumulated shell design to
+        steal ideas from later.
+        <a href="https://sqlite.org/cli.html" rel="external">sqlite.org/cli.html</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>Done here? Continue on the path with
+    <a href="../../modules/m01-relational-model-sql/index.html">M01 · The Relational Model &amp;
+    SQL Semantics</a>, then <a href="../../modules/m02-storage/index.html">M02 · Storage</a> —
+    Milestone 1 builds what M02 teaches.</p>
+
+    <nav class="prevnext">
+      <a href="../../modules/m00-orientation/index.html"><span class="dir">← Previous</span> M00 · Orientation</a>
+      <a class="next" href="../../modules/m01-relational-model-sql/index.html"><span class="dir">Next →</span> M01 · The Relational Model &amp; SQL Semantics</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: [],
+    current: [],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

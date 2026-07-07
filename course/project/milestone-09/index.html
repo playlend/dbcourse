@@ -1,0 +1,697 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 9 · Write-Ahead Logging and ARIES-Style Recovery — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 9</span>
+  </nav>
+  <span class="badge milestone">Milestone 9</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 9 · Write-Ahead Logging and ARIES-Style Recovery</h1>
+  <p class="subtitle">Build the append-only log, enforce the log-before-data rule in the buffer pool,
+  and implement the three-pass ARIES restart — then prove it by crashing your database hundreds of times.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check yourself</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li>Implement an append-only log manager with monotonically increasing LSNs, a per-transaction
+        <code>prev_lsn</code> chain, and a durable <code>flushed_lsn</code> watermark.</li>
+    <li>Design log records that carry before-images for undo and after-images for redo, plus
+        compensation log records (CLRs) that make rollback itself restartable.</li>
+    <li>Enforce the WAL rule at the buffer-pool boundary via the <code>LogFlusher</code> hook, so a
+        <em>steal</em> eviction policy is safe and commit is <em>no-force</em>.</li>
+    <li>Take fuzzy checkpoints that snapshot the active-transaction table (ATT) and dirty-page table
+        (DPT) without stopping traffic.</li>
+    <li>Implement ARIES restart exactly: analysis, redo that repeats history, and undo of losers —
+        and explain why redo consults the pageLSN while undo does not.</li>
+    <li>Build crash-injection tests, both simulated (drop unflushed state) and real (kill the
+        process), and use them to argue durability empirically rather than by inspection.</li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m10-logging-recovery/index.html">M10 · Logging &amp; Recovery</a> —
+        the concept module for this milestone; read it first.</li>
+    <li>Mohan et&nbsp;al., the ARIES paper — this is the algorithm you implement, simplified to
+        page-granularity logging. Read §1.4 (buffer management and the WAL protocol), §3 (overview:
+        repeating history and CLRs), §4 (data structures), §5.4 (fuzzy checkpoints) and §6 (the three
+        restart passes).<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li>The Internals of PostgreSQL, Ch.&nbsp;9 — how a production system does the same jobs: XLOG
+        records and <code>pd_lsn</code> (§9.1), checkpoint processing (§9.7), recovery (§9.8).<sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li>PostgreSQL documentation, “Reliability and the Write-Ahead Log”, especially the WAL
+        introduction.<sup class="cite"><a href="#ref-7">7</a></sup><sup class="cite"><a href="#ref-8">8</a></sup></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <p>The WAL is the last purely internal component of FerricDB. It sits beside the buffer pool and
+  the transaction manager: executors log every heap change before applying it, the transaction
+  manager logs begin/commit/abort, and the buffer pool refuses to write a dirty page until the log
+  covering it is on disk. When this milestone is done, FerricDB stops being a program that
+  <em>usually</em> keeps your data and becomes a database: you can kill it at any instant and no
+  committed change is lost, no aborted change survives.</p>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — FerricDB architecture. Everything else is built; this milestone adds
+    WAL / Recovery, wired to the transaction manager (commit/abort records) and the buffer pool
+    (the WAL rule).</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+  <p>You implement <code>course/ferricdb/crates/wal</code> (package <code>ferricdb-wal</code>), which
+  depends on <code>common</code>, <code>storage</code>, and <code>buffer</code>. The public surface,
+  from the API spec:</p>
+
+<pre><code>// crates/wal — ferricdb-wal (Milestone 9)
+
+pub enum LogRecord {
+    Begin  { txn: TxnId },
+    Commit { txn: TxnId },
+    Abort  { txn: TxnId },
+    Insert { txn: TxnId, rid: RecordId, tuple: Vec&lt;u8&gt;, meta: TupleMeta },
+    Update { txn: TxnId, rid: RecordId,
+             old_meta: TupleMeta, old: Vec&lt;u8&gt;,
+             new_meta: TupleMeta, new: Vec&lt;u8&gt; },
+    Delete { txn: TxnId, rid: RecordId, old_meta: TupleMeta, old: Vec&lt;u8&gt; },
+    /// Compensation log record written during undo; undo_next points at
+    /// the next record of the same txn still to undo.
+    Clr    { txn: TxnId, rid: RecordId, redo: Vec&lt;u8&gt;, undo_next: Lsn },
+    CheckpointBegin,
+    CheckpointEnd { active_txns: Vec&lt;(TxnId, Lsn /*lastLSN*/)&gt;,
+                    dirty_pages: Vec&lt;(PageId, Lsn /*recLSN*/)&gt; },
+}
+
+pub struct WalManager { /* append-only file, in-memory tail, flushed_lsn */ }
+impl WalManager {
+    pub fn open(path: &amp;std::path::Path) -&gt; Result&lt;Self&gt;;
+    pub fn append(&amp;self, prev_lsn: Lsn, rec: &amp;LogRecord) -&gt; Result&lt;Lsn&gt;;
+    pub fn flush(&amp;self, up_to: Lsn) -&gt; Result&lt;()&gt;;
+    pub fn flushed_lsn(&amp;self) -&gt; Lsn;
+    pub fn iter_from(&amp;self, lsn: Lsn) -&gt; Result&lt;WalIter&gt;; // Iterator&lt;Item=Result&lt;(Lsn, Lsn /*prev*/, LogRecord)&gt;&gt;
+    pub fn checkpoint(&amp;self, active: &amp;[(TxnId, Lsn)],
+                      dirty: &amp;[(PageId, Lsn)]) -&gt; Result&lt;Lsn&gt;;
+}
+impl ferricdb_buffer::LogFlusher for WalManager { /* flush_until = flush */ }
+
+pub struct RecoveryReport { pub redone: usize, pub undone: usize,
+                            pub loser_txns: Vec&lt;TxnId&gt; }
+/// ARIES: analysis (rebuild ATT+DPT from last checkpoint), redo
+/// (repeat history from min recLSN, honoring pageLSN), undo (losers,
+/// writing CLRs).
+pub fn recover(wal: &amp;WalManager, pool: &amp;BufferPoolManager) -&gt; Result&lt;RecoveryReport&gt;;</code></pre>
+
+  <p>Two hooks built in earlier milestones finally earn their keep. The buffer pool
+  (<code>ferricdb-buffer</code>, Milestone 2) exposes:</p>
+
+<pre><code>/// Log hook for the WAL rule (Milestone 9): before a dirty page with
+/// pageLSN = L is written out, flush_until(L) must succeed.
+pub trait LogFlusher: Send + Sync {
+    fn flush_until(&amp;self, lsn: Lsn) -&gt; Result&lt;()&gt;;
+}
+
+impl BufferPoolManager {
+    pub fn set_log_flusher(&amp;self, log: std::sync::Arc&lt;dyn LogFlusher&gt;); // wired in MS9
+    // …
+}</code></pre>
+
+  <p>And every page has carried a pageLSN in its header since Milestone 1
+  (<code>ferricdb-storage</code>):</p>
+
+<pre><code>/// One 8 KB page in memory. First 16 bytes of every page are reserved:
+/// pageLSN (u64) + page type tag (u32) + reserved (u32).
+pub struct Page { /* [u8; PAGE_SIZE] */ }
+impl Page {
+    pub fn lsn(&amp;self) -&gt; Lsn;
+    pub fn set_lsn(&amp;mut self, lsn: Lsn);
+    // … new(), data(), data_mut() as in Milestone 1
+}</code></pre>
+
+  <h3 id="spec-semantics">Semantics</h3>
+  <ul>
+    <li><strong>LSNs are strictly increasing.</strong> <code>append</code> assigns and returns the
+        record’s LSN. In ARIES an LSN is typically the logical address of the record in the log
+        address space<sup class="cite"><a href="#ref-1">1</a></sup>; PostgreSQL likewise uses a byte
+        position in an 8-byte log address space<sup class="cite"><a href="#ref-4">4</a></sup>. Using
+        the record’s byte offset in the log file is the natural course choice. <code>Lsn = 0</code>
+        means “none” — never assign it.</li>
+    <li><strong><code>prev_lsn</code> chains a transaction’s records backward.</strong> Pass the LSN
+        of the same transaction’s previous record (0 for its first). Rollback and the undo pass walk
+        this chain; ARIES stores it as PrevLSN in every record.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong><code>append</code> buffers; only <code>flush</code> makes records durable.</strong>
+        <code>flush(up_to)</code> must write <em>every</em> record with LSN ≤ <code>up_to</code> and
+        <code>fsync</code> before returning. <code>flushed_lsn()</code> is the durability watermark:
+        everything at or below it survives a crash, nothing above it is promised.</li>
+    <li><strong><code>Update</code> carries both images.</strong> The old tuple/meta is the undo
+        information, the new one the redo information — ARIES’ Data field serves both
+        roles.<sup class="cite"><a href="#ref-1">1</a></sup> <code>Insert</code> needs no
+        before-image (undo = delete the slot); <code>Delete</code> needs no after-image (redo =
+        delete again).</li>
+    <li><strong><code>Clr</code> is redo-only.</strong> Its <code>redo</code> bytes describe the
+        compensation so it can be re-applied by a later redo pass; it has no undo information
+        because CLRs are never undone.<sup class="cite"><a href="#ref-1">1</a></sup>
+        <code>undo_next</code> holds the <code>prev_lsn</code> of the record it compensated.</li>
+    <li><strong><code>checkpoint</code> is fuzzy.</strong> It appends <code>CheckpointBegin</code>,
+        then <code>CheckpointEnd</code> carrying the ATT (txn, lastLSN) and DPT (page, recLSN)
+        snapshots supplied by the caller, flushes, and returns the begin record’s LSN. It must not
+        write any data pages — that is the whole point.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong><code>iter_from</code> must survive a torn tail.</strong> A crash can truncate the
+        file mid-record; iteration ends cleanly at the first incomplete or corrupt record instead of
+        erroring the whole scan.</li>
+    <li><strong><code>recover</code> reads and writes pages only through the buffer pool</strong>,
+        and returns how much work each phase did — the tests assert on
+        <code>RecoveryReport</code>.</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 960 240" role="img">
+      <title>A log with seven records showing the backward prev_lsn chain of transaction T7 above
+      the records, and the undo_next pointers of two compensation log records below, skipping over
+      already-undone work.</title>
+      <defs>
+        <marker id="wal-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5"
+                markerHeight="6.5" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.65"></path>
+        </marker>
+      </defs>
+      <text x="340" y="26" class="d-text-sm" text-anchor="middle">prev_lsn chain (per transaction, backward)</text>
+      <path class="d-line" d="M 210 78 Q 145 44 82 78" marker-end="url(#wal-arrow)"></path>
+      <path class="d-line" d="M 470 78 Q 340 30 212 78" marker-end="url(#wal-arrow)"></path>
+      <path class="d-line" d="M 600 78 Q 535 44 472 78" marker-end="url(#wal-arrow)"></path>
+      <path class="d-line" d="M 730 78 Q 665 44 602 78" marker-end="url(#wal-arrow)"></path>
+      <path class="d-line" d="M 860 78 Q 795 44 732 78" marker-end="url(#wal-arrow)"></path>
+
+      <rect x="25" y="80" width="110" height="46" rx="6" class="d-box"></rect>
+      <text x="80" y="99" class="d-mono-sm" text-anchor="middle">LSN 100</text>
+      <text x="80" y="115" class="d-text-sm" text-anchor="middle">Begin T7</text>
+
+      <rect x="155" y="80" width="110" height="46" rx="6" class="d-box"></rect>
+      <text x="210" y="99" class="d-mono-sm" text-anchor="middle">LSN 130</text>
+      <text x="210" y="115" class="d-text-sm" text-anchor="middle">Insert T7</text>
+
+      <rect x="285" y="80" width="110" height="46" rx="6" class="d-box"></rect>
+      <text x="340" y="99" class="d-mono-sm" text-anchor="middle">LSN 150</text>
+      <text x="340" y="115" class="d-text-sm" text-anchor="middle">Insert T8</text>
+
+      <rect x="415" y="80" width="110" height="46" rx="6" class="d-box"></rect>
+      <text x="470" y="99" class="d-mono-sm" text-anchor="middle">LSN 180</text>
+      <text x="470" y="115" class="d-text-sm" text-anchor="middle">Update T7</text>
+
+      <rect x="545" y="80" width="110" height="46" rx="6" class="d-box-warn"></rect>
+      <text x="600" y="99" class="d-mono-sm" text-anchor="middle">LSN 210</text>
+      <text x="600" y="115" class="d-text-sm" text-anchor="middle">CLR (undoes 180)</text>
+
+      <rect x="675" y="80" width="110" height="46" rx="6" class="d-box-warn"></rect>
+      <text x="730" y="99" class="d-mono-sm" text-anchor="middle">LSN 240</text>
+      <text x="730" y="115" class="d-text-sm" text-anchor="middle">CLR (undoes 130)</text>
+
+      <rect x="805" y="80" width="110" height="46" rx="6" class="d-box"></rect>
+      <text x="860" y="99" class="d-mono-sm" text-anchor="middle">LSN 260</text>
+      <text x="860" y="115" class="d-text-sm" text-anchor="middle">Abort T7</text>
+
+      <path class="d-line-hl" stroke-dasharray="5 4" d="M 600 128 Q 405 198 214 128" marker-end="url(#wal-arrow)"></path>
+      <path class="d-line-hl" stroke-dasharray="5 4" d="M 730 128 Q 405 226 84 128" marker-end="url(#wal-arrow)"></path>
+      <text x="430" y="228" class="d-text-sm" text-anchor="middle">undo_next — each CLR points past the record it compensated, so undone work is never revisited</text>
+    </svg>
+    <figcaption>Figure 2 — Anatomy of the log while T7 rolls back. Every record points backward to
+    its transaction’s previous record (<code>prev_lsn</code>); each CLR’s <code>undo_next</code>
+    equals the <code>prev_lsn</code> of the record it undid, so a rollback interrupted by a crash
+    resumes exactly where it stopped.<sup class="cite"><a href="#ref-1">1</a></sup></figcaption>
+  </figure>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+
+  <div class="callout note">
+    <span class="callout-title">Honest difficulty note</span>
+    <p>This is the hardest milestone in the course, harder than the B+Tree. Not because any one pass
+    is long — each is under a hundred lines — but because correctness is invisible until a crash
+    lands in exactly the wrong microsecond. Build in the order below, keep every step under test
+    before starting the next, and let the crash-injection loop, not your intuition, be the judge.
+    Budget two weeks.</p>
+  </div>
+
+  <h3 id="step-1">Step 1 — Encode records and append them</h3>
+  <p>Pick a simple binary framing for one record on disk: a length prefix, the payload
+  (<code>prev_lsn</code>, a type tag, then the fields), and a checksum. The checksum is not
+  paranoia — it is how <code>iter_from</code> will distinguish “end of log” from “torn record at the
+  crash point”. PostgreSQL splits its log into 16&nbsp;MB segment files<sup class="cite"><a href="#ref-4">4</a></sup>;
+  a single append-only file is a fine course simplification. Keep an in-memory tail buffer protected
+  by a mutex: <code>append</code> assigns the next LSN (byte offset works), serializes into the
+  tail, and returns without touching the disk. Write a round-trip unit test — every
+  <code>LogRecord</code> variant through serialize → deserialize — before anything else.</p>
+
+  <h3 id="step-2">Step 2 — <code>flush</code>, <code>flushed_lsn</code>, <code>iter_from</code></h3>
+  <p><code>flush(up_to)</code> writes the buffered prefix of the log through <code>up_to</code>,
+  calls <code>sync_data</code>, then advances <code>flushed_lsn</code>. Note the order: the
+  watermark moves only <em>after</em> fsync returns. Because the log is one sequential file, this is
+  cheap — the PostgreSQL docs make the same point: syncing a sequential log costs far less than
+  flushing scattered data pages, and one fsync can commit many concurrent
+  transactions.<sup class="cite"><a href="#ref-8">8</a></sup> <code>iter_from(lsn)</code> seeks to a
+  byte offset and yields <code>(lsn, prev_lsn, record)</code> triples until end-of-file or the first
+  record whose length or checksum does not hold — stop there silently; that torn tail is a record
+  that was never durable.</p>
+
+  <h3 id="step-3">Step 3 — Stamp the pageLSN on every modification</h3>
+  <p>ARIES keeps a <code>page_LSN</code> in every page: the LSN of the log record describing the
+  latest update applied to that page.<sup class="cite"><a href="#ref-1">1</a></sup> PostgreSQL’s
+  page header has the same field, <code>pd_lsn</code>.<sup class="cite"><a href="#ref-3">3</a></sup>
+  Thread the WAL into the write paths that mutate heap pages (insert, update via
+  <code>set_meta</code>, delete): append the log record <em>first</em>, then apply the change and
+  call <code>page.set_lsn(record_lsn)</code> while still holding the page guard. Doing both under
+  the same guard keeps log order identical to page-apply order, which ARIES requires for physical
+  redo to work.<sup class="cite"><a href="#ref-1">1</a></sup> Redo will also need to re-apply a
+  tuple at the <em>exact</em> slot named in the record’s <code>rid</code> — a plain
+  <code>insert()</code> that picks any free slot is not enough, so plan a crate-internal
+  “place at slot” primitive.</p>
+
+  <h3 id="step-4">Step 4 — Enforce the WAL rule in the buffer pool</h3>
+  <p>Implement <code>LogFlusher</code> for <code>WalManager</code> (it is just <code>flush</code>)
+  and wire it with <code>pool.set_log_flusher(wal.clone())</code> at startup. In the buffer pool’s
+  write-back path — eviction, <code>flush_page</code>, <code>flush_all</code> — call
+  <code>flush_until(page.lsn())</code> before the disk write. This is the WAL protocol: the buffer
+  manager forces the log up to the dirty page’s LSN before the page goes
+  out.<sup class="cite"><a href="#ref-1">1</a></sup> PostgreSQL states the same invariant as its
+  central rule: data files may be written only after the WAL records describing the changes are on
+  permanent storage.<sup class="cite"><a href="#ref-8">8</a></sup> With this one hook, a
+  <em>steal</em> policy (evicting pages dirtied by uncommitted transactions) becomes safe, because
+  the before-images needed to undo them are guaranteed to be in the durable
+  log.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <h3 id="step-5">Step 5 — Transaction lifecycle: Begin, Commit, Abort</h3>
+  <p>Log <code>Begin</code> when the transaction manager hands out a transaction, and track its
+  <code>lastLSN</code> as you append its records. Commit is two lines with a big meaning: append
+  <code>Commit</code>, then <code>flush(commit_lsn)</code> — and only report success to the caller
+  after the flush returns. That is <em>no-force</em>: no data page is written at commit; the flushed
+  log alone carries durability.<sup class="cite"><a href="#ref-1">1</a></sup>
+  Abort during normal operation is a rehearsal for restart undo: walk the transaction’s
+  <code>prev_lsn</code> chain from its lastLSN; for each undoable record apply the before-image,
+  append a <code>Clr</code> whose <code>undo_next</code> is the undone record’s
+  <code>prev_lsn</code> (and stamp the touched page with the CLR’s LSN); finish with an
+  <code>Abort</code> record. Write this as one reusable routine — the undo pass in step&nbsp;9 is
+  the same loop; ARIES presents it once as ROLLBACK and reuses it.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <h3 id="step-6">Step 6 — Fuzzy checkpoints</h3>
+  <p>A checkpoint exists to bound how much log recovery must read; it must not stop the world.
+  <code>checkpoint(active, dirty)</code> appends <code>CheckpointBegin</code>, then
+  <code>CheckpointEnd</code> carrying the ATT (each active transaction with its lastLSN) and the DPT
+  (each dirty page with its recLSN), then flushes. Record the begin record’s LSN in a small side
+  file next to the log — the analog of ARIES’ master record and of PostgreSQL’s
+  <code>pg_control</code>, which stores the location of the latest checkpoint so recovery knows
+  where to start.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-5">5</a></sup>
+  Only update the side file after <code>CheckpointEnd</code> is durable: a checkpoint whose end
+  record never reached disk is incomplete and must be ignored.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  <p>The recLSN needs care: it is recorded by the buffer pool when a clean page first becomes dirty,
+  as the end-of-log LSN at that moment — “from this point on, the log may contain updates not yet in
+  the on-disk copy of this page”.<sup class="cite"><a href="#ref-1">1</a></sup> When a page is
+  written out, its DPT entry is dropped. You will need to surface the buffer pool’s dirty set with
+  recLSNs to the caller assembling the checkpoint — a small crate-internal accessor; the public API
+  stays as specified. Crucially, a fuzzy checkpoint forces <em>no</em> dirty
+  pages<sup class="cite"><a href="#ref-1">1</a></sup> — PostgreSQL’s checkpointer likewise dribbles
+  dirty pages out gradually while traffic continues, on a timer that defaults to
+  300&nbsp;seconds.<sup class="cite"><a href="#ref-5">5</a></sup></p>
+
+  <h3 id="step-7">Step 7 — Recovery I: the analysis pass</h3>
+  <p>Analysis starts at the <code>CheckpointBegin</code> of the last <em>complete</em> checkpoint
+  (from the side file; LSN 0 if none) and scans forward to the end of the
+  log.<sup class="cite"><a href="#ref-1">1</a></sup> Seed the ATT and DPT from
+  <code>CheckpointEnd</code> when you pass it, then update both from every record you see:</p>
+  <ul>
+    <li>Any record for a transaction not in the ATT adds it; every record updates that transaction’s
+        lastLSN.</li>
+    <li>Any page-touching record (<code>Insert</code>/<code>Update</code>/<code>Delete</code>/<code>Clr</code>)
+        whose page is not in the DPT adds it with recLSN = the record’s own LSN.</li>
+    <li><code>Commit</code> and <code>Abort</code> remove the transaction from the ATT — both mark a
+        finished outcome (an <code>Abort</code> record is only written after rollback completed, so
+        there is nothing left to undo).</li>
+  </ul>
+  <p>Whoever remains in the ATT at end of scan is a <em>loser</em>. The redo starting point is the
+  minimum recLSN in the DPT; if the DPT is empty, redo can be skipped
+  entirely.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 960 320" role="img">
+      <title>A log timeline with the minimum recLSN before the checkpoint records and a crash at
+      the end, and three passes drawn below: analysis scanning from the checkpoint to the crash,
+      redo scanning from the minimum recLSN to the crash, and undo scanning backward from the
+      crash.</title>
+      <defs>
+        <marker id="pass-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.65"></path>
+        </marker>
+      </defs>
+      <rect x="40" y="70" width="840" height="34" rx="6" class="d-box"></rect>
+      <text x="60" y="92" class="d-text-sm">the log (grows →)</text>
+
+      <line x1="170" y1="70" x2="170" y2="104" class="d-line"></line>
+      <text x="170" y="40" class="d-text-sm" text-anchor="middle">min recLSN</text>
+      <text x="170" y="56" class="d-text-sm" text-anchor="middle">(oldest unflushed change)</text>
+
+      <line x1="430" y1="70" x2="430" y2="104" class="d-line"></line>
+      <text x="424" y="56" class="d-text-sm" text-anchor="end">begin_chkpt</text>
+      <line x1="510" y1="70" x2="510" y2="104" class="d-line"></line>
+      <text x="516" y="40" class="d-text-sm">end_chkpt (carries ATT + DPT)</text>
+
+      <path class="d-line-hl" d="M 850 62 l 6 12 l -12 10 l 8 12 l -6 12"></path>
+      <text x="850" y="52" class="d-text" text-anchor="middle" font-weight="600">crash</text>
+
+      <path class="d-line" d="M 430 150 H 846" marker-end="url(#pass-arrow)"></path>
+      <text x="420" y="154" class="d-text" text-anchor="end" font-weight="600">1 · analysis</text>
+      <text x="640" y="170" class="d-text-sm" text-anchor="middle">from the last complete checkpoint to end of log — rebuilds ATT + DPT</text>
+
+      <path class="d-line" d="M 170 200 H 846" marker-end="url(#pass-arrow)"></path>
+      <text x="160" y="204" class="d-text" text-anchor="end" font-weight="600">2 · redo</text>
+      <text x="510" y="220" class="d-text-sm" text-anchor="middle">repeats history from min recLSN — which may lie before the checkpoint</text>
+
+      <path class="d-line" d="M 850 260 H 304" marker-end="url(#pass-arrow)"></path>
+      <text x="860" y="264" class="d-text" font-weight="600">3 · undo</text>
+      <text x="575" y="280" class="d-text-sm" text-anchor="middle">losers rolled back in reverse LSN order, writing CLRs</text>
+    </svg>
+    <figcaption>Figure 3 — The three restart passes over one log.<sup class="cite"><a href="#ref-1">1</a></sup>
+    Note that redo starts at the minimum recLSN, which can be <em>earlier</em> than the checkpoint:
+    the checkpoint is a summary, not a barrier.</figcaption>
+  </figure>
+
+  <h3 id="step-8">Step 8 — Recovery II: redo repeats history</h3>
+  <p>Redo scans forward from the minimum recLSN and re-applies <em>every</em> missing page change —
+  including those of loser transactions and including CLRs. This “repeating history” is the paradigm
+  the paper is built on: first re-establish the exact state as of the crash, then roll losers back
+  from that known state.<sup class="cite"><a href="#ref-1">1</a></sup> The decision procedure, from
+  ARIES Fig.&nbsp;11 (pseudocode of the published algorithm — your Rust will differ):</p>
+<pre><code>for (lsn, _prev, rec) in wal.iter_from(min_recLSN):
+    if rec touches a page
+       and rec.page ∈ DPT
+       and lsn ≥ DPT[rec.page].recLSN:        # filter 1: no disk read needed
+        fetch the page via the buffer pool
+        if page.pageLSN &lt; lsn:                 # filter 2: is the effect present?
+            re-apply the record's redo action
+            page.pageLSN := lsn                # no new log records are written
+</code></pre>
+  <p>Filter 1 uses only the DPT and skips records without touching the disk; filter 2 reads the page
+  and asks whether the effect already made it out before the crash. Both are required and they are
+  not the same test (see the pitfalls). Setting <code>pageLSN := lsn</code> after each application
+  is what makes redo idempotent; nothing is logged during the redo
+  pass.<sup class="cite"><a href="#ref-1">1</a></sup> PostgreSQL’s recovery makes the identical
+  comparison — a record is replayed only when its LSN beats the page’s <code>pd_lsn</code>, because
+  replaying a change that is already present is not an idempotent
+  operation.<sup class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <h3 id="step-9">Step 9 — Recovery III: undo the losers</h3>
+  <p>Undo rolls back all losers in one backward sweep, in reverse LSN order across transactions:
+  repeatedly pick the loser with the largest next-LSN-to-undo and process that
+  record.<sup class="cite"><a href="#ref-1">1</a></sup> Adapted from ARIES Figs.&nbsp;8
+  and&nbsp;12:</p>
+<pre><code>undo_next[t] := lastLSN(t) for every loser t
+while any undo_next[t] ≠ 0:
+    t := loser with the largest undo_next[t];  rec := record at undo_next[t]
+    match rec:
+        Insert/Update/Delete →
+            apply the before-image through the buffer pool
+            clr := append Clr { redo: …, undo_next: rec.prev_lsn }
+            page.pageLSN := clr.lsn
+            undo_next[t] := rec.prev_lsn
+        Clr   → undo_next[t] := rec.undo_next      # skip; CLRs are never undone
+        Begin → append Abort { t };  undo_next[t] := 0
+</code></pre>
+  <p>Two things are deliberately absent. Undo never consults the DPT, and never compares pageLSNs —
+  because history was already repeated, the page state is exactly what the log says it is, so the
+  undo applies unconditionally.<sup class="cite"><a href="#ref-1">1</a></sup> And when undo meets a
+  CLR (left over from a rollback that a crash interrupted, or from a previous recovery that itself
+  crashed), it does not undo it — it follows <code>undo_next</code> straight past the work that was
+  already undone. That single pointer is what bounds logging even across repeated failures: each
+  undoable record produces at most one CLR, ever.<sup class="cite"><a href="#ref-1">1</a></sup>
+  Fill in <code>RecoveryReport</code> as you go: records re-applied in redo, records undone, and the
+  loser list.</p>
+  <p>One contrast worth knowing: the recovery walkthrough in interdb Ch.&nbsp;9.8 is redo-only —
+  PostgreSQL replays from the REDO point and stops<sup class="cite"><a href="#ref-6">6</a></sup>,
+  leaning on MVCC (your Milestone 8 machinery) to keep aborted rows invisible instead of erasing
+  them at restart. FerricDB’s MVCC could justify the same shortcut; we implement the full ARIES undo
+  as a course choice, because the canonical three-pass algorithm is the thing this milestone exists
+  to teach — and it keeps the WAL correct independently of visibility rules.</p>
+
+  <h3 id="step-10">Step 10 — The kill-the-process harness</h3>
+  <p>The provided sim-crash tests fake a crash: run a workload, drop the buffer pool without
+  flushing data pages (the WAL file survives), reopen, recover, check invariants. They are fast and
+  seeded, and they will catch most bugs. But a simulated crash only loses what you remembered to
+  throw away. The real harness — your job here — kills an actual process at an arbitrary
+  instruction:</p>
+  <ol>
+    <li><strong>Give the test binary a child mode.</strong> At the top of a harness test, check an
+        environment variable (say <code>FERRICDB_MS9_CHILD</code>). If set, run the child role;
+        otherwise run the parent role. The parent re-executes its own binary via
+        <code>std::process::Command::new(std::env::current_exe()?)</code> with the variable set,
+        plus a seed and a database path — a standard libtest re-exec pattern.</li>
+    <li><strong>Child:</strong> open the database, run a seeded workload of small transactions —
+        inserts, updates, deletes; commit some, abort others; make each row’s values derivable from
+        (txn number, seed) so the parent can validate content, not just counts. After each
+        successful commit, print <code>COMMITTED &lt;n&gt;</code> to stdout and flush stdout. At a
+        seeded random operation count, call <code>std::process::abort()</code> — no destructors, no
+        flushes, no goodbye.</li>
+    <li><strong>Parent:</strong> wait for the child (expect an abnormal exit), collect the
+        <code>COMMITTED</code> lines, reopen the database, run <code>recover()</code>, and assert
+        the two invariants: every transaction acknowledged before the crash is fully present with
+        correct contents, and no rows from aborted or unfinished transactions are visible. The check
+        is deliberately one-sided: a commit that returned but whose stdout line was lost in the
+        crash is allowed to survive — it must simply never be half-present.</li>
+    <li><strong>Loop</strong> over a hundred or more seeds, and for extra credit re-kill the child
+        <em>during recovery</em> (child mode: recover, then abort at a random point) and recover
+        again — recovery must be idempotent.</li>
+  </ol>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <p>All provided Milestone 9 tests carry the prefix <code>ms9_</code> and are marked
+  <code>#[ignore = "milestone 9"]</code> in the starter workspace, so earlier milestones stay green
+  without them. Run them with the filter and <code>--include-ignored</code>; many learners simply
+  delete the <code>#[ignore]</code> attributes once they start the milestone so plain
+  <code>cargo test</code> picks them up from then on.</p>
+<pre><code>cargo test -p ferricdb-wal -- --include-ignored ms9_</code></pre>
+  <p>The <code>ms9_</code> group covers, roughly in the order you should make them pass: log record
+  round-trips and iteration, torn-tail handling in <code>iter_from</code>, the
+  <code>flushed_lsn</code> watermark, WAL-rule enforcement through the <code>LogFlusher</code> hook,
+  checkpoint contents, each recovery pass in isolation, and finally the seeded randomized sim-crash
+  loop <code>ms9_crash_injection_no_lost_commits</code>: hundreds of random crash points, each
+  followed by recovery and a full audit — zero committed data lost, zero aborted data resurrected.
+  Expect that last test to fail long after the unit tests pass; each failing seed is a reproducible
+  crash point, so debug it like a fixed test case. Your process-kill harness from step&nbsp;10
+  complements it as your own addition. Finish with <code>cargo test --workspace</code> — the WAL
+  wiring touches the buffer pool and executor paths from earlier milestones.</p>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Appending to the log without stamping the pageLSN</span>
+    <p>If a page change is logged but <code>set_lsn</code> is skipped, redo’s filter 2 sees a stale
+    pageLSN and re-applies a change that is already present. Redo of a slotted-page mutation is not
+    idempotent — PostgreSQL guards replay with exactly this LSN comparison for the same
+    reason.<sup class="cite"><a href="#ref-6">6</a></sup> Symptom: duplicate rows or doubly-applied
+    updates after recovery, and a database that gets <em>worse</em> each time you recover it
+    again.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Undoing CLRs</span>
+    <p>Never. CLRs are redo-only; when undo encounters one it follows <code>undo_next</code> and
+    moves on.<sup class="cite"><a href="#ref-1">1</a></sup> If you “undo the undo”, a crash during
+    rollback resurrects aborted data on the next restart, and repeated crashes make the log grow
+    without bound — the exact failure ARIES cites in older systems that compensated
+    compensations.<sup class="cite"><a href="#ref-1">1</a></sup> Symptom: the crash-during-recovery
+    loop flip-flops a row between states instead of converging.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Conflating the two redo filters</span>
+    <p>“Page not in the DPT (or LSN &lt; recLSN)” and “pageLSN ≥ record LSN” are different tests
+    with different jobs: the first prunes log records using only in-memory tables, the second is the
+    ground truth read from the page itself.<sup class="cite"><a href="#ref-1">1</a></sup> Skip the
+    second and you double-apply to pages that were flushed just before the crash; skip the first and
+    you are merely slow — until you “optimize” by treating recLSN as the application test, which
+    corrupts pages whose on-disk state is newer than the DPT thinks. Symptom: corruption that only
+    appears when a checkpoint, an eviction, and a crash interleave — i.e., only under the randomized
+    loop.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Flushing the commit record without everything before it</span>
+    <p><code>flush(up_to)</code> is a prefix operation: every record with LSN ≤ <code>up_to</code>
+    goes out, in order, before the fsync. If your implementation flushes selected records — say,
+    just the commit — the durable log can hold a commit whose updates are missing, and recovery will
+    happily declare a winner it cannot redo. The WAL guarantee is stated over the whole prefix:
+    changes are recoverable because <em>all</em> records describing them reached storage
+    first.<sup class="cite"><a href="#ref-8">8</a></sup> Symptom: committed rows vanish, but only
+    when the crash lands between two partial flushes.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Treating the checkpoint as a barrier</span>
+    <p>A fuzzy checkpoint promises nothing about data pages — it forces none of
+    them.<sup class="cite"><a href="#ref-1">1</a></sup> It is where <em>analysis</em> starts, not
+    where redo starts: redo begins at the minimum recLSN, which can lie far before the checkpoint
+    (Figure&nbsp;3), and records written between <code>begin_chkpt</code> and
+    <code>end_chkpt</code> still need scanning.<sup class="cite"><a href="#ref-1">1</a></sup>
+    If you start redo at the checkpoint, every page dirtied before it and never flushed silently
+    loses its changes. Symptom: committed data missing, but only in runs where a checkpoint happened
+    while old dirty pages were still in the pool.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Recovery that assumes it will finish</span>
+    <p>A crash during recovery must leave the system recoverable again — that is the whole design:
+    redo is guarded by pageLSN, and CLRs written by the undo pass carry <code>undo_next</code> so a
+    second undo resumes rather than repeats.<sup class="cite"><a href="#ref-1">1</a></sup> But the
+    property only holds if your recovery honors the WAL rule too — the buffer manager follows the
+    usual protocol while writing pages during recovery,<sup class="cite"><a href="#ref-1">1</a></sup>
+    so wire the <code>LogFlusher</code> hook <em>before</em> calling <code>recover()</code>.
+    Symptom: recovering once works; killing the process mid-recovery and recovering again panics or
+    loses data.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li><code>cargo test -p ferricdb-wal -- --include-ignored ms9_</code> passes — including
+        <code>ms9_crash_injection_no_lost_commits</code>, the seeded randomized sim-crash loop:
+        after hundreds of random crash points, zero committed transactions lost and zero aborted
+        transactions resurrected.</li>
+    <li>Your process-kill harness (step&nbsp;10) demonstrates the same two invariants across at
+        least 100 seeded kills, including kills during recovery, and is documented in your repo so a
+        grader can run it.</li>
+    <li>Recovery is idempotent: running <code>recover()</code> on an already-recovered database, or
+        crashing mid-recovery and recovering again, converges to the same committed state.</li>
+    <li>The WAL rule is airtight: no code path writes a page whose <code>pageLSN</code> exceeds
+        <code>flushed_lsn()</code> — add a debug assertion in the buffer pool’s write-back path and
+        leave it on in tests.</li>
+    <li>COMMIT returns to the caller only after the log is flushed through the commit record’s LSN;
+        no data pages are flushed at commit.</li>
+    <li>Checkpoints bound recovery: after a checkpoint plus more traffic, restart scans the log only
+        from the checkpoint (analysis) and the minimum recLSN (redo) — verify by counting records
+        scanned, not by vibes.</li>
+    <li><code>cargo test --workspace</code> is still green — the WAL wiring must not regress earlier
+        milestones.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check yourself</h2>
+
+  <fieldset class="quiz" data-explain="Redo prunes with the DPT and recLSN first (filter 1, no disk read), but the final authority is the pageLSN comparison on the page itself: apply only when pageLSN < record LSN, then stamp the page with the record's LSN. 'Only committed transactions' is wrong by design — repeating history redoes losers' updates too, and undo cleans them up afterwards.">
+    <legend class="quiz-q">During the redo pass, when is a log record’s change actually applied to its page?</legend>
+    <label><input type="radio" name="q-ms9-redo"> Whenever the page appears in the dirty-page table</label>
+    <label><input type="radio" name="q-ms9-redo"> Only when the record belongs to a committed transaction</label>
+    <label><input type="radio" name="q-ms9-redo" data-correct> When the page’s pageLSN is less than the record’s LSN</label>
+    <label><input type="radio" name="q-ms9-redo"> Only for records written after the last checkpoint</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Redo first repeats history, re-applying the CLRs from the interrupted rollback; then undo, on meeting the most recent CLR, follows its undo_next pointer straight past everything already undone. CLRs themselves are never undone, and ARIES deliberately does not consult pageLSN during undo — after repeating history it doesn't need to.">
+    <legend class="quiz-q">The process crashed halfway through rolling back transaction T. At the next restart, what stops recovery from undoing T’s updates twice?</legend>
+    <label><input type="radio" name="q-ms9-clr"> The undo pass compares each page’s pageLSN before undoing</label>
+    <label><input type="radio" name="q-ms9-clr" data-correct> The CLRs’ undo_next pointers, which undo follows past already-undone records</label>
+    <label><input type="radio" name="q-ms9-clr"> T was removed from the ATT by the checkpoint</label>
+    <label><input type="radio" name="q-ms9-clr"> The dirty-page table filters out T’s pages</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="No-force means commit never waits for data pages — only the log must be durable, through the commit record's LSN (which, since flush is a prefix operation, covers all of the transaction's records). Flushing dirty pages at commit is a force policy; ARIES and Postgres both avoid it because sequentially syncing the log is far cheaper.">
+    <legend class="quiz-q">Under FerricDB’s steal/no-force policy, COMMIT may return success as soon as…</legend>
+    <label><input type="radio" name="q-ms9-commit"> the Commit record has been appended to the in-memory log tail</label>
+    <label><input type="radio" name="q-ms9-commit" data-correct> the log is flushed through the Commit record’s LSN</label>
+    <label><input type="radio" name="q-ms9-commit"> all pages the transaction dirtied are written to disk</label>
+    <label><input type="radio" name="q-ms9-commit"> the next checkpoint completes</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">C. Mohan, D. Haderle, B. Lindsay, H. Pirahesh, P. Schwarz, “ARIES: A
+            Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks
+            Using Write-Ahead Logging”, ACM TODS 17(1), 1992.
+            <a href="https://web.stanford.edu/class/cs345d-01/rl/aries.pdf" rel="external">https://web.stanford.edu/class/cs345d-01/rl/aries.pdf</a></li>
+        <li id="ref-2">ACM Digital Library record for the ARIES paper.
+            <a href="https://dl.acm.org/doi/10.1145/128765.128770" rel="external">https://dl.acm.org/doi/10.1145/128765.128770</a></li>
+        <li id="ref-3">H. Suzuki, “The Internals of PostgreSQL”, Ch. 9: Write Ahead Logging — WAL.
+            <a href="https://www.interdb.jp/pg/pgsql09.html" rel="external">https://www.interdb.jp/pg/pgsql09.html</a></li>
+        <li id="ref-4">H. Suzuki, “The Internals of PostgreSQL”, §9.2: Transaction Log and WAL
+            Segment Files.
+            <a href="https://www.interdb.jp/pg/pgsql09/02.html" rel="external">https://www.interdb.jp/pg/pgsql09/02.html</a></li>
+        <li id="ref-5">H. Suzuki, “The Internals of PostgreSQL”, §9.7: Checkpoint Processing.
+            <a href="https://www.interdb.jp/pg/pgsql09/07.html" rel="external">https://www.interdb.jp/pg/pgsql09/07.html</a></li>
+        <li id="ref-6">H. Suzuki, “The Internals of PostgreSQL”, §9.8: Database Recovery.
+            <a href="https://www.interdb.jp/pg/pgsql09/08.html" rel="external">https://www.interdb.jp/pg/pgsql09/08.html</a></li>
+        <li id="ref-7">PostgreSQL Documentation, “Reliability and the Write-Ahead Log”.
+            <a href="https://www.postgresql.org/docs/current/wal.html" rel="external">https://www.postgresql.org/docs/current/wal.html</a></li>
+        <li id="ref-8">PostgreSQL Documentation, “Write-Ahead Logging (WAL)”.
+            <a href="https://www.postgresql.org/docs/current/wal-intro.html" rel="external">https://www.postgresql.org/docs/current/wal-intro.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>Mohan &amp; Levine, ARIES/IM — how the same recovery framework extends to B+Tree indexes
+          (a Stretch-goal topic).
+          <a href="https://users.cs.utah.edu/~pandey/courses/cs6530/fall22/papers/logrecover/aries.pdf" rel="external">users.cs.utah.edu/~pandey/…/aries.pdf</a></li>
+      <li>PostgreSQL Documentation, “Asynchronous Commit” — what you get if you relax the
+          commit-time log flush, and what it costs.
+          <a href="https://www.postgresql.org/docs/current/wal-async-commit.html" rel="external">postgresql.org/docs/current/wal-async-commit.html</a></li>
+      <li>PostgreSQL Documentation, “WAL Configuration” — checkpoint spacing and tuning in
+          production.
+          <a href="https://www.postgresql.org/docs/current/wal-configuration.html" rel="external">postgresql.org/docs/current/wal-configuration.html</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>Next on the path: <a href="../../modules/m11-wire-protocol-server/index.html">M11 · The
+    Postgres Wire Protocol</a>, then <a href="../milestone-10/index.html">Milestone 10</a> —
+    real clients connect.</p>
+
+    <nav class="prevnext">
+      <a href="../../modules/m10-logging-recovery/index.html"><span class="dir">← Previous</span> M10 · Logging &amp; Recovery</a>
+      <a class="next" href="../../modules/m11-wire-protocol-server/index.html"><span class="dir">Next →</span> M11 · The Postgres Wire Protocol</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor", "index", "txn"],
+    current: ["wal"],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

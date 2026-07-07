@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 4 · Planner and Volcano Executor — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 4</span>
+  </nav>
+  <span class="badge milestone">Milestone 4</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 4 · Planner and Volcano Executor</h1>
+  <p class="subtitle">The milestone where FerricDB becomes a database: bound statements become
+  plans, plans become iterator trees, and real SQL runs end to end in your REPL.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <p>Every piece you have built so far was in service of this moment. Storage holds tuples, the
+  buffer pool serves pages, the front-end produces checked statements — and today you write the
+  machine that connects them: a planner that turns <code>BoundStatement</code>s into operator
+  trees and an executor that pulls tuples through those trees one <code>next()</code> at a
+  time. When the last test goes green, type <code>INSERT</code> and <code>SELECT</code> into
+  your REPL and take the moment. You wrote a database.</p>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li><strong>Implement</strong> the Volcano iterator contract — <code>open</code>/<code>next</code>/<code>close</code>
+      — and explain why pull-based composition makes operators independent.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Implement</strong> the nine core operators: SeqScan, Filter, Projection, Values,
+      Limit, in-memory Sort, Insert, Update, Delete.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Implement</strong> an expression evaluator with SQL three-valued logic.</li>
+    <li><strong>Build</strong> the planner that maps bound statements to logical plans and
+      logical plans to executor trees.</li>
+    <li><strong>Recognize</strong> blocking vs streaming operators and the Halloween problem —
+      and defuse the latter.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m06-query-execution/index.html">M06 · Query Execution</a> — the
+      concept module: the iterator model, plan trees, operator semantics. Its plan-tree stepper
+      is a visual trace of the code you are about to write.</li>
+    <li><a href="../../modules/m01-relational-model-sql/index.html">M01 · The Relational Model</a>
+      — revisit it: your operators implement exactly that algebra.</li>
+    <li>toyDB's architecture guide — a clean Rust iterator engine; read how its executors
+      compose before designing yours.
+      <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">github.com/erikgrinaker/toydb/docs/architecture</a></li>
+    <li>CMU 15-445 Project #3 — operator semantics at BusTub scale (their executor set is a
+      superset of this milestone's).
+      <a href="https://15445.courses.cs.cmu.edu/fall2025/project3/" rel="external">15445.courses.cs.cmu.edu/fall2025/project3/</a></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — planner and executor light up. With this milestone the entire query
+    path from SQL text to heap pages is yours, end to end.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+  <p>You implement the heart of <code>crates/exec</code>:</p>
+
+  <pre><code>pub mod plan {
+    pub enum LogicalPlan {
+        SeqScan { table: TableInfo, filter: Option&lt;BoundExpr&gt; },
+        Filter { input: Box&lt;LogicalPlan&gt;, predicate: BoundExpr },
+        Projection { input: Box&lt;LogicalPlan&gt;, exprs: Vec&lt;BoundExpr&gt; },
+        Sort { input: Box&lt;LogicalPlan&gt;, keys: Vec&lt;(BoundExpr, bool)&gt; },
+        Limit { input: Box&lt;LogicalPlan&gt;, limit: u64 },
+        Insert { table: TableInfo, input: Box&lt;LogicalPlan&gt; },
+        Update { table: TableInfo, set: Vec&lt;(usize, BoundExpr)&gt;, input: Box&lt;LogicalPlan&gt; },
+        Delete { table: TableInfo, input: Box&lt;LogicalPlan&gt; },
+        Values { rows: Vec&lt;Vec&lt;BoundExpr&gt;&gt;, schema: Schema },
+        // IndexScan, joins, aggregates: Milestones 5–6
+    }
+}
+
+/// Volcano iterator contract. next() returns Ok(None) at end of stream.
+pub trait Executor {
+    fn schema(&amp;self) -&gt; &amp;Schema;
+    fn open(&amp;mut self) -&gt; Result&lt;()&gt;;
+    fn next(&amp;mut self) -&gt; Result&lt;Option&lt;Vec&lt;Value&gt;&gt;&gt;;
+    fn close(&amp;mut self) -&gt; Result&lt;()&gt;;
+}
+
+pub struct Planner&lt;'a&gt; { /* &amp;'a ExecContext */ }
+impl&lt;'a&gt; Planner&lt;'a&gt; {
+    pub fn plan(&amp;self, stmt: binder::BoundStatement) -&gt; Result&lt;plan::LogicalPlan&gt;;
+    pub fn create_executor(&amp;self, plan: &amp;plan::LogicalPlan) -&gt; Result&lt;Box&lt;dyn Executor&gt;&gt;;
+}
+
+pub struct QueryResult { pub schema: Schema, pub rows: Vec&lt;Vec&lt;Value&gt;&gt;,
+                         pub affected: u64, pub explain: Option&lt;String&gt; }
+/// One-stop entry used by REPL, tests, and server.
+pub fn execute(sql: &amp;str, ctx: &amp;ExecContext) -&gt; Result&lt;Vec&lt;QueryResult&gt;&gt;;</code></pre>
+
+  <p>Operator semantics you must honor (each is checked by a test):</p>
+  <ul>
+    <li><strong>SeqScan</strong> wraps <code>HeapFile::scan</code>, deserializes tuples, and
+      (optionally) applies an inlined filter. Skips tombstones.</li>
+    <li><strong>Filter</strong> passes a row iff its predicate evaluates to <em>true</em> —
+      NULL is not true, so a NULL predicate drops the row. Three-valued logic is not optional;
+      it is the tests' favorite subject.</li>
+    <li><strong>Projection</strong> evaluates its expressions per row and emits the new shape;
+      its <code>schema()</code> reports the projected columns and types.</li>
+    <li><strong>Sort</strong> is <em>blocking</em>: <code>open()</code> drains its child,
+      sorts in memory with <code>Value::sql_cmp</code> (NULLs order last in this course —
+      document any choice you make), and <code>next()</code> replays. External sort arrives in
+      Milestone 6.</li>
+    <li><strong>Limit</strong> is <em>streaming</em>: stop calling the child after N rows —
+      the M06 stepper's short-circuit, now in code.</li>
+    <li><strong>Insert / Update / Delete</strong> consume their input, write through
+      <code>HeapFile</code>, and report <code>affected</code> counts (rows produced: none).
+      Update and Delete take their victims from a child SeqScan.</li>
+    <li><strong>Values</strong> emits its literal rows; it is INSERT's usual child.</li>
+  </ul>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <ol>
+    <li><strong>Expression evaluator first.</strong>
+      <code>eval(expr: &amp;BoundExpr, row: &amp;[Value]) -&gt; Result&lt;Value&gt;</code> — a match over
+      the expression tree. The delicate part is NULL: any arithmetic or comparison with a NULL
+      operand yields NULL; <code>AND</code>/<code>OR</code> follow the three-valued truth tables
+      from M01 (<code>false AND NULL = false</code>, <code>true OR NULL = true</code> — the
+      short-circuit rows matter); <code>IS NULL</code> is the one expression that looks at NULL
+      and returns a real boolean. <code>common::Value::sql_cmp</code> already encodes comparison
+      semantics — use it, don't re-derive it.</li>
+    <li><strong>Values + Projection next.</strong> With those two and the evaluator,
+      <code>SELECT 1 + 2 * 3;</code> runs end to end through <code>execute()</code>. Get that
+      green before touching storage.</li>
+    <li><strong>SeqScan, then Filter, then Insert.</strong> Scan is a thin adapter over
+      <code>HeapFile::scan</code>; Insert is Values feeding serialized tuples into
+      <code>HeapFile::insert</code>. At this point the first sqllogictest statements pass.</li>
+    <li><strong>Update/Delete: materialize victims first.</strong> Collect the target
+      <code>RecordId</code>s from the child scan <em>completely</em>, close the scan, then
+      mutate. Interleaving scan and mutation is the <strong>Halloween problem</strong>: an
+      update that moves a tuple forward can meet its own output and update it again. The
+      provided test constructs exactly that trap (an UPDATE bumping values into the scan's
+      path); materialization defuses it.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Sort and Limit.</strong> Sort teaches the blocking pattern (all work in
+      <code>open</code>); Limit teaches early termination. Together they finish the SELECT
+      clause set.</li>
+    <li><strong>Planner: two honest functions.</strong> <code>plan()</code> is a structural
+      mapping — SELECT becomes Scan→Filter→Sort→Limit→Projection (build the tree bottom-up;
+      Projection outermost so ORDER BY can reference unprojected columns for now).
+      <code>create_executor()</code> recursively converts nodes to boxed executors. Resist
+      cleverness here — optimization is Milestone 7's whole job.</li>
+    <li><strong>The result table.</strong> Wire <code>execute()</code> into the REPL's
+      <code>print_result</code>: column headers from <code>QueryResult::schema</code>,
+      width-aligned rows, <code>N rows</code> / <code>N affected</code> trailers. This is the
+      REPL payoff moment from Milestone 0.</li>
+    <li><strong>Run the sqllogictest suite last.</strong> The harness (provided in
+      <code>crates/ferricdb/tests/slt_harness.rs</code>) drives <code>execute()</code> with
+      <code>tests/slt/ms4_crud.slt</code> — CREATE/INSERT/SELECT/UPDATE/DELETE with WHERE,
+      ORDER BY, LIMIT, and NULL cases, in the standard sqllogictest format.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+  </ol>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <pre><code>cargo test -p ferricdb-exec -- --include-ignored ms4_
+
+# end-to-end: the sqllogictest suite
+cargo test -p ferricdb -- --include-ignored slt_all
+
+# regressions
+cargo test -p ferricdb-sql -p ferricdb-catalog -- --include-ignored ms3_</code></pre>
+  <p>The <code>ms4_</code> group builds a fresh <code>ExecContext</code> over a tempfile-backed
+  store and drives everything through <code>execute()</code>: CRUD round-trips, three-valued
+  WHERE semantics, ORDER BY + LIMIT interplay, affected counts, expression evaluation (including
+  CAST and IS NULL), and the Halloween guard. <code>slt_all</code> then replays
+  <code>ms4_crud.slt</code>; when a case fails, the harness prints the statement and both result
+  sets — read them, they are precise.</p>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Treating NULL as false everywhere</span>
+    <p><em>Symptom:</em> <code>SELECT * FROM t WHERE NOT (x &gt; 5)</code> returns rows where
+    <code>x</code> is NULL. <em>Cause:</em> collapsing NULL to false <em>before</em> NOT instead
+    of after: <code>NOT NULL</code> is NULL, which the filter then drops. Keep NULL a first-class
+    value through the whole expression tree and convert to "row passes?" only at the filter
+    boundary.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">The Halloween problem</span>
+    <p><em>Symptom:</em> <code>UPDATE t SET x = x + 10 WHERE x &lt; 100</code> bumps some rows
+    twice (or loops). <em>Cause:</em> the update's writes land ahead of the scan cursor and are
+    re-visited. Named for the day IBM's System R team discovered it; the fix is the one in the
+    guidance — fully materialize the victim list before writing.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Sort as a streaming operator</span>
+    <p><em>Symptom:</em> ORDER BY output is correct for one-page tables and interleaved for
+    larger ones. <em>Cause:</em> sorting each <code>next()</code> batch instead of draining the
+    child in <code>open()</code>. A sort cannot emit its first row before seeing its last input
+    row — blocking is the definition, not an implementation detail.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Schema lies</span>
+    <p><em>Symptom:</em> downstream operators panic on column indexes. <em>Cause:</em> an
+    operator whose <code>schema()</code> doesn't match what <code>next()</code> actually emits
+    (classically: Projection reporting its input schema). Every test failure of the form
+    "index out of bounds" starts here.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li><code>ms4_</code> and <code>slt_all</code> pass; <code>ms1_</code>–<code>ms3_</code>
+      still pass.</li>
+    <li>A full REPL session works: create a table, insert three rows (one with NULLs), select
+      with WHERE/ORDER BY/LIMIT, update, delete, select again — with aligned result tables and
+      correct counts.</li>
+    <li>The Halloween UPDATE from the pitfall bumps every row exactly once.</li>
+    <li>You can explain why Limit over Sort still reads the whole table, but Limit over SeqScan
+      does not.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="Sort must see every input row before it can emit the smallest — it is blocking by definition. Limit is streaming: it just stops pulling. Stacked as Limit(Sort(...)), the sort still consumes everything; the limit only trims the replay. That asymmetry is why 'top-N' gets its own specialized operator in real systems.">
+    <legend class="quiz-q">SELECT … ORDER BY x LIMIT 5 on a million-row table: how many rows does Sort consume?</legend>
+    <label><input type="radio" name="q1"> Five — Limit stops the pipeline early</label>
+    <label><input type="radio" name="q1" data-correct> All million — Sort is blocking; Limit only trims what Sort replays</label>
+    <label><input type="radio" name="q1"> One page worth — the buffer pool bounds it</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+  <fieldset class="quiz" data-explain="false AND NULL is false (the false side decides regardless of the unknown), while true AND NULL is NULL (the unknown side could still flip it). Getting these two rows of the truth table right is most of what the ms4_ NULL tests check.">
+    <legend class="quiz-q">What does false AND NULL evaluate to?</legend>
+    <label><input type="radio" name="q2" data-correct> false — the known false operand decides</label>
+    <label><input type="radio" name="q2"> NULL — any operation with NULL is NULL</label>
+    <label><input type="radio" name="q2"> An error — booleans cannot mix with NULL</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Hellerstein, Stonebraker, Hamilton, "Architecture of a Database System" —
+          the query processor chapter: the iterator model and operator composition.
+          <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf" rel="external">https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf</a></li>
+        <li id="ref-2">CMU 15-445/645 (Fall 2025), Project #3: Query Execution — operator
+          semantics, blocking vs streaming, and update-path hazards.
+          <a href="https://15445.courses.cs.cmu.edu/fall2025/project3/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project3/</a></li>
+        <li id="ref-3">risinglightdb/sqllogictest-rs — the harness format and runner used by the
+          end-to-end suite.
+          <a href="https://github.com/risinglightdb/sqllogictest-rs" rel="external">https://github.com/risinglightdb/sqllogictest-rs</a></li>
+        <li id="ref-4">erikgrinaker/toydb, architecture guide — a Rust iterator engine to
+          compare designs with.
+          <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>The Internals of PostgreSQL, §3.4 — how Postgres's executor walks its plan trees; map
+        each of its node types onto yours.
+        <a href="https://www.interdb.jp/pg/pgsql03.html" rel="external">interdb.jp/pg/pgsql03.html</a></li>
+      <li>toyDB's SQL docs — which parts of SQL a comparable one-person engine chose to support,
+        and why. <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/sql.md" rel="external">github.com/erikgrinaker/toydb/docs/sql.md</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>Next on the path: <a href="../../modules/m04-data-structures-indexes/index.html">M04 ·
+    B+Trees (and Friends)</a>, then <a href="../milestone-05/index.html">Milestone 5</a> — your
+    scans learn to skip.</p>
+
+    <nav class="prevnext">
+      <a href="../../modules/m06-query-execution/index.html"><span class="dir">← Previous</span> M06 · Query Execution</a>
+      <a class="next" href="../../modules/m04-data-structures-indexes/index.html"><span class="dir">Next →</span> M04 · B+Trees (and Friends)</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog"],
+    current: ["planner", "executor"],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

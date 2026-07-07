@@ -1,0 +1,1114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M06 · Query Execution: Plans and the Iterator Model — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+/* set theme before first paint to avoid flashing */
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M06 Query Execution</span>
+  </nav>
+  <span class="badge">Module 06</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M06 · Query Execution: Plans and the Iterator Model</h1>
+  <p class="subtitle">How a bound SQL statement becomes a tree of operators, and how one
+  <code>next()</code> call at the root pulls tuples through the whole tree — the engine you
+  will build in Milestone 4.</p>
+
+  <noscript><p class="noscript-warn">Interactive demos and self-check quizzes on this page need JavaScript;
+  all explanatory content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-pipeline">From SQL text to a running plan</a></li>
+      <li><a href="#sec-plans">Logical plans vs physical plans</a></li>
+      <li><a href="#sec-iterator">The Volcano iterator model: open, next, close</a></li>
+      <li><a href="#sec-stepper">Watch a plan run: the pull stepper</a></li>
+      <li><a href="#sec-models">Streaming vs blocking, and rival execution models</a></li>
+      <li><a href="#sec-expressions">Evaluating expressions over tuples</a></li>
+      <li><a href="#sec-catalog">The catalog: the executor's map of the world</a></li>
+      <li><a href="#sec-operators">Operator semantics: the Milestone 4 zoo</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-pipeline">From SQL text to a running plan</h2>
+
+  <p>Everything you built through Milestone 3 was preparation for this moment. The parser turns a SQL
+  string into an abstract syntax tree; the binder resolves every table and column name against the
+  catalog and attaches types (see <a href="../m05-sql-parsing/index.html">M05</a>). What comes out is
+  still a <em>description</em> of a question. This module is about the machinery that turns that
+  description into an answer: the <strong>planner</strong>, which produces an executable plan, and the
+  <strong>executor</strong>, which runs it.</p>
+
+  <p>The classic survey by Hellerstein, Stonebraker, and Hamilton describes the whole arc in one
+  sentence: a relational query processor takes a declarative SQL statement, validates it, optimizes it
+  into a <em>procedural dataflow execution plan</em>, and executes that plan on behalf of a client,
+  which then pulls result tuples, typically one at a time or in small batches.<sup class="cite"><a href="#ref-1">1</a></sup>
+  Two words there deserve emphasis. <em>Dataflow</em>: the plan is a graph whose nodes are operators
+  and whose edges carry tuples. <em>Pulls</em>: the consumer asks for rows; nothing runs until
+  someone asks.</p>
+
+  <p>PostgreSQL is the cleanest real-world illustration of the staging. A query passes through five
+  subsystems: the <strong>parser</strong> builds a parse tree (rooted in a <code>SelectStmt</code>
+  node) checking syntax only; the <strong>analyzer</strong> performs semantic analysis and produces a
+  <em>query tree</em> (a <code>Query</code> structure recording the command type, target list, range
+  table, and join tree); the <strong>rewriter</strong> transforms the query tree according to stored
+  rules — this is how views are expanded into their defining subqueries; the <strong>planner</strong>
+  produces a <em>plan tree</em> using purely cost-based optimization (PostgreSQL supports neither
+  rule-based optimization nor hints); and the <strong>executor</strong> runs the plan tree, accessing
+  tables and indexes in the order the plan nodes dictate.<sup class="cite"><a href="#ref-5">5</a></sup>
+  View expansion in the rewriter is an old idea with a long pedigree — the survey traces it back to
+  INGRES, and lists it alongside constant folding and predicate rewrites as the standard rewriter
+  duties.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>FerricDB collapses this into four stages, which is a <em>course choice</em> to keep Milestone 4
+  small: parse (MS3) → bind (MS3) → plan → execute. There is no separate rewriter; the few rewrites we
+  ever do (constant folding, predicate pushdown) arrive in Milestone 7 as optimizer rules, mirroring
+  where SQL Server hosts its rewriter — inside the optimizer — rather than DB2's stand-alone
+  component.<sup class="cite"><a href="#ref-1">1</a></sup> The public seam in
+  <code>course/ferricdb/crates/exec</code> is three calls:</p>
+
+  <pre><code>let plan = planner.plan(bound_statement)?;      // BoundStatement -&gt; LogicalPlan
+let plan = planner.optimize(plan)?;             // identity until Milestone 7
+let mut exec = planner.create_executor(&amp;plan)?; // LogicalPlan -&gt; Box&lt;dyn Executor&gt;</code></pre>
+
+  <h2 id="sec-plans">Logical plans vs physical plans</h2>
+
+  <p>A <strong>logical plan</strong> says <em>what</em> relational operation to perform: "filter these
+  rows", "keep these columns", "order by this expression". A <strong>physical plan</strong> says
+  <em>how</em>: which access path fetches the rows, which algorithm sorts them. The survey frames the
+  optimizer's whole job as converting the internal query representation into an efficient plan — a
+  dataflow diagram piping table data through a graph of operators — and its example plan is explicitly
+  physical: <em>HeapScan</em> and <em>IndexScan</em> leaves feeding an <em>IndexJoin</em>, not the
+  abstract "scan" and "join" of relational algebra.<sup class="cite"><a href="#ref-1">1</a></sup>
+  The distinction matters because one logical plan usually has several physical realizations with
+  wildly different costs, and choosing among them is the optimizer's business
+  (<a href="../m08-query-optimization/index.html">M08</a>).</p>
+
+  <figure>
+    <svg viewBox="0 0 940 400" role="img">
+      <title>One logical plan on the left and two candidate physical plans on the right for the same SQL query.</title>
+      <!-- panel headers -->
+      <text x="160" y="26" text-anchor="middle" class="d-text" font-weight="650">Logical plan — what</text>
+      <text x="475" y="26" text-anchor="middle" class="d-text" font-weight="650">Physical plan A — how</text>
+      <text x="790" y="26" text-anchor="middle" class="d-text" font-weight="650">Physical plan B — how (MS5+)</text>
+      <!-- logical column -->
+      <rect x="60" y="44" width="200" height="40" rx="8" class="d-box-hl"/>
+      <text x="160" y="69" text-anchor="middle" class="d-mono">Limit 2</text>
+      <rect x="60" y="112" width="200" height="40" rx="8" class="d-box-hl"/>
+      <text x="160" y="137" text-anchor="middle" class="d-mono">Order by balance</text>
+      <rect x="60" y="180" width="200" height="40" rx="8" class="d-box-hl"/>
+      <text x="160" y="205" text-anchor="middle" class="d-mono">Project name, balance</text>
+      <rect x="60" y="248" width="200" height="40" rx="8" class="d-box-hl"/>
+      <text x="160" y="273" text-anchor="middle" class="d-mono">Filter balance ≥ 100</text>
+      <rect x="60" y="316" width="200" height="40" rx="8" class="d-box-hl"/>
+      <text x="160" y="341" text-anchor="middle" class="d-mono">Scan accounts</text>
+      <line x1="160" y1="84" x2="160" y2="112" class="d-line"/>
+      <line x1="160" y1="152" x2="160" y2="180" class="d-line"/>
+      <line x1="160" y1="220" x2="160" y2="248" class="d-line"/>
+      <line x1="160" y1="288" x2="160" y2="316" class="d-line"/>
+      <!-- physical A -->
+      <rect x="375" y="44" width="200" height="40" rx="8" class="d-box"/>
+      <text x="475" y="69" text-anchor="middle" class="d-mono">Limit 2</text>
+      <rect x="375" y="112" width="200" height="40" rx="8" class="d-box-warn"/>
+      <text x="475" y="130" text-anchor="middle" class="d-mono">InMemSort(balance)</text>
+      <text x="475" y="146" text-anchor="middle" class="d-text-sm">blocking: buffers every row</text>
+      <rect x="375" y="180" width="200" height="40" rx="8" class="d-box"/>
+      <text x="475" y="205" text-anchor="middle" class="d-mono">Projection</text>
+      <rect x="375" y="248" width="200" height="40" rx="8" class="d-box"/>
+      <text x="475" y="273" text-anchor="middle" class="d-mono">Filter balance ≥ 100</text>
+      <rect x="375" y="316" width="200" height="40" rx="8" class="d-box"/>
+      <text x="475" y="334" text-anchor="middle" class="d-mono">SeqScan accounts</text>
+      <text x="475" y="350" text-anchor="middle" class="d-text-sm">reads every heap page</text>
+      <line x1="475" y1="84" x2="475" y2="112" class="d-line"/>
+      <line x1="475" y1="152" x2="475" y2="180" class="d-line"/>
+      <line x1="475" y1="220" x2="475" y2="248" class="d-line"/>
+      <line x1="475" y1="288" x2="475" y2="316" class="d-line"/>
+      <!-- physical B -->
+      <rect x="690" y="44" width="200" height="40" rx="8" class="d-box"/>
+      <text x="790" y="69" text-anchor="middle" class="d-mono">Limit 2</text>
+      <rect x="690" y="112" width="200" height="40" rx="8" class="d-box"/>
+      <text x="790" y="137" text-anchor="middle" class="d-mono">Projection</text>
+      <rect x="690" y="180" width="200" height="56" rx="8" class="d-box-good"/>
+      <text x="790" y="202" text-anchor="middle" class="d-mono">IndexScan accounts</text>
+      <text x="790" y="222" text-anchor="middle" class="d-text-sm">balance ≥ 100, already ordered</text>
+      <line x1="790" y1="84" x2="790" y2="112" class="d-line"/>
+      <line x1="790" y1="152" x2="790" y2="180" class="d-line"/>
+      <text x="790" y="290" text-anchor="middle" class="d-text-sm">index order makes the Sort node</text>
+      <text x="790" y="308" text-anchor="middle" class="d-text-sm">unnecessary; B+Tree arrives in MS5</text>
+      <!-- chooser arrows -->
+      <line x1="270" y1="200" x2="365" y2="200" class="d-line-hl"/>
+      <line x1="270" y1="200" x2="680" y2="380" class="d-line-hl"/>
+      <text x="330" y="388" class="d-text-sm">the planner picks the cheaper realization (M08)</text>
+    </svg>
+    <figcaption>Figure 1 — one logical plan, two candidate physical plans for
+    <code>SELECT name, balance FROM accounts WHERE balance &gt;= 100 ORDER BY balance LIMIT 2</code>.
+    Plan B exploits an index's ordered scan to delete the Sort node entirely — an optimizer rule
+    in CMU's Project 3 performs exactly this rewrite.<sup class="cite"><a href="#ref-2">2</a></sup></figcaption>
+  </figure>
+
+  <p>toyDB, the Rust engine we lean on throughout the course, represents a plan as a
+  <code>Plan</code> enum whose variant names the statement kind (SELECT, INSERT, UPDATE, DELETE) and
+  whose body is a tree of <code>Node</code> values; each node emits a stream of rows and may consume
+  the row streams of its children, with rows flowing from the leaves to the root.<sup class="cite"><a href="#ref-3">3</a></sup>
+  For a SELECT with a join, filter, projection, and ORDER BY, toyDB's tree stacks
+  <code>Order</code> over <code>Projection</code> over <code>Filter</code> over a join of two
+  <code>Scan</code> leaves.<sup class="cite"><a href="#ref-3">3</a></sup> FerricDB's
+  <code>plan::LogicalPlan</code> enum is the same shape:</p>
+
+  <pre><code>pub enum LogicalPlan {
+    SeqScan    { table: TableInfo, filter: Option&lt;BoundExpr&gt; },
+    Filter     { input: Box&lt;LogicalPlan&gt;, predicate: BoundExpr },
+    Projection { input: Box&lt;LogicalPlan&gt;, exprs: Vec&lt;BoundExpr&gt; },
+    Sort       { input: Box&lt;LogicalPlan&gt;, keys: Vec&lt;(BoundExpr, bool)&gt; },
+    Limit      { input: Box&lt;LogicalPlan&gt;, limit: u64 },
+    Values     { rows: Vec&lt;Vec&lt;BoundExpr&gt;&gt;, schema: Schema },
+    Insert     { table: TableInfo, input: Box&lt;LogicalPlan&gt; },
+    Update     { table: TableInfo, set: Vec&lt;(usize, BoundExpr)&gt;, input: Box&lt;LogicalPlan&gt; },
+    Delete     { table: TableInfo, input: Box&lt;LogicalPlan&gt; },
+    // IndexScan (MS5), joins and Aggregate (MS6) join the enum later
+}</code></pre>
+
+  <p>Notice the name: <em>Logical</em>Plan, even though Milestone 4 executes it directly. This is a
+  deliberate course choice. Until Milestone 5 there is exactly one access path (the sequential scan)
+  and one sort algorithm (in memory), so every logical node has exactly one physical realization and a
+  separate physical tree would be pure ceremony. toyDB makes the same simplification — a single node
+  tree serves as both.<sup class="cite"><a href="#ref-3">3</a></sup> When index scans (MS5) and
+  cost-based choices (MS7) arrive, <code>create_executor</code> becomes the place where physical
+  decisions get made.</p>
+
+  <p>How do real systems <em>represent</em> the executable plan? The survey notes that every major
+  DBMS now compiles queries into some interpretable data structure, but the abstraction level varies:
+  some systems use a lightweight, relational-algebra-like tree annotated with access method and
+  algorithm names, while others lower plans into op-codes closer in spirit to Java bytecode.<sup class="cite"><a href="#ref-1">1</a></sup>
+  PostgreSQL and SQLite sit at opposite ends of that spectrum, and it is worth seeing both because
+  FerricDB copies one and your intuition from <code>sqlite3</code> may come from the other.</p>
+
+  <div class="tabs">
+    <div class="tab-list" role="tablist">
+      <button role="tab" aria-selected="true" type="button">PostgreSQL — plan-node tree</button>
+      <button role="tab" aria-selected="false" type="button">SQLite — VDBE bytecode</button>
+    </div>
+    <div class="tab-panel">
+      <p>PostgreSQL's planner emits a tree of <em>plan nodes</em>; the executor walks it, with control
+      flowing top-down (a <code>Sort</code> node invokes the <code>Seq Scan</code> below it) while
+      tuples flow bottom-up, one at a time, in classic Volcano style.<sup class="cite"><a href="#ref-5">5</a></sup>
+      <code>EXPLAIN</code> prints the tree directly — for a single-table query with an ORDER BY you
+      see a two-node plan (costs elided here):<sup class="cite"><a href="#ref-5">5</a></sup></p>
+      <pre><code>Sort  (cost=… rows=… width=…)
+  Sort Key: data
+  -&gt;  Seq Scan on tbl_1  (cost=… rows=… width=…)
+        Filter: (id &lt; 300)</code></pre>
+      <p>The executor reads and writes tables through the buffer manager
+      (<a href="../m03-buffer-pool/index.html">M03</a>), works within memory areas such as
+      <code>work_mem</code> and <code>temp_buffers</code>, and spills to temporary files when a sort
+      or hash exceeds them.<sup class="cite"><a href="#ref-5">5</a></sup> The tree-of-objects design
+      has structural advantages: a running plan stays mutable, and independent nodes are natural units
+      to hand to separate threads.<sup class="cite"><a href="#ref-6">6</a></sup> FerricDB is squarely
+      in this camp.</p>
+    </div>
+    <div class="tab-panel" hidden>
+      <p>SQLite compiles a SQL statement into <em>bytecode</em>: a prepared statement is literally a
+      small program, executed by a virtual machine (the VDBE), with high-level opcodes like
+      <code>OP_Next</code> (advance a B-tree cursor) and <code>OP_Column</code> (extract a column
+      value).<sup class="cite"><a href="#ref-6">6</a></sup> SQLite's own documentation contrasts this
+      with MySQL and PostgreSQL, which compile SQL into "a tree of objects that represent the
+      processing to be done" and execute by walking that tree.<sup class="cite"><a href="#ref-6">6</a></sup>
+      Bytecode's advantages: <code>EXPLAIN</code> renders the whole program as a flat, readable table
+      of instructions; execution pauses naturally after each produced row (incremental evaluation is
+      trivial); the program is compact; and the inner loop makes fewer decisions per step, so it runs
+      fast.<sup class="cite"><a href="#ref-6">6</a></sup> The costs: a bytecode program is hard to
+      restructure once running, and harder to parallelize than a dataflow tree whose nodes are
+      independent.<sup class="cite"><a href="#ref-6">6</a></sup></p>
+    </div>
+  </div>
+
+  <h2 id="sec-iterator">The Volcano iterator model: open, next, close</h2>
+
+  <p>Now the heart of the module. Most query executors, from the earliest relational systems to
+  toyDB, use the <strong>iterator model</strong> (also called the <strong>Volcano model</strong> or
+  <strong>pipeline model</strong>). The survey sketches the whole idea as a tiny superclass: an
+  iterator has an array of input iterators and three methods — initialize, get the next tuple, and
+  close — and <em>every operator in the plan is a subclass of it</em>.<sup class="cite"><a href="#ref-1">1</a></sup>
+  A typical system's subclass roster reads like our milestone list: file scan, index scan, sort,
+  nested-loops join, merge join, hash join, duplicate elimination, grouped
+  aggregation.<sup class="cite"><a href="#ref-1">1</a></sup> FerricDB's version is the trait you will
+  implement nine times in Milestone 4:</p>
+
+  <pre><code>/// Volcano iterator contract. next() returns Ok(None) at end of stream.
+pub trait Executor {
+    fn schema(&amp;self) -&gt; &amp;Schema;
+    fn open(&amp;mut self) -&gt; Result&lt;()&gt;;
+    fn next(&amp;mut self) -&gt; Result&lt;Option&lt;Vec&lt;Value&gt;&gt;&gt;;
+    fn close(&amp;mut self) -&gt; Result&lt;()&gt;;
+}</code></pre>
+
+  <p>(Naming is cosmetic and varies by system: the survey writes <code>init/get_next/close</code>,<sup class="cite"><a href="#ref-1">1</a></sup>
+  BusTub writes <code>Init/Next</code>,<sup class="cite"><a href="#ref-2">2</a></sup> toyDB reuses
+  Rust's own <code>Iterator::next</code>.<sup class="cite"><a href="#ref-4">4</a></sup> FerricDB's
+  <code>open/next/close</code> is a course choice.) The lifecycle:</p>
+
+  <ul>
+    <li><strong>open()</strong> — acquire resources and initialize state: look up the table's first
+    page, allocate the sort buffer, reset counters. Each operator opens its children, so one call at
+    the root cascades to the leaves.</li>
+    <li><strong>next()</strong> — do the smallest amount of work needed to produce <em>one</em> output
+    row, calling children's <code>next()</code> as needed; return <code>Ok(None)</code> when the
+    stream is exhausted.</li>
+    <li><strong>close()</strong> — release everything, again cascading down. After close, no more
+    <code>next()</code> calls are legal.</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 940 330" role="img">
+      <title>Three-phase lifecycle of an iterator plan: open cascades down, next pulls rows up repeatedly, close cascades down.</title>
+      <!-- phase 1: open -->
+      <text x="160" y="28" text-anchor="middle" class="d-text" font-weight="650">1 · open()</text>
+      <rect x="80" y="48" width="160" height="38" rx="8" class="d-box"/>
+      <text x="160" y="72" text-anchor="middle" class="d-mono">Limit</text>
+      <rect x="80" y="128" width="160" height="38" rx="8" class="d-box"/>
+      <text x="160" y="152" text-anchor="middle" class="d-mono">Filter</text>
+      <rect x="80" y="208" width="160" height="38" rx="8" class="d-box"/>
+      <text x="160" y="232" text-anchor="middle" class="d-mono">SeqScan</text>
+      <line x1="140" y1="86" x2="140" y2="128" class="d-line-hl"/>
+      <line x1="140" y1="166" x2="140" y2="208" class="d-line-hl"/>
+      <text x="150" y="111" class="d-mono-sm">open()</text>
+      <text x="150" y="191" class="d-mono-sm">open()</text>
+      <text x="160" y="286" text-anchor="middle" class="d-text-sm">allocate state, pin nothing yet;</text>
+      <text x="160" y="304" text-anchor="middle" class="d-text-sm">cascades root → leaves</text>
+      <!-- phase 2: next -->
+      <text x="475" y="28" text-anchor="middle" class="d-text" font-weight="650">2 · next(), repeated</text>
+      <rect x="395" y="48" width="160" height="38" rx="8" class="d-box-hl"/>
+      <text x="475" y="72" text-anchor="middle" class="d-mono">Limit</text>
+      <rect x="395" y="128" width="160" height="38" rx="8" class="d-box-hl"/>
+      <text x="475" y="152" text-anchor="middle" class="d-mono">Filter</text>
+      <rect x="395" y="208" width="160" height="38" rx="8" class="d-box-hl"/>
+      <text x="475" y="232" text-anchor="middle" class="d-mono">SeqScan</text>
+      <line x1="440" y1="86" x2="440" y2="128" class="d-line-hl"/>
+      <line x1="440" y1="166" x2="440" y2="208" class="d-line-hl"/>
+      <line x1="510" y1="128" x2="510" y2="86" class="d-line-hl"/>
+      <line x1="510" y1="208" x2="510" y2="166" class="d-line-hl"/>
+      <text x="380" y="111" text-anchor="end" class="d-mono-sm">next() ↓</text>
+      <text x="380" y="191" text-anchor="end" class="d-mono-sm">next() ↓</text>
+      <text x="522" y="111" class="d-mono-sm">↑ Some(row) | None</text>
+      <text x="522" y="191" class="d-mono-sm">↑ Some(row) | None</text>
+      <text x="475" y="286" text-anchor="middle" class="d-text-sm">control goes down the call stack,</text>
+      <text x="475" y="304" text-anchor="middle" class="d-text-sm">the tuple rides the return value up</text>
+      <!-- phase 3: close -->
+      <text x="790" y="28" text-anchor="middle" class="d-text" font-weight="650">3 · close()</text>
+      <rect x="710" y="48" width="160" height="38" rx="8" class="d-box"/>
+      <text x="790" y="72" text-anchor="middle" class="d-mono">Limit</text>
+      <rect x="710" y="128" width="160" height="38" rx="8" class="d-box"/>
+      <text x="790" y="152" text-anchor="middle" class="d-mono">Filter</text>
+      <rect x="710" y="208" width="160" height="38" rx="8" class="d-box"/>
+      <text x="790" y="232" text-anchor="middle" class="d-mono">SeqScan</text>
+      <line x1="770" y1="86" x2="770" y2="128" class="d-line"/>
+      <line x1="770" y1="166" x2="770" y2="208" class="d-line"/>
+      <text x="780" y="111" class="d-mono-sm">close()</text>
+      <text x="780" y="191" class="d-mono-sm">close()</text>
+      <text x="790" y="286" text-anchor="middle" class="d-text-sm">free buffers, unpin pages, drop</text>
+      <text x="790" y="304" text-anchor="middle" class="d-text-sm">cursors — even after early exit</text>
+    </svg>
+    <figcaption>Figure 2 — the iterator lifecycle. The crucial phase is the middle one:
+    <code>next()</code> couples dataflow to control flow, so a row travels upward precisely when a
+    call returns.<sup class="cite"><a href="#ref-1">1</a></sup></figcaption>
+  </figure>
+
+  <h3 id="sub-pull">Pull-based dataflow</h3>
+
+  <p>The deep property of this design is that <em>dataflow is coupled with control flow</em>: a call
+  to <code>get_next()</code> is an ordinary procedure call, and the tuple travels to the parent as its
+  return value — a row moves up the tree exactly when control returns.<sup class="cite"><a href="#ref-1">1</a></sup>
+  Three big consequences follow, all from the survey.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <ul>
+    <li><strong>One thread suffices.</strong> A single thread executes the entire plan; there are no
+    queues between operators and no rate-matching problem where a fast producer floods a slow
+    consumer — contrast network dataflow systems, which need explicit feedback protocols between
+    concurrent producers and consumers.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Composability is total.</strong> Any iterator can be the input of any other; each
+    operator's logic is independent of what sits above or below it, so no special-case code is needed
+    for particular combinations.<sup class="cite"><a href="#ref-1">1</a></sup> Your <code>Limit</code>
+    will not know whether its child is a scan, a filter, or (from Milestone 6) a hash join — and must
+    not care.</li>
+    <li><strong>Resources stay busy, and first rows come early.</strong> Since some iterator is
+    always active, a single-processor plan keeps resources fully utilized; and because rows stream
+    out as soon as they are produced, the model also serves <em>time-to-first-row</em>, the metric
+    interactive applications care about, not just time-to-completion.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+  </ul>
+
+  <p>The model even survives parallelism: <em>exchange</em> operators encapsulate threading and
+  network "push" behind the same pull-style <code>get_next()</code> interface, so the other operators
+  never notice.<sup class="cite"><a href="#ref-1">1</a></sup> You will not build exchange operators in
+  this course, but it explains why the 1990-vintage design still runs inside nearly every SQL engine
+  you can name.</p>
+
+  <p>In Rust the model is almost embarrassingly natural. toyDB's executor takes the plan, recursively
+  calls <code>execute_node()</code> on each node, and has every node return a boxed row iterator that
+  the parent consumes; pulling on the <em>root</em> iterator drives the entire pipeline by recursively
+  calling <code>next()</code> on the children's iterators.<sup class="cite"><a href="#ref-4">4</a></sup>
+  FerricDB keeps an explicit <code>Executor</code> trait instead of bare
+  <code>Box&lt;dyn Iterator&gt;</code> (a course choice: we need <code>schema()</code> for wire
+  results and an explicit <code>close()</code> to unpin buffer pages deterministically), but the
+  driver loop is the same four lines you will write in the REPL:</p>
+
+  <pre><code>let mut exec = planner.create_executor(&amp;plan)?;
+exec.open()?;
+while let Some(row) = exec.next()? {
+    print_row(&amp;row);
+}
+exec.close()?;</code></pre>
+
+  <div class="callout note">
+    <span class="callout-title">Where does the tuple's memory live?</span>
+    <p>The survey distinguishes <strong>BP-tuples</strong> — tuple references pointing into buffer-pool
+    pages, which force the page to stay pinned as long as the reference lives — from
+    <strong>M-tuples</strong>, copies materialized on the heap (by copying columns out of a page or by
+    evaluating expressions).<sup class="cite"><a href="#ref-1">1</a></sup> Always copying into
+    M-tuples simplifies the executor and eliminates a classic bug — forgetting to unpin a page, a
+    "buffer leak" — but the copies themselves can become the bottleneck, so high-performance engines
+    support both.<sup class="cite"><a href="#ref-1">1</a></sup> FerricDB always copies: a row is an
+    owned <code>Vec&lt;Value&gt;</code>, decoded from the page inside SeqScan. That is a course
+    choice, trading memory bandwidth for never having a dangling page reference — the borrow checker
+    would fight us on BP-tuples, and it would be right to.</p>
+  </div>
+
+  <h2 id="sec-stepper">Watch a plan run: the pull stepper</h2>
+
+  <p>Time to make the cascade concrete. Take this table and query — the same fixed data the widget
+  below uses:</p>
+
+  <pre><code>SELECT name, balance FROM accounts WHERE balance &gt;= 100 LIMIT 2;
+
+Limit 2
+└─ Projection: name, balance
+   └─ Filter: balance &gt;= 100
+      └─ SeqScan: accounts        -- 8 rows in heap order</code></pre>
+
+  <p><strong>Worked example.</strong> The client's first <code>next()</code> on Limit cascades down —
+  Limit asks Projection, Projection asks Filter, Filter asks SeqScan — and SeqScan reads row 1,
+  <code>(1, ada, 120)</code>. The predicate <code>120 ≥ 100</code> holds, so the row rides the return
+  values back up and the client has its first result after exactly one heap read. The second pull is
+  more interesting: SeqScan yields <code>(2, bob, 45)</code> — Filter rejects it and, without
+  returning to its parent, calls <code>SeqScan.next()</code> again; <code>(3, cat, 80)</code> is
+  rejected too; <code>(4, dan, 200)</code> passes and flows up. Filter's single <code>next()</code>
+  invocation consumed <em>three</em> child rows. On the third pull, Limit has already emitted 2 rows,
+  so it returns <code>None</code> immediately — it never calls Projection at all. The final tally:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Operator</th><th>next() calls received</th><th>rows returned upward</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Limit 2</td><td>3</td><td>2, then None</td></tr>
+        <tr><td>Projection</td><td>2</td><td>2</td></tr>
+        <tr><td>Filter</td><td>2</td><td>2</td></tr>
+        <tr><td>SeqScan</td><td>4</td><td>4</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>SeqScan read 4 of 8 rows; rows 5–8 were never touched. Nothing in the Limit code "knows" about
+  scans — the early exit falls out of the pull discipline: work happens only when a parent asks, and
+  Limit stops asking.<sup class="cite"><a href="#ref-1">1</a></sup> Scale the intuition up: if
+  <code>accounts</code> had a million rows and the first two matches still sat in rows 1 and 4, the
+  query would <em>still</em> perform exactly 4 heap reads. BusTub's spec states the operator's
+  contract dryly — Limit constrains the number of output tuples, and has no effect if the child
+  produces fewer than the limit<sup class="cite"><a href="#ref-2">2</a></sup> — but the performance
+  consequence is this short-circuit.</p>
+
+  <div class="widget" id="widget-volcano">
+    <p class="widget-title">Plan-tree stepper — pull tuples through a Volcano executor</p>
+    <p class="widget-sub">Each click of "Pull next tuple" issues one <code>next()</code> call on the
+    root and animates the recursive calls down the tree (left) and the tuple's trip back up. The
+    heap table (right) shows which rows SeqScan has actually read. Watch the per-operator counters,
+    and keep pulling until Limit short-circuits: rows 5–8 are never read.</p>
+    <div class="controls">
+      <button id="vx-pull" class="btn primary" type="button">Pull next tuple</button>
+      <button id="vx-reset" class="btn" type="button">↺ Reset</button>
+      <span class="step-label" id="vx-status" role="status">Ready — no calls yet.</span>
+    </div>
+    <div class="grid-2">
+      <div id="vx-tree"></div>
+      <div>
+        <div class="table-wrap">
+          <table id="vx-table">
+            <thead><tr><th>#</th><th>id</th><th>name</th><th>balance</th><th>state</th></tr></thead>
+            <tbody>
+              <tr><td>1</td><td>1</td><td>ada</td><td>120</td><td></td></tr>
+              <tr><td>2</td><td>2</td><td>bob</td><td>45</td><td></td></tr>
+              <tr><td>3</td><td>3</td><td>cat</td><td>80</td><td></td></tr>
+              <tr><td>4</td><td>4</td><td>dan</td><td>200</td><td></td></tr>
+              <tr><td>5</td><td>5</td><td>eve</td><td>300</td><td></td></tr>
+              <tr><td>6</td><td>6</td><td>fay</td><td>20</td><td></td></tr>
+              <tr><td>7</td><td>7</td><td>gil</td><td>150</td><td></td></tr>
+              <tr><td>8</td><td>8</td><td>hal</td><td>90</td><td></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div id="vx-result"></div>
+      </div>
+    </div>
+    <div class="log" id="vx-log" aria-live="polite"></div>
+  </div>
+
+  <div class="callout tip">
+    <span class="callout-title">Read the counters like a profiler</span>
+    <p>The gap between "calls received" and "rows returned" is where execution cost hides. Filter
+    received 2 calls but drove 4 scan reads; a selective predicate under a small limit is why the
+    optimizer wants filters as deep in the tree as possible (predicate pushdown, Milestone 7). When
+    you implement <code>EXPLAIN ANALYZE</code>-style counters in FerricDB, these are exactly the
+    numbers to expose.</p>
+  </div>
+
+  <h2 id="sec-models">Streaming vs blocking, and rival execution models</h2>
+
+  <h3 id="sub-blocking">Streaming operators and pipeline breakers</h3>
+
+  <p>Filter, Projection, and Limit are <strong>streaming</strong> operators: each output row needs
+  only a bounded amount of input, so rows flow through with O(1) state and the first result reaches
+  the client while the scan is still cold. <strong>Blocking</strong> operators break the pipe. A sort
+  cannot emit its first output row until it has seen its <em>last</em> input row — the minimum of the
+  sort order might be the final tuple the scan produces. toyDB's <code>Order</code> node therefore
+  buffers all input rows in memory before sorting them,<sup class="cite"><a href="#ref-4">4</a></sup>
+  and PostgreSQL's executor sorts within <code>work_mem</code>, spilling to temporary files when the
+  data exceeds it.<sup class="cite"><a href="#ref-5">5</a></sup> The BusTub spec names the phenomenon:
+  aggregation is a <em>pipeline breaker</em>, as is the build side of a hash join — which is why those
+  executors do their heavy lifting in <code>Init()</code> rather than <code>Next()</code>.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p>Inside the iterator contract, "blocking" is not a different interface — it is just an operator
+  whose <em>first</em> <code>next()</code> call is expensive. Your Milestone 4 Sort will drain its
+  child completely on the first pull, sort the buffered rows, then stream them out one per call. The
+  contract is preserved; only the latency profile changes. That means everything downstream of a Sort
+  loses the time-to-first-row benefit, and a <code>LIMIT</code> above a Sort cannot save the scan —
+  though it can save comparisons, a trick (top-k via a bounded heap) you will meet in
+  <a href="../m07-joins-sorting-aggregation/index.html">M07</a>.</p>
+
+  <h3 id="sub-alternatives">Materialization and vectorization, surveyed</h3>
+
+  <p>Tuple-at-a-time pulling is not the only way to run a plan tree. Two alternatives matter, and you
+  should be able to place any engine you meet on this axis.</p>
+
+  <ul>
+    <li><strong>Full materialization.</strong> Each operator consumes its entire input, computes its
+    entire output, and hands the finished intermediate table to its parent. This is the natural model
+    if you think of relational algebra as set functions, and it is effectively what a blocking
+    operator does locally. As a whole-engine strategy it forfeits early results and can allocate
+    intermediate results as large as the base tables — our LIMIT query above would read all 8 rows
+    (or all million) before Limit discarded the surplus. Its virtue is simplicity and tight loops per
+    operator.</li>
+    <li><strong>Vectorized (batch-at-a-time) execution.</strong> Keep the pull-based tree, but let
+    each <code>next()</code> return a <em>batch</em> of tuples instead of one. This is not exotic:
+    the current BusTub is built this way — every executor's <code>Next</code> returns a batch of up
+    to <code>BUSTUB_BATCH_SIZE</code> tuples (plus their record IDs), or an indicator that no tuples
+    remain.<sup class="cite"><a href="#ref-2">2</a></sup> Even the classic survey's client interface
+    anticipates it: results are pulled "typically one at a time, or in small batches".<sup class="cite"><a href="#ref-1">1</a></sup>
+    The point is to amortize per-call overhead — one virtual dispatch per few thousand values rather
+    than per value — the same "fewer decisions per step" argument SQLite makes for its bytecode inner
+    loop.<sup class="cite"><a href="#ref-6">6</a></sup> The price is more in-flight memory and more
+    bookkeeping at operators like Limit that must split batches.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Model</th><th>Unit crossing operator edges</th><th>First-row latency</th><th>Per-row overhead</th><th>Seen in</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Volcano / iterator</td><td>one tuple</td><td>lowest (streaming ops)</td>
+          <td>one call chain per row</td>
+          <td>PostgreSQL,<sup class="cite"><a href="#ref-5">5</a></sup> toyDB,<sup class="cite"><a href="#ref-4">4</a></sup> FerricDB (course choice)</td>
+        </tr>
+        <tr>
+          <td>Vectorized</td><td>a batch of tuples</td><td>low</td>
+          <td>one call chain per batch</td>
+          <td>BusTub Fall 2025 ("row-based vectorization")<sup class="cite"><a href="#ref-2">2</a></sup></td>
+        </tr>
+        <tr>
+          <td>Materialization</td><td>a whole intermediate table</td><td>highest</td>
+          <td>lowest per operator, but no early exit</td>
+          <td>each blocking operator, locally (Sort, hash-join build)<sup class="cite"><a href="#ref-2">2</a></sup></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>FerricDB stays tuple-at-a-time for the whole course. The reasoning is pedagogical: every
+  operator's state machine is visible in a page of Rust, and correctness bugs surface as a single
+  wrong row rather than a corrupted batch boundary. If you later want the vectorized flavor, the
+  refactor is mechanical — change <code>next()</code> to return <code>Vec&lt;Vec&lt;Value&gt;&gt;</code>
+  and teach each operator to loop.</p>
+
+  <h2 id="sec-expressions">Evaluating expressions over tuples</h2>
+
+  <p>Operators move rows; <strong>expressions</strong> compute over them. A Filter carries a predicate
+  expression, a Projection carries one expression per output column, an Update carries one per
+  assignment. BusTub's planner models them the same way: expression trees of column references,
+  constants, and arithmetic nodes attached to plan nodes.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p>The single most important design decision is <em>when names die</em>. In the AST, a column
+  reference is a name (<code>"balance"</code>); ambiguity is everywhere — after a join, two tables
+  may both have a <code>released</code> column, aliases rename things, and an <code>ORDER BY</code>
+  may reference a column the projection does not even output. toyDB resolves all of this at plan
+  time: the planner threads a <code>Scope</code> that tracks which column names are visible at each
+  node and which index each occupies, and <code>build_expression()</code> converts every by-name
+  reference into a by-index reference — its docs show a join predicate
+  <code>movies.genre_id = genres.id</code> compiling down to the positional form <code>#3 = #4</code>
+  against the joined row layout.<sup class="cite"><a href="#ref-3">3</a></sup> FerricDB does the same
+  one milestone earlier: the binder (<a href="../m05-sql-parsing/index.html">M05</a>) produces
+  <code>BoundExpr</code> trees whose column references are already <code>(table, column-index)</code>
+  pairs, so by the time an executor sees an expression, evaluation is a recursive walk in which a
+  column reference is a plain <code>row[i]</code> array access — no string comparison, no catalog
+  lookup, no failure path.</p>
+
+  <p>Types were settled even earlier, and the catalog is what settled them. The survey's example is
+  worth internalizing: in <code>(EMP.salary * 1.15) &lt; 75000</code>, which multiplication routine
+  runs and how the literals are represented depends entirely on the declared type of
+  <code>EMP.salary</code> — integer, float, or "money" — information the parser pulled from the
+  catalog when it validated attribute references.<sup class="cite"><a href="#ref-1">1</a></sup>
+  FerricDB's <code>Value::sql_cmp</code> handles the last subtlety at runtime: it returns
+  <code>None</code> when either side is NULL, mirroring SQL's three-valued comparison logic from
+  <a href="../m01-relational-model-sql/index.html">M01</a> — and your Filter must treat a NULL
+  predicate result as "do not pass", not as an error.</p>
+
+  <p>Note also what expression evaluation <em>produces</em>: fresh values that belong to no page.
+  In the survey's vocabulary, evaluating <code>EMP.sal * 0.1</code> constructs an M-tuple on the
+  heap.<sup class="cite"><a href="#ref-1">1</a></sup> This is why our Projection returns a new
+  <code>Vec&lt;Value&gt;</code> rather than a slice of its input — some of its outputs never existed
+  in storage at all.</p>
+
+  <h2 id="sec-catalog">The catalog: the executor's map of the world</h2>
+
+  <p>Every stage of the query processor consults the catalog, each asking a different question.
+  The parser asks "does this table exist, and what are its columns' types?" — the survey describes the
+  parser canonicalizing each table name, invoking the catalog manager to verify the table is
+  registered, caching its metadata, and then using the catalog to validate every attribute
+  reference.<sup class="cite"><a href="#ref-1">1</a></sup> The planner asks "what does the row layout
+  look like, and what access paths exist?" — toyDB's <code>Planner</code> holds a catalog handle
+  precisely to fetch table schemas while building <code>Scan</code> nodes.<sup class="cite"><a href="#ref-3">3</a></sup>
+  The executor asks the bluntest question of all: "where are the bytes?" BusTub's executors call
+  <code>Catalog::GetTable()</code> and <code>Catalog::GetIndex()</code> during <code>Init()</code> to
+  locate the physical table and any indexes that must be maintained.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p>In FerricDB the answers live in two structs you defined in Milestone 3:
+  <code>TableInfo</code> (oid, name, schema, <code>first_page</code>, indexes) and
+  <code>IndexInfo</code> (oid, name, column, <code>root_page</code>). A SeqScan's <code>open()</code>
+  is little more than <code>catalog.table("accounts")?</code> followed by
+  <code>HeapFile::open(store, info.first_page)</code>; an Insert uses the same
+  <code>TableInfo</code> to find where new tuples go, plus the schema to type-check what it writes.
+  The catalog is itself stored in heap pages and reads itself at startup from fixed bootstrap page
+  ids — a course choice from MS3 that pays off here: the executor needs no special path for system
+  tables, because <code>.tables</code> in the REPL is just a scan over the catalog's own heap.</p>
+
+  <p>One contract deserves its own paragraph, because our test harness enforces it from Milestone 4
+  on: <strong>every executor must know its output schema, and its rows must match it exactly</strong>.
+  BusTub warns that executors "must produce tuples with schema exactly as specified in the plan node"
+  or fail the tests;<sup class="cite"><a href="#ref-2">2</a></sup> FerricDB surfaces the same rule as
+  <code>Executor::schema()</code>, which the REPL uses for column headers today and the wire protocol
+  will use for <code>RowDescription</code> messages in Milestone 10. The planner computes schemas
+  bottom-up: SeqScan's schema is the table's; Filter's is its child's, unchanged; Projection's is
+  derived from its expression list. If your Projection reorders columns, its schema must say so.</p>
+
+  <h2 id="sec-operators">Operator semantics: the Milestone 4 zoo</h2>
+
+  <p>Here is the executor roster for Milestone 4, operator by operator. For each: what
+  <code>next()</code> must do, and where the traps are. Throughout, remember the composability rule —
+  each operator may assume <em>nothing</em> about its child except the iterator
+  contract.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <h3 id="sub-read-ops">Reading: SeqScan, Filter, Projection, Values, Limit, Sort</h3>
+
+  <p><strong>SeqScan</strong> walks the table's heap pages in physical order, decoding one tuple per
+  <code>next()</code>. It sits directly on <code>HeapFile::scan()</code> from Milestone 1
+  (<a href="../m02-storage/index.html">M02</a>). The subtlety is dead tuples: a heap slot may hold a
+  deleted or invalid tuple, and the scan must skip it silently — BusTub's SeqScan likewise checks each
+  tuple's metadata (<code>is_deleted_</code>) and skips deleted entries.<sup class="cite"><a href="#ref-2">2</a></sup>
+  FerricDB's <code>SeqScan</code> plan node also carries an <code>Option&lt;BoundExpr&gt;</code>
+  filter, so a pushed-down predicate can be applied during the scan without a separate Filter node —
+  the same shape as toyDB's <code>Scan</code>, which passes an optional predicate straight into the
+  storage engine's scan call.<sup class="cite"><a href="#ref-4">4</a></sup> At MS4 your planner may
+  leave that field <code>None</code> and rely on an explicit Filter; the optimizer starts filling it
+  in Milestone 7.</p>
+
+  <p><strong>Filter</strong> holds a predicate and one child.<sup class="cite"><a href="#ref-2">2</a></sup>
+  Its <code>next()</code> is a loop: pull a child row, evaluate the predicate, return the row if the
+  result is true, otherwise pull again; propagate <code>None</code>. It is stateless beyond the child
+  handle. Treat a NULL predicate result as false-for-filtering, per three-valued logic.</p>
+
+  <p><strong>Projection</strong> evaluates its expression list against each input row and emits the
+  results as a new row — toyDB's projection node does exactly this per joined row.<sup class="cite"><a href="#ref-4">4</a></sup>
+  It never filters and never reorders rows; count in must equal count out.</p>
+
+  <p><strong>Values</strong> is a leaf that yields literal rows from the plan itself — BusTub uses it
+  as the child of Insert for <code>INSERT INTO t VALUES (...)</code>.<sup class="cite"><a href="#ref-2">2</a></sup>
+  Note the expressions still need evaluation (a literal row may contain <code>1 + 2</code>), just with
+  no input row to reference.</p>
+
+  <p><strong>Limit</strong> keeps a counter; after emitting <code>limit</code> rows, it answers
+  <code>None</code> forever <em>without touching its child</em> — the short-circuit you watched in the
+  stepper. If the child ends first, Limit simply passes the <code>None</code> through; a limit larger
+  than the input has no effect.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p><strong>Sort</strong> is Milestone 4's only blocking operator. On the first <code>next()</code>
+  (or in <code>open()</code>, your choice — BusTub frames the same decision for its pipeline
+  breakers<sup class="cite"><a href="#ref-2">2</a></sup>), drain the child into a
+  <code>Vec</code>, sort with a comparator built from the plan's <code>(expression, descending)</code>
+  key list and <code>Value::sql_cmp</code>, then stream from the buffer. This is precisely toyDB's
+  approach — its Order node buffers everything in memory<sup class="cite"><a href="#ref-4">4</a></sup> —
+  and it is a labeled course choice: real engines cannot assume the input fits, which is why
+  PostgreSQL spills sorts to temp files beyond <code>work_mem</code><sup class="cite"><a href="#ref-5">5</a></sup>
+  and CMU's project builds a two-way external merge sort with multi-column keys, ASC/DESC directions,
+  and NULLS FIRST/LAST handling.<sup class="cite"><a href="#ref-2">2</a></sup> FerricDB defers
+  external sorting to Milestone 6 (<code>ExternalSorter</code>, with a fixed page budget); M06's sort
+  is allowed to be a <code>Vec</code> and a comparator.</p>
+
+  <h3 id="sub-write-ops">Writing: Insert, Update, Delete</h3>
+
+  <p>DML plans are shaped differently from queries: the survey describes them as simple straight-line
+  plans — one access method as the source, and a data modification operator at the top of the
+  pipeline.<sup class="cite"><a href="#ref-1">1</a></sup> An INSERT's source is usually a Values node;
+  UPDATE and DELETE sit above a scan (plus Filter) that finds the victim rows. All three are
+  executors like any other, but their observable output is tiny: BusTub's Insert, Update, and Delete
+  each emit a single tuple containing one integer — the number of rows affected.<sup class="cite"><a href="#ref-2">2</a></sup>
+  FerricDB surfaces the same number as <code>QueryResult::affected</code> (course choice, matching
+  that convention), which the REPL prints as <code>INSERT 3</code>.</p>
+
+  <p><strong>Insert</strong> pulls each row from its child, validates it against the table schema from
+  the catalog, encodes it, and calls <code>HeapFile::insert</code>. From Milestone 5 onward it must
+  also insert into every index on the table — BusTub requires exactly this index
+  maintenance.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p><strong>Delete</strong> needs to know <em>which physical tuple</em> to kill, which a bare
+  <code>Vec&lt;Value&gt;</code> row does not say. BusTub solves this by having every executor's
+  <code>Next</code> return record identifiers (RIDs) alongside tuples, so a Delete can address the
+  exact slot its child produced.<sup class="cite"><a href="#ref-2">2</a></sup> FerricDB adopts the
+  same idea as a course convention: a scan feeding a DML operator threads each row's
+  <code>RecordId</code> (page id + slot — the analog of Postgres's <code>ctid</code>) along with the
+  row; Milestone 4's spec fixes the exact encoding. Deletion itself is a metadata write, not removal:
+  mark the tuple dead via its <code>TupleMeta</code>, exactly as BusTub sets <code>is_deleted_</code>
+  rather than physically removing the tuple.<sup class="cite"><a href="#ref-2">2</a></sup> Space
+  reclamation is a separate, later concern — and in
+  <a href="../m09-transactions-mvcc/index.html">M09</a> those same metadata bits grow into MVCC
+  version visibility.</p>
+
+  <p><strong>Update</strong> is read-modify-write: pull a row and its RID, evaluate the SET
+  expressions (each assignment in FerricDB's plan is a <code>(column-index, expression)</code> pair),
+  and write the result back. The simplest correct implementation is the one BusTub prescribes: delete
+  the old tuple, insert the new one.<sup class="cite"><a href="#ref-2">2</a></sup> That choice —
+  updates may <em>move</em> tuples — is also the door to one of the oldest bugs in the field.</p>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall: the Halloween problem</span>
+    <p>Discovered by the System R group on October 31st, hence the name. Take "give every employee
+    earning under $20K a 10% raise" and run it as a pipeline: an index scan over
+    <code>EMP.salary</code> feeding an Update operator. Each raise rewrites the tuple, which — because
+    the scan's index is <em>on the updated column</em> — can reinsert it ahead of the scan cursor. The
+    scan rediscovers the tuple, raises it again, and again, until every victim earns more than $20K.
+    SQL semantics forbid this: a statement must not see its own updates. Standard fixes: have the
+    planner refuse index scans on the updated column, or split the pipeline — materialize the full
+    list of victim RIDs first, then fetch and update them in a second pass.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 820 430" role="img">
+      <title>Two update plans: a pipelined index scan feeding Update, which is unsafe, and a batch read-then-write plan with RID materialization, which is safe.</title>
+      <text x="200" y="28" text-anchor="middle" class="d-text" font-weight="650">Pipelined — unsafe</text>
+      <rect x="100" y="50" width="200" height="46" rx="8" class="d-box-bad"/>
+      <text x="200" y="78" text-anchor="middle" class="d-mono">Update EMP</text>
+      <rect x="100" y="140" width="200" height="56" rx="8" class="d-box"/>
+      <text x="200" y="163" text-anchor="middle" class="d-mono">IndexScan EMP(salary)</text>
+      <text x="200" y="183" text-anchor="middle" class="d-text-sm">salary &lt; 20000</text>
+      <line x1="200" y1="140" x2="200" y2="96" class="d-line"/>
+      <text x="200" y="240" text-anchor="middle" class="d-text-sm">updated tuples can move ahead of the</text>
+      <text x="200" y="258" text-anchor="middle" class="d-text-sm">scan cursor and be raised repeatedly</text>
+      <text x="620" y="28" text-anchor="middle" class="d-text" font-weight="650">Batch read-then-write — safe</text>
+      <rect x="520" y="50" width="200" height="42" rx="8" class="d-box-good"/>
+      <text x="620" y="76" text-anchor="middle" class="d-mono">Update EMP</text>
+      <rect x="520" y="118" width="200" height="42" rx="8" class="d-box"/>
+      <text x="620" y="144" text-anchor="middle" class="d-mono">Fetch tuple by RID</text>
+      <rect x="520" y="186" width="200" height="42" rx="8" class="d-box"/>
+      <text x="620" y="212" text-anchor="middle" class="d-mono">Scan RID list</text>
+      <rect x="520" y="254" width="200" height="42" rx="8" class="d-box-hl"/>
+      <text x="620" y="280" text-anchor="middle" class="d-mono">Materialize RIDs (temp)</text>
+      <rect x="520" y="322" width="200" height="56" rx="8" class="d-box"/>
+      <text x="620" y="345" text-anchor="middle" class="d-mono">IndexScan EMP(salary)</text>
+      <text x="620" y="365" text-anchor="middle" class="d-text-sm">salary &lt; 20000</text>
+      <line x1="620" y1="118" x2="620" y2="92" class="d-line"/>
+      <line x1="620" y1="186" x2="620" y2="160" class="d-line"/>
+      <line x1="620" y1="254" x2="620" y2="228" class="d-line"/>
+      <line x1="620" y1="322" x2="620" y2="296" class="d-line"/>
+      <text x="620" y="410" text-anchor="middle" class="d-text-sm">all victims are identified before the first write</text>
+    </svg>
+    <figcaption>Figure 3 — the Halloween problem and its batch fix, redrawn after the survey's
+    Figure 4.3: the materialization step collects every victim's RID into a temporary list before any
+    tuple is modified, so the scan can never re-encounter its own writes.<sup class="cite"><a href="#ref-1">1</a></sup></figcaption>
+  </figure>
+
+  <p>Milestone 4 sidesteps the trap — with no indexes yet, a SeqScan-fed Update cannot re-encounter a
+  moved tuple that way — but the moment MS5 gives your planner an IndexScan, this figure becomes a
+  correctness requirement, and FerricDB takes the survey's first fix: the planner never chooses an
+  index on a column the statement updates.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="Filter's contract is to return the next row that passes the predicate. Because a next() call must do the smallest amount of work that produces one output row, Filter loops: pull from the child, test, and either return the row or pull again — returning None only when the child is exhausted. This is why one next() on Filter can trigger many next() calls on the scan below it.">
+    <legend class="quiz-q">A Filter executor's <code>next()</code> pulls a row from its child, and the
+    predicate evaluates to false. What must Filter do?</legend>
+    <label><input type="radio" name="q1"> Return <code>None</code> — this stream position has no row</label>
+    <label><input type="radio" name="q1"> Return the row anyway and let the parent re-check the predicate</label>
+    <label><input type="radio" name="q1" data-correct> Call the child's <code>next()</code> again, repeating until a row passes or the child returns <code>None</code></label>
+    <label><input type="radio" name="q1"> Raise an error, because the planner should have removed non-matching rows</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Sort cannot know its smallest output row until it has seen every input row, so it must consume its whole child before emitting anything — it is a pipeline breaker, like aggregation and the build side of a hash join in the CMU project. Filter, Projection, and Limit all emit rows as they receive them with O(1) state.">
+    <legend class="quiz-q">Which Milestone 4 operator is a pipeline breaker (blocking operator)?</legend>
+    <label><input type="radio" name="q2"> Projection</label>
+    <label><input type="radio" name="q2"> Limit</label>
+    <label><input type="radio" name="q2" data-correct> Sort</label>
+    <label><input type="radio" name="q2"> Filter</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Work happens only when a parent pulls. Limit stops pulling after its 10th row, so the scan performs exactly as many reads as it took to find 10 passing rows — 50 here. The table's total size is irrelevant; that is the short-circuit the stepper demonstrates with 4 reads out of 8 rows. Under full materialization, by contrast, the scan would read all 1,000,000 rows first.">
+    <legend class="quiz-q">A table has 1,000,000 rows. You run
+    <code>SELECT * FROM t WHERE p LIMIT 10</code> through the Volcano plan
+    Limit ← Filter ← SeqScan, and the 10th row satisfying <code>p</code> is the 50th row in heap
+    order. How many rows does SeqScan read?</legend>
+    <label><input type="radio" name="q3"> 10</label>
+    <label><input type="radio" name="q3" data-correct> 50</label>
+    <label><input type="radio" name="q3"> Roughly 500,000 on average</label>
+    <label><input type="radio" name="q3"> 1,000,000 — a sequential scan always reads the whole table</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Name resolution happens once, at bind/plan time, where the scope knows exactly which columns are visible and in what order — toyDB compiles movies.genre_id = genres.id down to the positional form #3 = #4. At execution time a column reference is then a constant-time row[i] access with no ambiguity and no failure path, which matters when the expression runs once per tuple.">
+    <legend class="quiz-q">Why do bound expressions reference columns by <em>index</em> rather than by name?</legend>
+    <label><input type="radio" name="q4"> Because SQL forbids duplicate column names anywhere in a query</label>
+    <label><input type="radio" name="q4" data-correct> Names are resolved once against the scope at plan time, so per-tuple evaluation becomes a constant-time array access</label>
+    <label><input type="radio" name="q4"> Because names cannot be stored inside an enum in Rust</label>
+    <label><input type="radio" name="q4"> To make plans smaller on disk — plans are persisted with the table</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Updating a tuple can move it — for example, re-inserting it further along the very index the scan is traversing. The scan then rediscovers the updated tuple and updates it again, violating the SQL rule that a statement must not see its own writes: every under-$20K employee gets raised repeatedly until they cross $20K. The fixes are to avoid index scans on the updated column, or to materialize all victim RIDs before writing anything.">
+    <legend class="quiz-q">What goes wrong in the Halloween problem?</legend>
+    <label><input type="radio" name="q5"> Two concurrent transactions update the same row and one update is lost</label>
+    <label><input type="radio" name="q5"> The Update executor deadlocks with its own scan on a page latch</label>
+    <label><input type="radio" name="q5" data-correct> A pipelined update over an index on the updated column re-encounters tuples it already modified and updates them repeatedly</label>
+    <label><input type="radio" name="q5"> Deleted tuples are resurrected because the scan ignores tuple metadata</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Logical plans state what to compute; physical plans commit to algorithms and access paths. 'Rows must be ordered by balance' is a requirement — logical. Choosing between an in-memory sort and an index scan that delivers rows already ordered is choosing how to satisfy it, which is exactly the SeqScan-to-IndexScan decision CMU's Project 3 optimizer rule makes.">
+    <legend class="quiz-q">Which of these is a <em>physical</em> plan decision?</legend>
+    <label><input type="radio" name="q6"> The result must contain only rows with <code>balance &gt;= 100</code></label>
+    <label><input type="radio" name="q6"> The result must be ordered by <code>balance</code></label>
+    <label><input type="radio" name="q6" data-correct> Satisfying the ordering with an index scan on <code>balance</code> instead of an in-memory sort</label>
+    <label><input type="radio" name="q6"> The result must contain the columns <code>name</code> and <code>balance</code></label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">J. M. Hellerstein, M. Stonebraker, J. Hamilton, “Architecture of a Database
+        System”, <em>Foundations and Trends in Databases</em> 1(2), ch. 4 (Relational Query
+        Processor). <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf" rel="external">https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf</a></li>
+        <li id="ref-2">CMU 15-445/645 (Fall 2025), “Project #3: Query Execution”, BusTub project
+        specification. <a href="https://15445.courses.cs.cmu.edu/fall2025/project3/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project3/</a></li>
+        <li id="ref-3">E. Grinaker, “toyDB architecture guide — SQL Planning”.
+        <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/sql-planner.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/sql-planner.md</a></li>
+        <li id="ref-4">E. Grinaker, “toyDB architecture guide — SQL Execution”.
+        <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/sql-execution.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/sql-execution.md</a></li>
+        <li id="ref-5">H. Suzuki, <em>The Internals of PostgreSQL</em>, ch. 3: “Query Processing”.
+        <a href="https://www.interdb.jp/pg/pgsql03.html" rel="external">https://www.interdb.jp/pg/pgsql03.html</a></li>
+        <li id="ref-6">SQLite documentation, “Why SQLite Uses Bytecode”.
+        <a href="https://sqlite.org/whybytecode.html" rel="external">https://sqlite.org/whybytecode.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>The full toyDB architecture walkthrough — read the parser and optimizer chapters around the
+      two cited here to see the whole Rust pipeline end to end.
+      <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">link</a></li>
+      <li>PostgreSQL manual, “Using EXPLAIN” — practice reading real plan trees against the concepts
+      from this module. <a href="https://www.postgresql.org/docs/current/using-explain.html" rel="external">link</a></li>
+      <li><em>Readings in Database Systems</em> (5th ed.) — the query-optimization chapter
+      contextualizes where next-generation executors diverge from Volcano.
+      <a href="http://www.redbook.io/" rel="external">link</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>What to build now: <a href="../../project/milestone-04/index.html">Milestone 4 — Planner &amp;
+    Volcano Executor</a> — the <code>LogicalPlan</code> builder, the <code>Executor</code> trait, and
+    all nine operators from <a href="#sec-operators">the zoo</a>, verified end-to-end by
+    sqllogictest.</p>
+
+    <nav class="prevnext">
+      <a href="../../project/milestone-03/index.html"><span class="dir">← Previous</span> Milestone 3 · SQL Front-End</a>
+      <a class="next" href="../../project/milestone-04/index.html"><span class="dir">Next →</span> Milestone 4 · Planner &amp; Volcano Executor</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+/* Plan-tree pull stepper: simulates a Volcano executor over fixed data and
+   animates each root next() call. Vanilla JS, no globals. */
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  (function () {
+    var tree = document.getElementById("vx-tree");
+    var tableEl = document.getElementById("vx-table");
+    if (!tree || !tableEl || !window.Course) return;
+
+    /* ---- fixed data: accounts(id, name, balance) ---- */
+    var ROWS = [
+      [1, "ada", 120], [2, "bob", 45], [3, "cat", 80], [4, "dan", 200],
+      [5, "eve", 300], [6, "fay", 20], [7, "gil", 150], [8, "hal", 90]
+    ];
+    var LIMIT = 2;
+    var TICK_MS = 520;
+
+    /* ---- node/edge geometry ----
+       nodes: 0 client, 1 Limit, 2 Projection, 3 Filter, 4 SeqScan */
+    var NODES = [
+      { label: "Client (REPL)",            sub: "",                 y: 10,  h: 36 },
+      { label: "Limit 2",                  sub: "stops asking after 2 rows", y: 86,  h: 74 },
+      { label: "Projection",               sub: "name, balance",    y: 200, h: 74 },
+      { label: "Filter",                   sub: "balance ≥ 100", y: 314, h: 74 },
+      { label: "SeqScan",                  sub: "accounts (8 rows)", y: 428, h: 74 }
+    ];
+    var BOX_X = 40, BOX_W = 260, MID_X = BOX_X + BOX_W / 2;
+
+    var svg = Course.svgEl("svg", { viewBox: "0 0 340 520", role: "img" });
+    svg.appendChild(Course.svgEl("title", null,
+      "Physical plan tree: Limit over Projection over Filter over SeqScan, with per-operator call and row counters."));
+    var edgeEls = [], nodeRects = [], counterEls = [];
+    var i;
+    for (i = 0; i < 4; i++) {
+      var y1 = NODES[i].y + NODES[i].h, y2 = NODES[i + 1].y;
+      var ln = Course.svgEl("line", { x1: MID_X, y1: y1, x2: MID_X, y2: y2, "class": "d-line" });
+      svg.appendChild(ln);
+      edgeEls.push(ln);
+    }
+    for (i = 0; i < NODES.length; i++) {
+      var n = NODES[i];
+      var r = Course.svgEl("rect", { x: BOX_X, y: n.y, width: BOX_W, height: n.h, rx: 8, "class": "d-box" });
+      svg.appendChild(r);
+      nodeRects.push(r);
+      svg.appendChild(Course.svgEl("text", { x: MID_X, y: n.y + 22, "text-anchor": "middle", "class": "d-mono" }, n.label));
+      if (n.sub) {
+        svg.appendChild(Course.svgEl("text", { x: MID_X, y: n.y + 40, "text-anchor": "middle", "class": "d-text-sm" }, n.sub));
+      }
+      var ctr = Course.svgEl("text", { x: MID_X, y: n.y + (i === 0 ? 0 : 60), "text-anchor": "middle", "class": "d-mono-sm" },
+        i === 0 ? "" : "calls: 0 · rows out: 0");
+      if (i !== 0) svg.appendChild(ctr);
+      counterEls.push(ctr);
+    }
+    var clientCtr = Course.svgEl("text", { x: MID_X, y: NODES[0].y + 28 + 22, "text-anchor": "middle", "class": "d-mono-sm" }, "");
+    /* edge label: shows next()/tuple/None beside the active edge */
+    var edgeLabel = Course.svgEl("text", { x: MID_X + 14, y: 0, "class": "d-mono-sm", visibility: "hidden" }, "");
+    svg.appendChild(edgeLabel);
+    tree.appendChild(svg);
+
+    var statusEl = document.getElementById("vx-status");
+    var logEl = document.getElementById("vx-log");
+    var resultEl = document.getElementById("vx-result");
+    var pullBtn = document.getElementById("vx-pull");
+    var resetBtn = document.getElementById("vx-reset");
+    var bodyRows = tableEl.tBodies[0].rows;
+
+    /* ---- executor state ---- */
+    var scanPos, emitted, finished, calls, rowsOut, timer;
+
+    function initState() {
+      scanPos = 0; emitted = 0; finished = false;
+      calls = [0, 0, 0, 0, 0]; rowsOut = [0, 0, 0, 0, 0];
+      if (timer) { clearInterval(timer); timer = null; }
+      var i2;
+      for (i2 = 0; i2 < bodyRows.length; i2++) {
+        bodyRows[i2].style.opacity = "";
+        bodyRows[i2].style.outline = "";
+        bodyRows[i2].cells[4].textContent = "";
+      }
+      for (i2 = 0; i2 < edgeEls.length; i2++) edgeEls[i2].setAttribute("class", "d-line");
+      for (i2 = 0; i2 < nodeRects.length; i2++) nodeRects[i2].setAttribute("class", "d-box");
+      edgeLabel.setAttribute("visibility", "hidden");
+      refreshCounters();
+      logEl.textContent = "";
+      resultEl.textContent = "Result rows received by client: (none yet)";
+      statusEl.textContent = "Ready — no calls yet.";
+      pullBtn.disabled = false;
+    }
+
+    function refreshCounters() {
+      for (var k = 1; k <= 4; k++) {
+        counterEls[k].textContent = "calls: " + calls[k] + " · rows out: " + rowsOut[k];
+      }
+    }
+
+    /* ---- simulate ONE root next() call into a list of micro-events ---- */
+    function makePullEvents() {
+      var ev = [];
+      ev.push({ edge: 0, dir: "down", node: 1, elabel: "↓ next()", callInc: 1,
+        log: "Client calls Limit.next()" });
+      if (emitted >= LIMIT) {
+        ev.push({ edge: 0, dir: "up", node: 1, elabel: "↑ None", finish: true,
+          log: "Limit already emitted " + LIMIT + " rows — returns None WITHOUT calling Projection. Short-circuit: rows " + (scanPos + 1) + "–8 were never read." });
+        return ev;
+      }
+      ev.push({ edge: 1, dir: "down", node: 2, elabel: "↓ next()", callInc: 2,
+        log: "Limit calls Projection.next()" });
+      ev.push({ edge: 2, dir: "down", node: 3, elabel: "↓ next()", callInc: 3,
+        log: "Projection calls Filter.next()" });
+      for (;;) {
+        ev.push({ edge: 3, dir: "down", node: 4, elabel: "↓ next()", callInc: 4,
+          log: "Filter calls SeqScan.next()" });
+        if (scanPos >= ROWS.length) {
+          ev.push({ edge: 3, dir: "up", node: 3, elabel: "↑ None", log: "SeqScan is exhausted — returns None" });
+          ev.push({ edge: 2, dir: "up", node: 2, elabel: "↑ None", log: "Filter propagates None" });
+          ev.push({ edge: 1, dir: "up", node: 1, elabel: "↑ None", log: "Projection propagates None" });
+          ev.push({ edge: 0, dir: "up", node: 0, elabel: "↑ None", finish: true, log: "Limit returns None — stream ends" });
+          return ev;
+        }
+        var r = ROWS[scanPos], idx = scanPos;
+        scanPos++;
+        ev.push({ node: 4, readRow: idx,
+          log: "SeqScan reads heap row " + r[0] + ": (" + r[0] + ", " + r[1] + ", " + r[2] + ")" });
+        ev.push({ edge: 3, dir: "up", node: 3, elabel: "↑ (" + r[1] + ", " + r[2] + ")", rowInc: 4,
+          log: "SeqScan returns (" + r[0] + ", " + r[1] + ", " + r[2] + ") to Filter" });
+        if (r[2] >= 100) {
+          ev.push({ node: 3, log: "Filter: " + r[2] + " ≥ 100 is TRUE — pass the row up" });
+          ev.push({ edge: 2, dir: "up", node: 2, elabel: "↑ (" + r[1] + ", " + r[2] + ")", rowInc: 3,
+            log: "Filter returns the row to Projection" });
+          ev.push({ node: 2, log: "Projection evaluates [name, balance] → (" + r[1] + ", " + r[2] + ")" });
+          ev.push({ edge: 1, dir: "up", node: 1, elabel: "↑ (" + r[1] + ", " + r[2] + ")", rowInc: 2,
+            log: "Projection returns (" + r[1] + ", " + r[2] + ") to Limit" });
+          emitted++;
+          ev.push({ edge: 0, dir: "up", node: 0, elabel: "↑ (" + r[1] + ", " + r[2] + ")", rowInc: 1,
+            clientRow: "(" + r[1] + ", " + r[2] + ")",
+            log: "Limit (" + emitted + "/" + LIMIT + ") returns (" + r[1] + ", " + r[2] + ") to the client" });
+          return ev;
+        }
+        ev.push({ node: 3, log: "Filter: " + r[2] + " ≥ 100 is FALSE — discard, ask SeqScan again" });
+      }
+    }
+
+    /* ---- playback ---- */
+    var results = [];
+    function applyEvent(e) {
+      var j;
+      for (j = 0; j < edgeEls.length; j++) edgeEls[j].setAttribute("class", "d-line");
+      for (j = 0; j < nodeRects.length; j++) nodeRects[j].setAttribute("class", "d-box");
+      if (e.edge != null && e.edge >= 0) {
+        edgeEls[e.edge].setAttribute("class", "d-line-hl");
+        var ey1 = parseFloat(edgeEls[e.edge].getAttribute("y1"));
+        var ey2 = parseFloat(edgeEls[e.edge].getAttribute("y2"));
+        edgeLabel.setAttribute("y", (ey1 + ey2) / 2 + 4);
+        edgeLabel.textContent = e.elabel || "";
+        edgeLabel.setAttribute("visibility", "visible");
+      } else {
+        edgeLabel.setAttribute("visibility", "hidden");
+      }
+      if (e.node != null && e.node >= 0) nodeRects[e.node].setAttribute("class", "d-box-hl");
+      if (e.callInc) calls[e.callInc]++;
+      if (e.rowInc) rowsOut[e.rowInc]++;
+      refreshCounters();
+      if (e.readRow != null && e.readRow >= 0) {
+        for (j = 0; j < bodyRows.length; j++) {
+          if (j === e.readRow) {
+            bodyRows[j].style.outline = "2px solid var(--accent)";
+            bodyRows[j].cells[4].textContent = "reading…";
+          } else if (bodyRows[j].cells[4].textContent) {
+            bodyRows[j].style.outline = "";
+            bodyRows[j].style.opacity = "0.6";
+            if (bodyRows[j].cells[4].textContent === "reading…") bodyRows[j].cells[4].textContent = "read";
+          }
+        }
+      }
+      if (e.clientRow) {
+        results.push(e.clientRow);
+        resultEl.textContent = "Result rows received by client: " + results.join("  ");
+      }
+      if (e.finish) {
+        finished = true;
+        for (j = 0; j < bodyRows.length; j++) {
+          if (!bodyRows[j].cells[4].textContent) {
+            bodyRows[j].style.opacity = "0.35";
+            bodyRows[j].cells[4].textContent = "never read";
+          } else if (bodyRows[j].cells[4].textContent === "reading…") {
+            bodyRows[j].cells[4].textContent = "read";
+            bodyRows[j].style.outline = "";
+            bodyRows[j].style.opacity = "0.6";
+          }
+        }
+      }
+      var line = Course.el("div", null, e.log);
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+      statusEl.textContent = e.log;
+    }
+
+    function play(events) {
+      pullBtn.disabled = true;
+      var i3 = 0;
+      timer = setInterval(function () {
+        if (i3 >= events.length) {
+          clearInterval(timer); timer = null;
+          if (finished) {
+            pullBtn.disabled = true;
+            statusEl.textContent = "Done: SeqScan read " + rowsOut[4] + " of 8 rows. Reset to run again.";
+          } else {
+            pullBtn.disabled = false;
+          }
+          return;
+        }
+        applyEvent(events[i3]);
+        i3++;
+      }, TICK_MS);
+    }
+
+    pullBtn.addEventListener("click", function () {
+      if (finished || timer) return;
+      play(makePullEvents());
+    });
+    resetBtn.addEventListener("click", function () {
+      results = [];
+      initState();
+    });
+
+    results = [];
+    initState();
+  })();
+});
+</script>
+</body>
+</html>

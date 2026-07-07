@@ -1,0 +1,62 @@
+# CI for the FerricDB starter workspace.
+#
+# A fresh clone must always be green: milestone tests carry
+# #[ignore = "milestone N"] and are opted into locally with
+#   cargo test -- --include-ignored msN_
+# so CI checks that everything COMPILES and that non-ignored tests pass,
+# regardless of which milestone a learner has reached.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The starter is full of todo!("Milestone N") stubs by design —
+      # never let clippy complain about them.
+      - run: cargo clippy --workspace --all-targets -- -A clippy::todo -A clippy::unimplemented
+
+  check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets: every provided test (even ignored milestone tests)
+      # must compile against the stub API at all times.
+      - run: cargo check --workspace --all-targets
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Ignored milestone tests are skipped here; this stays green on a
+      # fresh clone and as learners progress at their own pace.
+      - run: cargo test --workspace

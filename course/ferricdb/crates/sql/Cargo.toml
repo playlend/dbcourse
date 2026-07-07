@@ -1,0 +1,9 @@
+[package]
+name = "ferricdb-sql"
+description = "FerricDB SQL front end: lexer, AST, and hand-written parser (Milestone 3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferricdb-common = { workspace = true }

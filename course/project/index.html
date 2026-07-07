@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The FerricDB Project — Build a Toy Postgres in Rust — FerricDB Course</title>
+<link rel="stylesheet" href="../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../assets/site.js"></script>
+<script defer src="../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../index.html">FerricDB Course</a><span class="sep">/</span>
+    <span>Project</span>
+  </nav>
+  <span class="badge milestone">Project</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>The FerricDB Project: Build a Toy Postgres in Rust</h1>
+  <p class="subtitle">Eleven cumulative milestones, one working database. By the end,
+  <code>psql</code> connects to code you wrote — every page, every B+Tree node, every log record.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram needs JavaScript;
+  everything else on this page reads fine without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-what">What you are building</a></li>
+      <li><a href="#sec-arch">The architecture</a></li>
+      <li><a href="#sec-rules">Ground rules</a></li>
+      <li><a href="#sec-testing">How testing works</a></li>
+      <li><a href="#sec-workspace">The workspace</a></li>
+      <li><a href="#sec-milestones">Milestones at a glance</a></li>
+      <li><a href="#sec-stretch">Stretch milestones</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-what">What you are building</h2>
+  <p><strong>FerricDB</strong> is a Postgres-flavored relational database: heap tables made of
+  8&nbsp;KB slotted pages, a buffer pool that owns all I/O, a hand-written SQL front-end, a
+  cost-aware planner, a Volcano-style executor, MVCC snapshot isolation with tuple-level
+  <code>xmin</code>/<code>xmax</code> versioning modeled on PostgreSQL's,<sup class="cite"><a href="#ref-3">3</a></sup>
+  ARIES-style write-ahead logging and recovery, and finally the PostgreSQL frontend/backend
+  wire protocol, so real clients — <code>psql</code>, drivers, GUI tools — connect to your server
+  without knowing it isn't Postgres.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+
+  <p>The project follows the model of CMU 15-445, where each lecture block maps onto a project
+  that extends one educational system (BusTub) — buffer pool, then B+Tree, then executors, then
+  concurrency control — so every concept is applied to code you already own.<sup class="cite"><a href="#ref-1">1</a></sup>
+  FerricDB milestones are cumulative in the same way: nothing is thrown away, and each layer is
+  exercised by everything built above it. The concept modules and milestones interleave along the
+  <a href="../index.html#path">recommended path</a>; each milestone page opens with the module you
+  should have read first.</p>
+
+  <div class="callout tip">
+    <span class="callout-title">Why build instead of just read?</span>
+    <p>Database internals are full of designs that sound obvious until you hold the invariants
+    yourself: why eviction must respect pin counts, why a leaf split copies its separator key up
+    while an internal split moves it, why recovery must re-apply history it is about to undo.
+    The milestones are sized so the tests catch you exactly where those designs bite.</p>
+  </div>
+
+  <h2 id="sec-arch">The architecture</h2>
+  <p>This is the whole system. Every box is clickable and links to the concept module that
+  teaches it; the milestone pages show this same diagram with the parts you have built lit up.</p>
+
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — FerricDB's architecture. Query flow runs down the left column
+    (protocol → parser → planner → executor → access methods → buffer pool → disk); the catalog,
+    transaction manager, and WAL cut across it from the right.</figcaption>
+  </figure>
+
+  <p>Reading the diagram bottom-up gives the build order: storage and the disk manager first
+  (<a href="milestone-01/index.html">MS1</a>), the buffer pool in front of them
+  (<a href="milestone-02/index.html">MS2</a>), then the SQL front-end and catalog
+  (<a href="milestone-03/index.html">MS3</a>), the planner and executor
+  (<a href="milestone-04/index.html">MS4</a>), the B+Tree beside the heap
+  (<a href="milestone-05/index.html">MS5</a>), richer operators
+  (<a href="milestone-06/index.html">MS6</a>), the optimizer
+  (<a href="milestone-07/index.html">MS7</a>), then the cross-cutting services: MVCC
+  (<a href="milestone-08/index.html">MS8</a>), WAL and recovery
+  (<a href="milestone-09/index.html">MS9</a>), and the wire protocol on top
+  (<a href="milestone-10/index.html">MS10</a>).</p>
+
+  <h2 id="sec-rules">Ground rules</h2>
+  <ul>
+    <li><strong>Core algorithms by hand.</strong> Slotted pages, the buffer pool and its
+    replacement policy, the B+Tree, the parser, the executor operators, MVCC visibility, and the
+    WAL/recovery machinery are the learning content — you implement them yourself.</li>
+    <li><strong>Allowed helper crates</strong> (already wired in the workspace):
+    <code>bytes</code>, <code>thiserror</code>, <code>tempfile</code>, <code>criterion</code>
+    (benchmarks), <code>rustyline</code> (REPL), <code>tokio</code> (server milestone only), plus
+    <code>rand</code> and <code>sqllogictest</code> inside tests. Everything else needs a very
+    good reason.</li>
+    <li><strong>One escape hatch:</strong> the SQL parser may be replaced with
+    <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">sqlparser-rs</a>
+    if parsing is not where you want to spend your time — but
+    <a href="../modules/m05-sql-parsing/index.html">Module 5</a> teaches you to write one, and the
+    hand-written path is the recommended one. The AST stays the same either way.</li>
+    <li><strong>Each milestone page gives you:</strong> learning objectives, required reading,
+    the public Rust API to implement (quoted from the workspace's API contract), step-by-step
+    guidance with hints — never solutions — a test plan, common pitfalls, and a definition of
+    done.</li>
+    <li><strong>Don't copy reference code.</strong> The cited projects (BusTub, toyDB, Mini-LSM)
+    are for reading. BusTub's course policy forbids copying solution code; toyDB and Mini-LSM are
+    Apache-2.0 and require attribution if you adapt anything.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+  </ul>
+
+  <h2 id="sec-testing">How testing works</h2>
+  <p>The workspace ships with the full test suites already written. Tests for future milestones
+  are marked <code>#[ignore = "milestone N"]</code> and named with an <code>msN_</code> prefix, so
+  <code>cargo test</code> is green from day one and each milestone has a concrete finish line:</p>
+
+  <pre><code># see everything that is waiting for you
+cargo test --workspace -- --list --ignored
+
+# work on milestone 2
+cargo test -p ferricdb-buffer -- --include-ignored ms2_</code></pre>
+
+  <p>From Milestone 4 onward — once SQL executes end to end — correctness is also checked by
+  <em>sqllogictest</em> files: scripted SQL sessions with expected results, run by the
+  <code>sqllogictest</code> crate (the Rust runner maintained by the RisingLight project and used
+  by several Rust database projects).<sup class="cite"><a href="#ref-2">2</a></sup> The files live in
+  <code>crates/ferricdb/tests/slt/</code> and the same suite that runs in-process in MS4 runs over
+  a real <code>psql</code> session in MS10 — the strongest possible statement that your database
+  behaves like a database.</p>
+
+  <h2 id="sec-workspace">The workspace</h2>
+  <p>The Cargo workspace lives at <code>course/ferricdb/</code>. Public APIs are declared as
+  stubs with documentation — the shape is given, the bodies are yours. One crate is provided
+  fully implemented: <code>common</code>, the shared plumbing (values, schemas, error types),
+  because copying type definitions teaches nothing.</p>
+
+  <div class="table-wrap">
+  <table>
+    <thead>
+      <tr><th>Crate</th><th>What you build there</th><th>Milestone</th><th>Module</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>crates/common</code></td><td><em>provided</em> — values, schema, errors</td><td>—</td><td>—</td></tr>
+      <tr><td><code>crates/storage</code></td><td>pages, slotted heap pages, tuple format, disk manager, heap files</td><td><a href="milestone-01/index.html">MS1</a></td><td><a href="../modules/m02-storage/index.html">M02</a></td></tr>
+      <tr><td><code>crates/buffer</code></td><td>buffer pool manager, CLOCK / LRU-K replacers, page guards</td><td><a href="milestone-02/index.html">MS2</a></td><td><a href="../modules/m03-buffer-pool/index.html">M03</a></td></tr>
+      <tr><td><code>crates/sql</code></td><td>lexer, recursive-descent + Pratt parser, AST</td><td><a href="milestone-03/index.html">MS3</a></td><td><a href="../modules/m05-sql-parsing/index.html">M05</a></td></tr>
+      <tr><td><code>crates/catalog</code></td><td>self-hosting system catalog, table/index metadata, statistics</td><td><a href="milestone-03/index.html">MS3</a>, <a href="milestone-07/index.html">MS7</a></td><td><a href="../modules/m05-sql-parsing/index.html">M05</a></td></tr>
+      <tr><td><code>crates/exec</code></td><td>binder, planner, Volcano operators, joins, external sort, optimizer</td><td><a href="milestone-04/index.html">MS4</a>–<a href="milestone-07/index.html">MS7</a></td><td><a href="../modules/m06-query-execution/index.html">M06</a>–<a href="../modules/m08-query-optimization/index.html">M08</a></td></tr>
+      <tr><td><code>crates/index</code></td><td>disk-resident B+Tree with splits and range iterators</td><td><a href="milestone-05/index.html">MS5</a></td><td><a href="../modules/m04-data-structures-indexes/index.html">M04</a></td></tr>
+      <tr><td><code>crates/txn</code></td><td>transaction manager, snapshots, MVCC visibility, conflict detection</td><td><a href="milestone-08/index.html">MS8</a></td><td><a href="../modules/m09-transactions-mvcc/index.html">M09</a></td></tr>
+      <tr><td><code>crates/wal</code></td><td>write-ahead log, checkpoints, ARIES recovery</td><td><a href="milestone-09/index.html">MS9</a></td><td><a href="../modules/m10-logging-recovery/index.html">M10</a></td></tr>
+      <tr><td><code>crates/server</code></td><td>PostgreSQL wire protocol codec + tokio server</td><td><a href="milestone-10/index.html">MS10</a></td><td><a href="../modules/m11-wire-protocol-server/index.html">M11</a></td></tr>
+      <tr><td><code>crates/ferricdb</code></td><td>the binary: REPL, flags, sqllogictest harness</td><td><a href="milestone-00/index.html">MS0</a></td><td><a href="../modules/m00-orientation/index.html">M00</a></td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <p>The crate dependency graph is acyclic and mirrors the architecture diagram:
+  <code>common</code> at the bottom; <code>storage</code> → <code>buffer</code> →
+  <code>index</code> up the storage spine; <code>sql</code>, <code>catalog</code>, and
+  <code>txn</code> feeding <code>exec</code>; <code>wal</code> hooking into <code>buffer</code>
+  through a log-flush trait so the WAL rule can be enforced without a dependency cycle.</p>
+
+  <h2 id="sec-milestones">Milestones at a glance</h2>
+  <div class="cards">
+    <a class="card milestone" href="milestone-00/index.html">
+      <span class="card-kicker">Milestone 0</span><h3>Skeleton, REPL, Test Harness</h3>
+      <p>Tour the workspace, implement the rustyline REPL and meta-commands, wire CI.</p></a>
+    <a class="card milestone" href="milestone-01/index.html">
+      <span class="card-kicker">Milestone 1</span><h3>Pages, Tuples, Heap Storage</h3>
+      <p>8 KB slotted pages, tuple serialization, DiskManager, HeapFile.</p></a>
+    <a class="card milestone" href="milestone-02/index.html">
+      <span class="card-kicker">Milestone 2</span><h3>Buffer Pool Manager</h3>
+      <p>Frames, page table, pins, CLOCK eviction; all I/O goes through the pool from here.</p></a>
+    <a class="card milestone" href="milestone-03/index.html">
+      <span class="card-kicker">Milestone 3</span><h3>SQL Front-End</h3>
+      <p>Lexer, recursive-descent + Pratt parser, AST, self-hosting catalog, binder.</p></a>
+    <a class="card milestone" href="milestone-04/index.html">
+      <span class="card-kicker">Milestone 4</span><h3>Planner &amp; Volcano Executor</h3>
+      <p>Iterator operators and expression evaluation — SQL runs end to end.</p></a>
+    <a class="card milestone" href="milestone-05/index.html">
+      <span class="card-kicker">Milestone 5</span><h3>B+Tree Index</h3>
+      <p>Disk-resident B+Tree with splits and range scans; IndexScan in the planner.</p></a>
+    <a class="card milestone" href="milestone-06/index.html">
+      <span class="card-kicker">Milestone 6</span><h3>Joins, Aggregation, External Sort</h3>
+      <p>NestedLoopJoin, HashJoin, GROUP BY aggregates, spill-to-disk sorting.</p></a>
+    <a class="card milestone" href="milestone-07/index.html">
+      <span class="card-kicker">Milestone 7</span><h3>Query Optimization</h3>
+      <p>Rewrites, ANALYZE statistics, a cost model, join ordering, EXPLAIN.</p></a>
+    <a class="card milestone" href="milestone-08/index.html">
+      <span class="card-kicker">Milestone 8</span><h3>Transactions &amp; MVCC</h3>
+      <p>Snapshots, visibility rules, first-committer-wins, VACUUM.</p></a>
+    <a class="card milestone" href="milestone-09/index.html">
+      <span class="card-kicker">Milestone 9</span><h3>WAL &amp; ARIES Recovery</h3>
+      <p>LSNs, CLRs, checkpoints, crash-injection testing — no committed row ever lost.</p></a>
+    <a class="card milestone" href="milestone-10/index.html">
+      <span class="card-kicker">Milestone 10</span><h3>Wire Protocol Server</h3>
+      <p>A tokio server speaking the PG protocol; psql connects on port 5433.</p></a>
+  </div>
+
+  <h2 id="sec-stretch">Stretch milestones</h2>
+  <p>Optional, lower-detail specs for after the core is done — each takes one production idea
+  from <a href="../modules/m12-advanced-topics/index.html">Module 12</a> and grafts it onto your
+  finished system.</p>
+  <div class="cards">
+    <a class="card stretch" href="stretch-s1/index.html">
+      <span class="card-kicker">Stretch S1</span><h3>Lock Manager &amp; Row Locks</h3>
+      <p>SELECT FOR UPDATE, wait queues, deadlock handling.</p></a>
+    <a class="card stretch" href="stretch-s2/index.html">
+      <span class="card-kicker">Stretch S2</span><h3>Serializable Isolation (SSI)</h3>
+      <p>Close the write-skew hole your MS8 tests document.</p></a>
+    <a class="card stretch" href="stretch-s3/index.html">
+      <span class="card-kicker">Stretch S3</span><h3>LSM Storage Engine</h3>
+      <p>Swap the heap for an LSM tree, following Mini-LSM.</p></a>
+    <a class="card stretch" href="stretch-s4/index.html">
+      <span class="card-kicker">Stretch S4</span><h3>Raft Replication</h3>
+      <p>Replicate FerricDB across a local cluster, following toyDB.</p></a>
+  </div>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">CMU 15-445/645, Intro to Database Systems — the lecture-paired,
+          cumulative project model (BusTub) this track follows; course policy forbids copying
+          solution code.
+          <a href="https://15445.courses.cs.cmu.edu/" rel="external">https://15445.courses.cs.cmu.edu/</a></li>
+        <li id="ref-2">risinglightdb/sqllogictest-rs — sqllogictest parser and runner for Rust,
+          used for FerricDB's end-to-end suites.
+          <a href="https://github.com/risinglightdb/sqllogictest-rs" rel="external">https://github.com/risinglightdb/sqllogictest-rs</a></li>
+        <li id="ref-3">Hironobu Suzuki, The Internals of PostgreSQL, Ch. 5 — the MVCC design
+          (xmin/xmax tuple versioning, snapshots) FerricDB's transaction layer is modeled on.
+          <a href="https://www.interdb.jp/pg/pgsql05.html" rel="external">https://www.interdb.jp/pg/pgsql05.html</a></li>
+        <li id="ref-4">PostgreSQL Documentation, "Frontend/Backend Protocol" — the wire protocol
+          FerricDB speaks in Milestone 10.
+          <a href="https://www.postgresql.org/docs/current/protocol.html" rel="external">https://www.postgresql.org/docs/current/protocol.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>cmu-db/bustub — the C++ educational DBMS behind 15-445; instructive test and API design
+        (read, don't copy).
+        <a href="https://github.com/cmu-db/bustub" rel="external">github.com/cmu-db/bustub</a></li>
+      <li>erikgrinaker/toydb — an educational distributed SQL database in Rust with an excellent
+        architecture guide; FerricDB's executor and MVCC take inspiration from it.
+        <a href="https://github.com/erikgrinaker/toydb" rel="external">github.com/erikgrinaker/toydb</a></li>
+    </ul>
+
+    <p><a class="btn primary" href="milestone-00/index.html">Start with Milestone 0 →</a></p>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    links: true,
+    root: ".."
+  });
+});
+</script>
+</body>
+</html>

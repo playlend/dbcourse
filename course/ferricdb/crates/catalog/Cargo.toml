@@ -1,0 +1,12 @@
+[package]
+name = "ferricdb-catalog"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferricdb-common = { workspace = true }
+ferricdb-storage = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

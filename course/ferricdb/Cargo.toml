@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/common",
+    "crates/storage",
+    "crates/buffer",
+    "crates/index",
+    "crates/sql",
+    "crates/catalog",
+    "crates/exec",
+    "crates/txn",
+    "crates/wal",
+    "crates/server",
+    "crates/ferricdb",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+
+[workspace.dependencies]
+# internal crates
+ferricdb-common = { path = "crates/common" }
+ferricdb-storage = { path = "crates/storage" }
+ferricdb-buffer = { path = "crates/buffer" }
+ferricdb-index = { path = "crates/index" }
+ferricdb-sql = { path = "crates/sql" }
+ferricdb-catalog = { path = "crates/catalog" }
+ferricdb-exec = { path = "crates/exec" }
+ferricdb-txn = { path = "crates/txn" }
+ferricdb-wal = { path = "crates/wal" }
+ferricdb-server = { path = "crates/server" }
+
+# allowed external crates (course crate policy — see project overview page)
+thiserror = "2"
+bytes = "1"
+tempfile = "3"
+rand = "0.9"
+rustyline = "15"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time"] }
+sqllogictest = "0.28"
+criterion = "0.5"

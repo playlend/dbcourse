@@ -1,0 +1,19 @@
+[package]
+name = "ferricdb-buffer"
+description = "FerricDB buffer pool: frames, page table, pin guards, CLOCK/LRU-K replacement (Milestone 2)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferricdb-common = { workspace = true }
+ferricdb-storage = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "hit_rate"
+harness = false

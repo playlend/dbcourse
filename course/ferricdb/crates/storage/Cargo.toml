@@ -1,0 +1,13 @@
+[package]
+name = "ferricdb-storage"
+description = "FerricDB storage layer: 8 KB pages, slotted heap pages, tuple format, disk manager, heap files (Milestone 1)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferricdb-common = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rand = { workspace = true }

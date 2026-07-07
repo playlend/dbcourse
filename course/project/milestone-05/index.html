@@ -1,0 +1,681 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 5 · B+Tree Index — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 5</span>
+  </nav>
+  <span class="badge milestone">Milestone 5</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 5 · B+Tree Index</h1>
+  <p class="subtitle">Build a disk-resident B+Tree keyed on a single column, wire it into the
+  catalog, executor, and planner, and prove it correct with an invariant-checking fuzz test.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check yourself</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <p>This is the most intricate data structure in the whole project, and the one CMU warns its
+  students about in bold type<sup class="cite"><a href="#ref-3">3</a></sup>. It is also the most
+  satisfying: when you finish, <code>SELECT * FROM users WHERE id = 42</code> stops scanning the
+  whole table and lands on the right page in three reads. Budget more time than you did for
+  Milestone 4, keep <code>check_invariants</code> running after every mutation, and the tree will
+  tell you the moment you corrupt it — instead of twenty inserts later.</p>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li>Design on-disk layouts for B+Tree leaf and internal nodes, one node per 8&nbsp;KB page,
+        using a sorted cell-pointer array.</li>
+    <li>Implement point search, insert with cascading leaf/internal/root splits, and lazy delete
+        on a paged B+Tree.</li>
+    <li>Explain why a leaf split <em>copies</em> its separator key up while an internal split
+        <em>pushes</em> it up, and what breaks when you mix the two.</li>
+    <li>Implement a range iterator that walks the sibling-linked leaf chain across node
+        boundaries.</li>
+    <li>Integrate an index with the rest of the system: <code>CREATE INDEX</code> in the
+        front-end, index maintenance in the write executors, and a simple access-path rule in the
+        planner.</li>
+    <li>Verify structural invariants (sorted keys, uniform leaf depth, key-range containment)
+        mechanically, under randomized workloads.</li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m04-data-structures-indexes/index.html">M04 · B+Trees and
+        Friends</a> — the concept module: why B+Trees won, occupancy math, hash indexes, and the
+        design space this milestone draws from.</li>
+    <li>cstack, <em>Let's Build a Simple Database</em>, Part 7 — the gentlest possible
+        introduction to leaf vs. internal nodes and how a tree grows by splitting.<sup
+        class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><em>The SQLite Database File Format</em>, §1.6 “B-tree Pages” — a production page layout
+        worth imitating: page header, cell pointer array, cells packed at the page end.<sup
+        class="cite"><a href="#ref-2">2</a></sup></li>
+    <li>CMU 15-445 Fall 2025, Project #2 — read “Task #2” and “Requirements and Hints” for
+        operation semantics and edge cases: duplicate keys, root changes, iterator design,
+        latch crabbing.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — FerricDB architecture. The B+Tree index is the second access method,
+    sitting beside heap storage; everything you built below it is reused unchanged.</figcaption>
+  </figure>
+  <p>The index is a peer of the heap file, not a layer above it: both are access methods that
+  store their pages through the same <code>PageStore</code> trait, which means the buffer pool
+  from Milestone 2 caches index pages and heap pages in the same frames with zero new plumbing.
+  The tree stores no tuples. Its leaves map key values to <code>RecordId</code>s — the
+  (page,&nbsp;slot) addresses from Milestone 1 — and the executor fetches the actual rows from the
+  heap. Above you, the catalog records which indexes exist and where their roots live, and the
+  planner starts making its first real decision: <code>SeqScan</code> or <code>IndexScan</code>.</p>
+
+  <h2 id="sec-spec">Specification</h2>
+
+  <h3 id="spec-tree">The tree (crates/index)</h3>
+  <p>You implement package <code>ferricdb-index</code> in <code>course/ferricdb/crates/index</code>.
+  The public surface, from the API spec:</p>
+  <pre><code>// crates/index/src/lib.rs — public surface to implement
+
+/// Disk-resident B+Tree mapping a single-column key to RecordIds.
+/// One node = one page. Keys are Values of one DataType.
+pub struct BPlusTree { /* Arc&lt;dyn PageStore&gt;, root PageId, key type */ }
+impl BPlusTree {
+    pub fn create(store: std::sync::Arc&lt;dyn PageStore&gt;, key_type: DataType) -&gt; Result&lt;Self&gt;;
+    pub fn open(store: std::sync::Arc&lt;dyn PageStore&gt;, root: PageId, key_type: DataType) -&gt; Self;
+    pub fn root_page(&amp;self) -&gt; PageId;
+    pub fn insert(&amp;mut self, key: &amp;Value, rid: RecordId) -&gt; Result&lt;()&gt;;   // splits as needed
+    pub fn get(&amp;self, key: &amp;Value) -&gt; Result&lt;Option&lt;RecordId&gt;&gt;;
+    pub fn delete(&amp;mut self, key: &amp;Value) -&gt; Result&lt;bool&gt;;                // lazy delete OK
+    pub fn range(
+        &amp;self,
+        lower: std::ops::Bound&lt;Value&gt;,
+        upper: std::ops::Bound&lt;Value&gt;,
+    ) -&gt; Result&lt;RangeIter&gt;;   // Iterator&lt;Item = Result&lt;(Value, RecordId)&gt;&gt;, leaf-chain walk
+    /// Test hook: verify sortedness, balance, and key-range invariants.
+    pub fn check_invariants(&amp;self) -&gt; Result&lt;()&gt;;
+}</code></pre>
+
+  <p>Semantic notes:</p>
+  <ul>
+    <li><strong>Two node kinds.</strong> Internal nodes hold <em>K</em> keys and <em>K</em>+1
+        child page pointers and exist only to route searches; leaf nodes hold keys paired with
+        <code>RecordId</code>s. All entries live at the leaf level — that separation is what makes
+        this a B+Tree rather than a B-Tree.<sup class="cite"><a href="#ref-1">1</a></sup><sup
+        class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Balance.</strong> Every leaf sits at the same depth, and the tree gets taller only
+        when the root itself splits.<sup class="cite"><a href="#ref-1">1</a></sup> Your
+        <code>check_invariants</code> must verify both.</li>
+    <li><strong>Unique keys.</strong> Keys are unique, following BusTub, where re-inserting an
+        existing key leaves the tree unchanged and reports failure.<sup class="cite"><a
+        href="#ref-3">3</a></sup> In this milestone you index the primary key and unique-valued
+        secondary columns; decide and document what your <code>insert</code> does on a duplicate
+        (error out or overwrite) — just make it deliberate.</li>
+    <li><strong>Keys are <code>Value</code>s of one <code>DataType</code></strong>, fixed at
+        <code>create</code>/<code>open</code>. Compare them with <code>Value::sql_cmp</code>, and
+        never let a <code>Null</code> key reach the tree (see the pitfalls).</li>
+    <li><strong>Lazy delete is acceptable</strong> as a first version: remove the leaf entry and
+        leave underfull nodes alone. CMU requires merge/redistribution<sup class="cite"><a
+        href="#ref-3">3</a></sup>; we defer that to the stretch step, honestly trading disk space
+        for a much smaller state space while you stabilize splits.</li>
+    <li><strong><code>range</code> takes standard <code>std::ops::Bound</code> pairs</strong>, so
+        it must handle <code>Included</code>, <code>Excluded</code>, and <code>Unbounded</code> on
+        each side, and it must walk the leaf sibling chain rather than re-descending from the
+        root per key.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+  </ul>
+
+  <h3 id="spec-layout">Node layout on the page</h3>
+  <p>How you arrange bytes inside a node is your design decision, but you should steal the shape
+  SQLite uses: after the page header comes a <em>cell pointer array</em> of 2-byte offsets kept in
+  key order, while the cells themselves are packed from the end of the page toward the middle;
+  the space between the two is free.<sup class="cite"><a href="#ref-2">2</a></sup> Inserting into
+  a sorted position then shifts only 2-byte pointers, never whole cells. SQLite's interior pages
+  additionally keep the right-most child pointer in the page header rather than in a cell, so
+  <em>K</em> cells plus one header field give the <em>K</em>+1 children.<sup class="cite"><a
+  href="#ref-2">2</a></sup> The first 16 bytes of every FerricDB page are already reserved by
+  Milestone 1 (pageLSN, page-type tag, padding) — use that type tag to mark pages as index leaf
+  or index internal.</p>
+
+  <figure>
+    <svg viewBox="0 0 920 310" role="img">
+      <title>Byte layout of leaf and internal B+Tree node pages: a reserved 16-byte page header,
+      a node header, a cell pointer array growing forward, free space, and cells packed backward
+      from the end of the page. An arrow shows a cell pointer holding the byte offset of its
+      cell.</title>
+      <defs>
+        <marker id="fig2-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.65"></path>
+        </marker>
+      </defs>
+
+      <text x="20" y="30" class="d-text" font-weight="600">Leaf node page (one 8 KB page)</text>
+      <rect x="20"  y="42" width="96"  height="56" rx="4" class="d-box"></rect>
+      <text x="68"  y="66" class="d-text-sm" text-anchor="middle">page hdr</text>
+      <text x="68"  y="82" class="d-mono-sm" text-anchor="middle">16 B: LSN·type</text>
+      <rect x="116" y="42" width="150" height="56" rx="4" class="d-box"></rect>
+      <text x="191" y="66" class="d-text-sm" text-anchor="middle">leaf node header</text>
+      <text x="191" y="82" class="d-mono-sm" text-anchor="middle">count · prev · next</text>
+      <rect x="266" y="42" width="170" height="56" rx="4" class="d-box-hl"></rect>
+      <text x="351" y="66" class="d-text-sm" text-anchor="middle">cell pointer array</text>
+      <text x="351" y="82" class="d-mono-sm" text-anchor="middle">2-B offsets, key-sorted</text>
+      <rect x="436" y="42" width="170" height="56" rx="4" class="d-box"
+            stroke-dasharray="5 4"></rect>
+      <text x="521" y="66" class="d-text-sm" text-anchor="middle">free space</text>
+      <path d="M 448 84 H 478" class="d-line" marker-end="url(#fig2-arrow)"></path>
+      <path d="M 594 84 H 564" class="d-line" marker-end="url(#fig2-arrow)"></path>
+      <rect x="606" y="42" width="294" height="56" rx="4" class="d-box-good"></rect>
+      <text x="753" y="66" class="d-text-sm" text-anchor="middle">cells: (key, RecordId)</text>
+      <text x="753" y="82" class="d-mono-sm" text-anchor="middle">packed from the page end</text>
+      <text x="20"  y="116" class="d-mono-sm">byte 0</text>
+      <text x="900" y="116" class="d-mono-sm" text-anchor="end">byte 8191</text>
+      <path d="M 330 98 C 330 140, 700 140, 700 104" class="d-line-hl"
+            marker-end="url(#fig2-arrow)"></path>
+      <text x="515" y="152" class="d-text-sm" text-anchor="middle">a cell pointer = byte offset of its cell</text>
+
+      <text x="20" y="196" class="d-text" font-weight="600">Internal node page</text>
+      <rect x="20"  y="208" width="96"  height="56" rx="4" class="d-box"></rect>
+      <text x="68"  y="232" class="d-text-sm" text-anchor="middle">page hdr</text>
+      <text x="68"  y="248" class="d-mono-sm" text-anchor="middle">16 B: LSN·type</text>
+      <rect x="116" y="208" width="150" height="56" rx="4" class="d-box"></rect>
+      <text x="191" y="232" class="d-text-sm" text-anchor="middle">internal node header</text>
+      <text x="191" y="248" class="d-mono-sm" text-anchor="middle">count · right-most child</text>
+      <rect x="266" y="208" width="170" height="56" rx="4" class="d-box-hl"></rect>
+      <text x="351" y="232" class="d-text-sm" text-anchor="middle">cell pointer array</text>
+      <text x="351" y="248" class="d-mono-sm" text-anchor="middle">2-B offsets, key-sorted</text>
+      <rect x="436" y="208" width="170" height="56" rx="4" class="d-box"
+            stroke-dasharray="5 4"></rect>
+      <text x="521" y="232" class="d-text-sm" text-anchor="middle">free space</text>
+      <rect x="606" y="208" width="294" height="56" rx="4" class="d-box-good"></rect>
+      <text x="753" y="232" class="d-text-sm" text-anchor="middle">cells: (key, child PageId)</text>
+      <text x="753" y="248" class="d-mono-sm" text-anchor="middle">K cells + header child = K+1 children</text>
+      <text x="20"  y="282" class="d-mono-sm">byte 0</text>
+      <text x="900" y="282" class="d-mono-sm" text-anchor="end">byte 8191</text>
+    </svg>
+    <figcaption>Figure 2 — Suggested node layouts, adapted from SQLite's b-tree page format:<sup
+    class="cite"><a href="#ref-2">2</a></sup> a sorted array of 2-byte cell pointers grows
+    forward, cells grow backward, and an internal node keeps its right-most child pointer in the
+    node header.</figcaption>
+  </figure>
+
+  <p>A worked fanout example with course numbers, so you can sanity-check your own layout. Take an
+  <code>INTEGER</code> key: an internal cell is an 8-byte key plus a 4-byte child
+  <code>PageId</code>, plus its 2-byte cell pointer — 14 bytes per entry. With 8,192-byte pages
+  and 32 bytes of headers, that is ⌊8,160&nbsp;/&nbsp;14⌋&nbsp;≈&nbsp;582 children per internal
+  node. A leaf cell is an 8-byte key plus a 6-byte <code>RecordId</code> (u32 page, u16 slot) plus
+  the 2-byte pointer — 16 bytes, so ≈&nbsp;510 entries per leaf. A height-3 tree — root, one
+  internal level, leaves — then addresses about 582&nbsp;×&nbsp;582&nbsp;×&nbsp;510&nbsp;≈
+  173&nbsp;million keys, reachable in three page reads. That is the whole argument for B+Trees:
+  logarithmic point lookups with a base in the hundreds, plus ordered traversal that a hash table
+  cannot give you.<sup class="cite"><a href="#ref-1">1</a></sup> <code>TEXT</code> keys are
+  variable-length, so do not hard-code a max cell count: a node is “full” when the incoming cell
+  no longer fits in free space, exactly like <code>PageFull</code> in Milestone 1.</p>
+
+  <h3 id="spec-integration">Integration surface (crates/sql, crates/catalog, crates/exec)</h3>
+  <p>The tree alone is invisible to SQL. Three existing crates gain small, already-stubbed pieces
+  this milestone:</p>
+  <pre><code>// crates/sql — ast::Statement gains one variant:
+CreateIndex { name: String, table: String, column: String },       // MS5
+
+// crates/catalog — every index is a catalog object:
+pub struct IndexInfo { pub oid: Oid, pub name: String, pub table: String,
+                       pub column: String, pub root_page: PageId }
+
+impl Catalog {
+    pub fn create_index(&amp;self, name: &amp;str, table: &amp;str, column: &amp;str,
+                        root_page: PageId) -&gt; Result&lt;Oid&gt;;                  // MS5
+    pub fn set_index_root(&amp;self, index_oid: Oid, root: PageId) -&gt; Result&lt;()&gt;;
+}
+
+// crates/exec — plan::LogicalPlan gains one variant:
+IndexScan { table: TableInfo, index: IndexInfo,
+            lower: Bound&lt;Value&gt;, upper: Bound&lt;Value&gt; },             // MS5</code></pre>
+  <p>A complete b-tree is reachable from its root page alone, so the root page number is the
+  identity of the index — SQLite stores exactly that in its schema table.<sup class="cite"><a
+  href="#ref-2">2</a></sup> FerricDB does the same: <code>IndexInfo.root_page</code> in the
+  catalog. When a root split changes the root (see pitfalls), <code>set_index_root</code> is how
+  the new identity gets persisted. The planner rule this milestone is deliberately naive: if the
+  filter constrains an indexed column with <code>=</code>, <code>&lt;</code>, <code>&lt;=</code>,
+  <code>&gt;</code>, or <code>&gt;=</code>, emit <code>IndexScan</code> with the matching bounds;
+  otherwise <code>SeqScan</code>. Whether the index is actually the cheaper choice is
+  <a href="../milestone-07/index.html">Milestone 7</a>'s cost-model problem, not yours today.</p>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <p>Ordered so that each step is testable before the next begins. Steps 1–4 are a solid first
+  session; splits (steps 5–6) are the hard middle; integration (step 9) is mostly plumbing you
+  have done before.</p>
+  <ol>
+    <li><p><strong>Design both node layouts on paper first.</strong> Decide every header field and
+      its offset before writing code: for leaves — cell count, free-space offset, previous-leaf
+      and next-leaf <code>PageId</code>s; for internal nodes — cell count, free-space offset,
+      right-most child. Write the layout as a comment block at the top of the module and treat it
+      as a contract. Decide your separator convention now too: FerricDB pages use “child
+      <em>i</em> holds keys &lt; separator <em>i</em>; keys ≥ the last separator go to the
+      right-most child”, but any convention works if search and split agree on it (SQLite routes
+      with ≤/&gt; instead<sup class="cite"><a href="#ref-2">2</a></sup>).</p></li>
+
+    <li><p><strong>Build typed page views, then unit-test them in isolation.</strong> Mirror the
+      <code>HeapPage</code> pattern from Milestone 1: private <code>LeafNode</code>/<code>
+      InternalNode</code> structs that <code>init</code> or <code>attach</code> over a
+      <code>&amp;mut Page</code> and expose cell-level operations — <code>key_at(i)</code>,
+      <code>insert_at(i, cell)</code>, and a binary search returning
+      <code>Result&lt;usize, usize&gt;</code> like the standard library's. Use binary search from
+      the start; CMU warns that linear scans of 500-entry nodes will blow your time budget.<sup
+      class="cite"><a href="#ref-3">3</a></sup> You can test “insert sorted, search, split at
+      midpoint” on a single page long before a tree exists.</p></li>
+
+    <li><p><strong>Write <code>check_invariants</code> and a debug dump before insert.</strong>
+      This inverts the obvious order on purpose. The checker is a recursive walk that verifies:
+      keys strictly ascending within every node, every child's keys inside the parent's separator
+      range, every leaf at the same depth, and the leaf chain visiting keys in globally sorted
+      order. BusTub ships a tree-printer tool for exactly this reason<sup class="cite"><a
+      href="#ref-3">3</a></sup>; your <code>Display</code>-style dump of “page id → keys per
+      level” is 30 lines and will save you hours. Call the checker after <em>every</em> mutation
+      in your own tests.</p></li>
+
+    <li><p><strong>Point search.</strong> <code>get</code> descends from the root: binary-search
+      the internal node's separators to choose a child, repeat until a leaf, binary-search the
+      leaf for an exact match. Deserialize only the key you are probing (you stored its cell
+      offset; you know the key <code>DataType</code>), and compare with
+      <code>Value::sql_cmp</code>. If your search visits more nodes than the tree's height,
+      something is wrong.</p></li>
+
+    <li><p><strong>Insert, then the leaf split.</strong> While descending, record the path as a
+      <code>Vec&lt;(PageId, usize)&gt;</code> of (node, chosen-child slot) — this replaces parent
+      pointers and is the same role BusTub's write-set context plays.<sup class="cite"><a
+      href="#ref-3">3</a></sup> If the leaf has room, insert and stop. Otherwise: allocate a new
+      page from the <code>PageStore</code>, move the upper half of the cells into it, stitch the
+      leaf chain (new node inherits the old <code>next</code>; old node points at the new one),
+      and insert the new leaf's <em>first key</em> into the parent at the recorded slot —
+      <em>copied</em> up, so it still exists in the leaf (Figure 3). A useful timing rule from
+      CMU: split a leaf when it is full <em>after</em> insertion, split an internal node when
+      full <em>before</em> insertion — it avoids nasty overflow corner cases.<sup class="cite"><a
+      href="#ref-3">3</a></sup></p></li>
+
+    <li><p><strong>Internal splits and the root split.</strong> Inserting the separator can
+      overflow the parent; split it by moving the upper half of its cells to a new internal node
+      and <em>pushing</em> the middle key up — it moves to the grandparent and appears in neither
+      half (Figure 3). Recurse up your recorded path. When the node that overflows is the root,
+      allocate a fresh root holding one separator and two children: this is the only way the tree
+      ever gets taller, and it is what keeps every leaf at the same depth.<sup class="cite"><a
+      href="#ref-1">1</a></sup> <code>BPlusTree</code> must report the new root via
+      <code>root_page()</code>, and whoever owns the catalog entry must persist it with
+      <code>set_index_root</code> — BusTub has the identical requirement with its header
+      page.<sup class="cite"><a href="#ref-3">3</a></sup> After this step, run the fuzz test for
+      the first time.</p></li>
+
+    <li><p><strong>Delete — lazily.</strong> Find the leaf, remove the cell (shift the 2-byte
+      pointers, reclaim the space or leave a gap and compact later), return whether the key was
+      present. Do <em>not</em> merge underfull nodes yet. Consequences you must handle: your
+      invariant checker cannot enforce minimum occupancy, and a leaf may become completely empty
+      while staying in the chain — the range iterator has to skip it without yielding anything.
+      Textbook B+Trees keep every node at least half full<sup class="cite"><a
+      href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-3">3</a></sup>; note in a comment
+      that you are relaxing this, and by how much your fuzz runs actually degrade.</p></li>
+
+    <li><p><strong>The range iterator.</strong> <code>range(lower, upper)</code> seeks once: for
+      <code>Unbounded</code>, descend to the left-most leaf; for
+      <code>Included(v)</code>/<code>Excluded(v)</code>, descend to <em>v</em>'s leaf and
+      binary-search the starting slot (mind the exclusive case). <code>next()</code> yields
+      <code>(key, rid)</code>, advances the slot, and when it runs off the end of a leaf, hops to
+      the sibling through the next-leaf pointer — sibling pointers exist precisely to make
+      in-order scans cheap.<sup class="cite"><a href="#ref-3">3</a></sup> Check the upper bound on
+      every yielded key and stop past it. Keep the iterator's state minimal — current
+      <code>PageId</code> plus slot index, re-fetching the page per step through
+      <code>with_page</code> — so you never hold a page pinned across the whole scan.</p></li>
+
+    <li><p><strong>Integrate with SQL.</strong> Five sub-tasks, each small:
+      (a)&nbsp;parse <code>CREATE INDEX name ON table (column)</code> into
+      <code>ast::Statement::CreateIndex</code>, and let the binder verify the table and column
+      exist; (b)&nbsp;execute it: <code>BPlusTree::create</code>, backfill by scanning the heap
+      and inserting <code>(key, rid)</code> for every live row, then
+      <code>catalog.create_index(...)</code> with the final root; (c)&nbsp;maintain indexes in the
+      write executors — <code>Insert</code> adds to every index in
+      <code>TableInfo.indexes</code>, <code>Delete</code> removes, <code>Update</code> removes the
+      old key and inserts the new one when the indexed column changed; (d)&nbsp;have
+      <code>Update</code>/<code>Delete</code> drain their input <code>RecordId</code>s into a
+      buffer <em>before</em> writing, so a scan never observes its own writes (the classic
+      self-updating-scan trap); (e)&nbsp;implement the <code>IndexScan</code> executor:
+      <code>open()</code> builds the range iterator from the plan's bounds, <code>next()</code>
+      resolves each <code>RecordId</code> through the heap and re-applies the full predicate as a
+      residual filter, which keeps the planner rule simple and always correct.</p></li>
+
+    <li><p><strong>Stretch: rebalance and latch crabbing.</strong> Real deletion: on underflow,
+      borrow a cell from a sibling (updating the parent separator) or merge with it (removing the
+      separator), recursing upward; a root left with a single child is replaced by that child,
+      shrinking the tree. For concurrency, study latch crabbing: acquire latches top-down,
+      releasing a parent as soon as the child is “safe” (cannot split or merge). CMU's spec adds
+      two hard rules: release latches in the same top-down order you acquired them, and never
+      take the same read latch twice in one thread.<sup class="cite"><a href="#ref-3">3</a></sup> FerricDB's
+      <code>&amp;mut self</code> writers make the tree single-writer today, so crabbing only pays
+      off once you share the tree behind interior mutability — treat it as a design exercise
+      first.</p></li>
+  </ol>
+
+  <figure>
+    <svg viewBox="0 0 920 290" role="img">
+      <title>Leaf splits copy the separator key up to the parent, so the key remains as the first
+      entry of the right leaf; internal splits push the separator up, removing it from both
+      halves.</title>
+      <defs>
+        <marker id="fig3-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.65"></path>
+        </marker>
+      </defs>
+
+      <text x="230" y="28" class="d-text" font-weight="600" text-anchor="middle">Leaf split: separator is COPIED up</text>
+      <text x="230" y="46" class="d-text-sm" text-anchor="middle">insert 23 → leaf [11 13 17 19 23] overflows</text>
+      <rect x="160" y="62" width="36" height="30" class="d-box"></rect>
+      <text x="178" y="82" class="d-mono" text-anchor="middle">…</text>
+      <rect x="196" y="62" width="36" height="30" class="d-box-hl"></rect>
+      <text x="214" y="82" class="d-mono" text-anchor="middle">17</text>
+      <rect x="232" y="62" width="36" height="30" class="d-box"></rect>
+      <text x="250" y="82" class="d-mono" text-anchor="middle">…</text>
+      <text x="290" y="82" class="d-text-sm">parent</text>
+      <path d="M 196 92 L 122 168" class="d-line" marker-end="url(#fig3-arrow)"></path>
+      <path d="M 268 92 L 328 168" class="d-line" marker-end="url(#fig3-arrow)"></path>
+      <rect x="84"  y="170" width="36" height="30" class="d-box"></rect>
+      <text x="102" y="190" class="d-mono" text-anchor="middle">11</text>
+      <rect x="120" y="170" width="36" height="30" class="d-box"></rect>
+      <text x="138" y="190" class="d-mono" text-anchor="middle">13</text>
+      <path d="M 158 185 H 272" class="d-line" marker-end="url(#fig3-arrow)"></path>
+      <text x="215" y="178" class="d-text-sm" text-anchor="middle">next leaf</text>
+      <rect x="276" y="170" width="36" height="30" class="d-box-hl"></rect>
+      <text x="294" y="190" class="d-mono" text-anchor="middle">17</text>
+      <rect x="312" y="170" width="36" height="30" class="d-box"></rect>
+      <text x="330" y="190" class="d-mono" text-anchor="middle">19</text>
+      <rect x="348" y="170" width="36" height="30" class="d-box"></rect>
+      <text x="366" y="190" class="d-mono" text-anchor="middle">23</text>
+      <text x="230" y="238" class="d-text-sm" text-anchor="middle">17 lives in the parent AND stays as the</text>
+      <text x="230" y="254" class="d-text-sm" text-anchor="middle">first key of the right leaf</text>
+
+      <path d="M 460 20 V 264" class="d-line" stroke-dasharray="5 4"></path>
+
+      <text x="690" y="28" class="d-text" font-weight="600" text-anchor="middle">Internal split: separator is PUSHED up</text>
+      <text x="690" y="46" class="d-text-sm" text-anchor="middle">internal [7 13 29 41 53] overflows</text>
+      <rect x="620" y="62" width="36" height="30" class="d-box"></rect>
+      <text x="638" y="82" class="d-mono" text-anchor="middle">…</text>
+      <rect x="656" y="62" width="36" height="30" class="d-box-hl"></rect>
+      <text x="674" y="82" class="d-mono" text-anchor="middle">29</text>
+      <rect x="692" y="62" width="36" height="30" class="d-box"></rect>
+      <text x="710" y="82" class="d-mono" text-anchor="middle">…</text>
+      <text x="750" y="82" class="d-text-sm">grandparent</text>
+      <path d="M 656 92 L 588 168" class="d-line" marker-end="url(#fig3-arrow)"></path>
+      <path d="M 728 92 L 786 168" class="d-line" marker-end="url(#fig3-arrow)"></path>
+      <rect x="544" y="170" width="36" height="30" class="d-box"></rect>
+      <text x="562" y="190" class="d-mono" text-anchor="middle">7</text>
+      <rect x="580" y="170" width="36" height="30" class="d-box"></rect>
+      <text x="598" y="190" class="d-mono" text-anchor="middle">13</text>
+      <rect x="736" y="170" width="36" height="30" class="d-box"></rect>
+      <text x="754" y="190" class="d-mono" text-anchor="middle">41</text>
+      <rect x="772" y="170" width="36" height="30" class="d-box"></rect>
+      <text x="790" y="190" class="d-mono" text-anchor="middle">53</text>
+      <path d="M 556 200 L 548 216" class="d-line"></path>
+      <path d="M 580 200 L 580 216" class="d-line"></path>
+      <path d="M 604 200 L 612 216" class="d-line"></path>
+      <path d="M 748 200 L 740 216" class="d-line"></path>
+      <path d="M 772 200 L 772 216" class="d-line"></path>
+      <path d="M 796 200 L 804 216" class="d-line"></path>
+      <text x="690" y="238" class="d-text-sm" text-anchor="middle">29 moves up to the grandparent and appears</text>
+      <text x="690" y="254" class="d-text-sm" text-anchor="middle">in NEITHER half afterwards</text>
+    </svg>
+    <figcaption>Figure 3 — The split rule that corrupts more student B+Trees than any other.
+    Leaves copy the separator up because every entry must remain findable at the leaf level;<sup
+    class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup>
+    internal keys only route, so an internal split pushes the middle key up and out.</figcaption>
+  </figure>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <p>The starter workspace ships every Milestone 5 test marked
+  <code>#[ignore = "milestone 5"]</code> with an <code>ms5_</code> name prefix. You do not edit
+  the tests to activate them: <code>--include-ignored</code> runs ignored tests too, and the
+  <code>ms5_</code> filter selects just this milestone's group. (Once you are done, you may also
+  delete the <code>#[ignore]</code> attributes so plain <code>cargo test</code> keeps guarding
+  the crate.)</p>
+  <pre><code># from course/ferricdb/ — the tree itself: unit, property, and fuzz tests
+cargo test -p ferricdb-index -- --include-ignored ms5_
+
+# end-to-end SQL behaviour (CREATE INDEX, index maintenance, IndexScan),
+# via the sqllogictest files crates/ferricdb/tests/slt/ms5_*.slt
+cargo test -p ferricdb slt_all</code></pre>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Coverage area</th><th>How it is checked</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Point operations</td><td><code>ms5_</code> unit tests: insert/get/delete round
+            trips at single-node scale, duplicate handling, empty-tree edge cases.</td></tr>
+        <tr><td>Splits and root growth</td><td><code>ms5_</code> tests insert far past one page's
+            capacity in ascending, descending, and shuffled orders, then verify every key is
+            findable and <code>root_page()</code> changed.</td></tr>
+        <tr><td>Structural invariants</td><td><code>ms5_btree_invariants_fuzz</code>: a
+            seeded-random interleaving of inserts and deletes that calls your own
+            <code>check_invariants</code> after every batch — sorted keys, uniform leaf depth,
+            key-range containment. A seed is printed so failures replay deterministically.</td></tr>
+        <tr><td>Range iteration</td><td><code>ms5_</code> tests compare <code>range()</code>
+            output against a <code>BTreeMap</code> oracle for all nine bound combinations,
+            including scans that cross many leaves.</td></tr>
+        <tr><td>SQL integration</td><td><code>ms5_*.slt</code> files: the same predicate is run
+            with and without an index and must return identical rows — the “index scan ≡ seq
+            scan” cross-check.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Write your own tests before trusting the provided ones: after step 5 you should already have
+  a hand-rolled “insert 10,000 sequential integers, get each one back” test. And keep the fuzz
+  test running in a loop while you develop deletion — it is the test that finds split-boundary
+  bugs the deterministic tests miss.</p>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — mixing up copy-up and push-up</span>
+    <p><strong>Why it happens:</strong> the two split routines look nearly identical, and both
+    “move the middle key to the parent”. But a leaf split must <em>copy</em> the separator (the
+    key still lives in the right leaf, because in a B+Tree every entry must exist at the leaf
+    level<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a
+    href="#ref-2">2</a></sup>), while an internal split must <em>push</em> it (routing keys are
+    not entries; keeping a copy in a child shifts every child pointer by one).
+    <strong>The symptom is silence:</strong> the tree keeps answering queries, but
+    <code>get</code> misses keys that <code>range</code> still finds, or children end up under
+    the wrong separator. You will not notice at insert time — only <code>check_invariants</code>
+    notices, which is why you run it after every mutation while developing.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — root split without telling the catalog</span>
+    <p><strong>Why it happens:</strong> the root split allocates a <em>new</em> root page, and a
+    b-tree is identified by its root page number<sup class="cite"><a href="#ref-2">2</a></sup> —
+    but the old root page still exists and still parses as a valid node.
+    <strong>Symptom:</strong> everything works until the process restarts or another
+    <code>BPlusTree::open</code> reads <code>IndexInfo.root_page</code> from the catalog; the
+    stale root is now a mid-level node, so scans silently miss every key outside its subtree.
+    After any operation that changes <code>root_page()</code>, the executor layer must call
+    <code>Catalog::set_index_root</code>. BusTub bakes the same requirement into its header
+    page.<sup class="cite"><a href="#ref-3">3</a></sup> Add a test that reopens the tree from the
+    catalog after a forced root split.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — the range iterator stops at a leaf boundary</span>
+    <p><strong>Why it happens:</strong> the happy-path iterator walks one leaf's cell array and
+    forgets the hop through the next-leaf pointer, or hops but forgets to reset the slot index to
+    0, or (with lazy delete) lands on an empty leaf and yields nothing instead of hopping again.
+    <strong>Symptom:</strong> range queries return exactly a leaf-capacity number of rows (a
+    suspiciously round number like 510), or duplicate the first key after each boundary. Test a
+    scan whose bounds span at least three leaves, and re-run it after deleting an entire middle
+    leaf's worth of keys.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — UPDATE and DELETE forget the indexes</span>
+    <p><strong>Why it happens:</strong> the heap and the index are separate structures with no
+    magic link between them; only your executors keep them in agreement. It is easy to wire index
+    inserts into <code>INSERT</code> and stop there. <strong>Symptom:</strong> an
+    <code>IndexScan</code> returns a <code>RecordId</code> whose tuple is dead (deleted row still
+    indexed) or misses rows whose indexed column was updated — which is exactly what the
+    “index scan ≡ seq scan” slt cross-checks are designed to catch. Route every write through a
+    single helper that touches the heap and <em>all</em> of <code>TableInfo.indexes</code>, and
+    remember that an <code>UPDATE</code> of an indexed column is a delete-then-insert in the
+    tree.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — comparing Values of the wrong type</span>
+    <p><strong>Why it happens:</strong> node search compares a probe key against stored keys with
+    <code>Value::sql_cmp</code>, which returns <code>Option&lt;Ordering&gt;</code> — it is
+    <code>None</code> when either side is <code>Null</code>, and mixed types (probing a
+    <code>Text</code> tree with an <code>Integer</code>) have no meaningful ordering.
+    <strong>Symptom:</strong> a panic on <code>unwrap()</code> deep inside binary search if you
+    are lucky; interleaved, unsorted keys and a corrupted tree if you are not. Enforce the
+    boundary once: the tree rejects keys whose <code>data_type()</code> differs from the tree's
+    <code>key_type</code>, the binder has already coerced literals, and rows with a
+    <code>Null</code> in the indexed column are skipped at insert (document this choice next to
+    the code).</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li><code>cargo test -p ferricdb-index -- --include-ignored ms5_</code> passes in full,
+        including <code>ms5_btree_invariants_fuzz</code> — the seeded insert/delete fuzz run that
+        validates sorted keys, uniform leaf depth, and key-range containment through your own
+        <code>check_invariants</code>.</li>
+    <li><code>CREATE INDEX</code> works end to end: it backfills from existing heap rows and the
+        index appears in the catalog with a live root page.</li>
+    <li>Index scans return exactly the same rows as sequential scans for the same predicate —
+        the <code>ms5_*.slt</code> cross-check files pass under <code>slt_all</code>.</li>
+    <li>The planner emits <code>IndexScan</code> for equality and range predicates on an indexed
+        column, and still emits <code>SeqScan</code> for everything else.</li>
+    <li><code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code> maintain every index on
+        the table; a reopened database (fresh <code>BPlusTree::open</code> from
+        <code>IndexInfo.root_page</code>) still answers correctly after root splits.</li>
+    <li>You can explain, without notes, why the leaf split copies its separator up and the
+        internal split pushes it up.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check yourself</h2>
+
+  <fieldset class="quiz" data-explain="A B+Tree keeps every entry at the leaf level — internal keys only route. So a leaf split copies the separator up: it becomes a router in the parent AND remains the first key of the right leaf. Only internal splits remove the pushed key from the children.">
+    <legend class="quiz-q">After a leaf split, where does the separator key live?</legend>
+    <label><input type="radio" name="q-ms5-split"> Only in the parent — it was moved up.</label>
+    <label><input type="radio" name="q-ms5-split" data-correct> In the parent <em>and</em> as the
+      first key of the new right leaf.</label>
+    <label><input type="radio" name="q-ms5-split"> In the parent and as the last key of the left
+      leaf.</label>
+    <label><input type="radio" name="q-ms5-split"> Only in the right leaf — parents never store
+      keys.</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="A b-tree is identified by its root page number, and FerricDB stores that identity in IndexInfo.root_page. A root split allocates a new root page, so the catalog entry must be updated via set_index_root — otherwise the next open() descends from a stale, mid-level node.">
+    <legend class="quiz-q">An insert causes the root to split. Besides the pages themselves, what
+    must be updated?</legend>
+    <label><input type="radio" name="q-ms5-root"> Nothing — the root page is rewritten in place,
+      so its PageId never changes.</label>
+    <label><input type="radio" name="q-ms5-root"> The heap file's first_page pointer.</label>
+    <label><input type="radio" name="q-ms5-root" data-correct> The index's root PageId in the
+      catalog, via <code>Catalog::set_index_root</code>.</label>
+    <label><input type="radio" name="q-ms5-root"> Every leaf's parent pointer.</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="The iterator descends once to the leaf containing the lower bound, then follows next-leaf sibling pointers, checking each key against the upper bound. That single descent plus a linked-list walk is the whole point of chaining the leaves.">
+    <legend class="quiz-q">Executing <code>WHERE k BETWEEN 10 AND 20</code> through the index —
+    how many times does the scan descend from the root?</legend>
+    <label><input type="radio" name="q-ms5-range"> Once per matching key.</label>
+    <label><input type="radio" name="q-ms5-range"> Twice — once for each bound.</label>
+    <label><input type="radio" name="q-ms5-range" data-correct> Once, to the lower bound's leaf;
+      after that it follows the leaf chain.</label>
+    <label><input type="radio" name="q-ms5-range"> Zero — range scans read every leaf from the
+      left-most one.</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Connor Stack, “Part 7 — Introduction to the B-Tree”, <em>Let's Build a
+          Simple Database</em>.
+          <a href="https://cstack.github.io/db_tutorial/parts/part7.html" rel="external">https://cstack.github.io/db_tutorial/parts/part7.html</a></li>
+        <li id="ref-2">SQLite Consortium, “The SQLite Database File Format”, §1.6 “B-tree Pages”.
+          <a href="https://www.sqlite.org/fileformat.html" rel="external">https://www.sqlite.org/fileformat.html</a></li>
+        <li id="ref-3">CMU 15-445/645 (Fall 2025), “Project #2 — B+Tree”.
+          <a href="https://15445.courses.cs.cmu.edu/fall2025/project2/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project2/</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>Connor Stack, “Part 8 — B-Tree Leaf Node Format” (and onward) — a full C implementation
+        of the same layout decisions, one part per component.
+        <a href="https://cstack.github.io/db_tutorial/parts/part8.html" rel="external">https://cstack.github.io/db_tutorial/parts/part8.html</a></li>
+      <li>The BusTub repository — compare your design against the scaffolding CMU gives its
+        students, including the b_plus_tree_printer visualization tool.
+        <a href="https://github.com/cmu-db/bustub" rel="external">https://github.com/cmu-db/bustub</a></li>
+      <li>Rust std docs, <code>std::ops::Bound</code> — the exact contract your
+        <code>range()</code> signature builds on.
+        <a href="https://doc.rust-lang.org/std/ops/enum.Bound.html" rel="external">https://doc.rust-lang.org/std/ops/enum.Bound.html</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>Next on the path: <a href="../../modules/m07-joins-sorting-aggregation/index.html">M07 ·
+    Joins, Sorting, Aggregation</a>, then <a href="../milestone-06/index.html">Milestone 6</a> —
+    the executor learns to join, sort, and aggregate.</p>
+
+    <nav class="prevnext">
+      <a href="../../modules/m04-data-structures-indexes/index.html"><span class="dir">← Previous</span> M04 · B+Trees (and Friends)</a>
+      <a class="next" href="../../modules/m07-joins-sorting-aggregation/index.html"><span class="dir">Next →</span> M07 · Joins, Sorting, Aggregation</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor"],
+    current: ["index"],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

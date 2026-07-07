@@ -1,0 +1,737 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 6 · Joins, Aggregation, External Sort — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 6</span>
+  </nav>
+  <span class="badge milestone">Milestone 6</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 6 · Joins, Aggregation, External Sort</h1>
+  <p class="subtitle">Teach the executor to combine tables, group rows, and sort data sets
+  bigger than memory — the three operator families that turn FerricDB into a usable query engine.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li>Implement <code>NestedLoopJoin</code>, a join that evaluates an arbitrary
+        <code>ON</code> predicate with correct SQL three-valued logic — including
+        non-equality predicates and predicate-free cross joins.</li>
+    <li>Implement <code>HashJoin</code> with a build phase and a probe phase over
+        equi-join keys, and explain why rows with <code>NULL</code> keys can never
+        join.<sup class="cite"><a href="#ref-4">4</a></sup><sup class="cite"><a href="#ref-9">9</a></sup></li>
+    <li>Implement hash aggregation for <code>GROUP BY</code> with
+        <code>COUNT</code>/<code>SUM</code>/<code>AVG</code>/<code>MIN</code>/<code>MAX</code>,
+        matching SQL <code>NULL</code> semantics for inputs and for empty
+        inputs.<sup class="cite"><a href="#ref-8">8</a></sup></li>
+    <li>Implement the <code>ExternalSorter</code>: sorted-run generation inside a fixed
+        budget of buffer pages, runs spilled to temporary pages through the buffer pool,
+        and a k-way merge — and predict its I/O with the pass-count
+        formula.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li>Extend the parser, binder, and planner to accept <code>JOIN … ON</code>,
+        <code>GROUP BY</code>, and aggregate function calls (the AST types already exist).</li>
+    <li>State what a global aggregate returns over zero rows, and why grouping treats
+        two <code>NULL</code> keys as one group while joining treats them as never
+        equal.<sup class="cite"><a href="#ref-8">8</a></sup><sup class="cite"><a href="#ref-9">9</a></sup></li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m07-joins-sorting-aggregation/index.html">M07 · Joins, Sorting, Aggregation</a>
+        — the concept module for this milestone. Read it first.</li>
+    <li>The Internals of PostgreSQL, §3.5 “Join Operations” — how a production engine runs
+        all three join algorithms; read the intro plus §3.5.1 (nested loop),
+        §3.5.2 (merge), and §3.5.3 (hash).<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li>Berkeley CS186 Note 8 “Sorting” — the exact run-generation and merge-pass structure
+        your <code>ExternalSorter</code> should follow, with the cost
+        formulas.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li>Berkeley CS186 Note 9 “Iterators and Joins” — nested-loop variants, sort-merge join,
+        and hash join with page-level I/O costs.<sup class="cite"><a href="#ref-6">6</a></sup></li>
+    <li>Berkeley CS186 Note 7 “Hashing” — external hashing as the model behind hash
+        aggregation and hash-join partitioning.<sup class="cite"><a href="#ref-7">7</a></sup></li>
+    <li>PostgreSQL docs, “Aggregate Functions” — skim the function table and read the note
+        about aggregates over zero rows before you write a single accumulator.<sup class="cite"><a href="#ref-8">8</a></sup></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <p>Everything in this milestone lives in <code>course/ferricdb/crates/exec</code>, with
+  supporting grammar work in <code>course/ferricdb/crates/sql</code>. You built the Volcano
+  executor skeleton in Milestone 4; today it grows from “scan, filter, project” into a real
+  algebra: two join operators, an aggregation operator, and a sort operator that survives
+  inputs larger than memory. The planner also grows — it must produce the new plan nodes —
+  but the executor is where the work is.</p>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — FerricDB architecture. The executor (highlighted) gains joins,
+    aggregation, and external sort in this milestone; every component below it is already
+    yours.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+  <p>The public surface comes from the workspace API contract (<code>course/ferricdb/docs/api-spec.md</code>) and is already stubbed
+  in the starter workspace. Your parser must produce the AST shapes below (the types exist
+  since Milestone 3 — until now the parser rejected the syntax):</p>
+  <pre><code>// crates/sql — ast types your parser now populates
+pub struct Select {
+    pub projection: Vec&lt;SelectItem&gt;,        // exprs + aliases, or *
+    pub from: Vec&lt;TableRef&gt;,                // joins from MS6
+    pub filter: Option&lt;Expr&gt;,
+    pub group_by: Vec&lt;Expr&gt;,                // MS6
+    pub order_by: Vec&lt;(Expr, bool /*desc*/)&gt;,
+    pub limit: Option&lt;u64&gt;,
+}
+pub enum TableRef {
+    Table { name: String, alias: Option&lt;String&gt; },
+    Join { left: Box&lt;TableRef&gt;, right: Box&lt;TableRef&gt;,
+           kind: JoinKind, on: Option&lt;Expr&gt; },                          // MS6
+}
+pub enum JoinKind { Inner, Cross }
+pub enum Expr {
+    Literal(Value), Column(Option&lt;String&gt; /*qualifier*/, String),
+    Unary(UnaryOp, Box&lt;Expr&gt;), Binary(Box&lt;Expr&gt;, BinaryOp, Box&lt;Expr&gt;),
+    IsNull(Box&lt;Expr&gt;, bool /*negated*/), Cast(Box&lt;Expr&gt;, DataType),
+    Function(String, Vec&lt;Expr&gt;),            // aggregates from MS6
+}</code></pre>
+  <p>The planner emits four plan variants for this milestone (three new, plus
+  <code>Sort</code> which finally gets a spill-capable implementation), and the executor
+  crate gains a sort module:</p>
+  <pre><code>// crates/exec — public surface to implement (quoted from api-spec.md)
+pub mod plan {
+    pub enum LogicalPlan {
+        // …variants you built in Milestones 4–5, plus:
+        NestedLoopJoin { left: Box&lt;LogicalPlan&gt;, right: Box&lt;LogicalPlan&gt;,
+                         on: Option&lt;BoundExpr&gt; },                            // MS6
+        HashJoin { left: Box&lt;LogicalPlan&gt;, right: Box&lt;LogicalPlan&gt;,
+                   left_keys: Vec&lt;BoundExpr&gt;, right_keys: Vec&lt;BoundExpr&gt; },  // MS6
+        Aggregate { input: Box&lt;LogicalPlan&gt;, group_by: Vec&lt;BoundExpr&gt;,
+                    aggregates: Vec&lt;AggExpr&gt; },                              // MS6
+        Sort { input: Box&lt;LogicalPlan&gt;, keys: Vec&lt;(BoundExpr, bool)&gt; },
+        // …
+    }
+}
+
+/// Volcano iterator contract. next() returns Ok(None) at end of stream.
+pub trait Executor {
+    fn schema(&amp;self) -&gt; &amp;Schema;
+    fn open(&amp;mut self) -&gt; Result&lt;()&gt;;
+    fn next(&amp;mut self) -&gt; Result&lt;Option&lt;Vec&lt;Value&gt;&gt;&gt;;
+    fn close(&amp;mut self) -&gt; Result&lt;()&gt;;
+}
+
+pub struct ExecContext { /* Arc: catalog, page store, txn manager, current txn,
+                            wal (opt), memory budget for sort/hash (MS6) */ }
+
+pub mod sort {                                                 // MS6
+    /// External merge sort: sorted runs spilled via the page store's temp
+    /// pages, k-way merge; stays within `memory_pages` buffer pages.
+    pub struct ExternalSorter { /* ... */ }
+}</code></pre>
+  <p>Comparisons everywhere in this milestone go through the three-valued comparison you
+  built in Milestone 1:</p>
+  <pre><code>// crates/common
+impl Value {
+    /// SQL comparison: returns None when either side is NULL (three-valued logic).
+    pub fn sql_cmp(&amp;self, other: &amp;Value) -&gt; Option&lt;std::cmp::Ordering&gt;;
+}</code></pre>
+
+  <h3 id="spec-semantics">Semantic notes (binding decisions — read carefully)</h3>
+  <ul>
+    <li><strong>Join output schema.</strong> Left child’s columns first, then the right
+        child’s, in child order. This is a course choice; the important part is that you pick
+        it once and the binder, planner, and executors all agree, because bound column
+        references are positional <em>(table index, column index)</em> pairs. Duplicate bare
+        names (<code>customer.id</code> and <code>orders.id</code>) are legal in the combined
+        schema — they are disambiguated by qualifier at bind time, and an unqualified
+        ambiguous name is a bind error.</li>
+    <li><strong>HashJoin keys.</strong> <code>left_keys[i]</code> pairs with
+        <code>right_keys[i]</code>; the planner extracts these pairs from equality conjuncts
+        of the <code>ON</code> clause. Rows whose key evaluates to <code>NULL</code> on
+        either side never appear in the output, because <code>=</code> with a
+        <code>NULL</code> operand yields unknown, not true.<sup class="cite"><a href="#ref-9">9</a></sup></li>
+    <li><strong><code>AggExpr</code>.</strong> Defined in the starter <code>exec</code>
+        crate next to <code>plan</code>: it names which of the five aggregate functions to
+        compute and carries the bound argument expression it applies to
+        (<code>COUNT(*)</code> carries none).</li>
+    <li><strong>Aggregate output schema.</strong> Group-by expressions first (in
+        <code>GROUP BY</code> order), then one column per aggregate (in projection order) —
+        a course choice, same caveat as the join schema. With an empty <code>group_by</code>,
+        the operator computes one global group.</li>
+    <li><strong>Grouping vs. joining on <code>NULL</code>.</strong> Grouping compares keys by
+        <em>distinctness</em>, not by <code>=</code>: two <code>NULL</code>s are “not
+        distinct” from each other,<sup class="cite"><a href="#ref-9">9</a></sup> so all rows
+        with a <code>NULL</code> group key collapse into a single group — the opposite of
+        join keys, which use <code>=</code> and never match.</li>
+    <li><strong><code>ORDER BY</code> and <code>NULL</code>.</strong> FerricDB sorts
+        <code>NULL</code> as if larger than every non-null value, matching PostgreSQL’s
+        default (<code>NULLS LAST</code> for ascending, <code>NULLS FIRST</code> for
+        descending);<sup class="cite"><a href="#ref-10">10</a></sup> we do not implement the
+        <code>NULLS FIRST/LAST</code> syntax. This rule also turns
+        <code>sql_cmp</code>’s <code>Option&lt;Ordering&gt;</code> into the total order a
+        sort needs.</li>
+    <li><strong>Memory budget.</strong> <code>ExecContext</code> carries a memory budget for
+        sort/hash, denominated in <em>buffer pages</em> (<code>memory_pages</code> ×
+        <code>PAGE_SIZE</code> bytes, with <code>PAGE_SIZE = 8192</code> from
+        <code>ferricdb-common</code>). It is the course analog of PostgreSQL’s
+        <code>work_mem</code>, which caps hash tables and in-memory
+        sorts.<sup class="cite"><a href="#ref-4">4</a></sup> In this milestone only the
+        sort path is required to respect it by spilling; hash join and hash aggregation may
+        assume their build side fits (spilling hash operators is a documented stretch —
+        see the merge-join note in the guidance).</li>
+    <li><strong>MergeJoin is optional.</strong> The public <code>LogicalPlan</code> enum has
+        no merge-join variant, so if you build one, keep it crate-private. It is a natural
+        extension once <code>ExternalSorter</code> exists.</li>
+  </ul>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Operator</th><th>Join condition</th><th>How it runs</th><th>Page-I/O sketch</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>NestedLoopJoin</code></td>
+          <td>any <code>ON</code> expression, or none (cross join)</td>
+          <td>for every outer row, rescan the inner side; FerricDB materializes the inner
+              once, as PostgreSQL’s materialized nested loop does<sup class="cite"><a href="#ref-2">2</a></sup></td>
+          <td>[R] + [R]·[S] for the page-at-a-time variant<sup class="cite"><a href="#ref-6">6</a></sup></td>
+        </tr>
+        <tr>
+          <td><code>HashJoin</code></td>
+          <td>conjunction of equalities</td>
+          <td>build a hash table on one side, probe it with the other<sup class="cite"><a href="#ref-4">4</a></sup></td>
+          <td>[R] + [S] when the build side fits in memory<sup class="cite"><a href="#ref-6">6</a></sup></td>
+        </tr>
+        <tr>
+          <td>merge join <em>(optional)</em></td>
+          <td>equalities only<sup class="cite"><a href="#ref-3">3</a></sup></td>
+          <td>sort both inputs, advance two cursors; duplicates need mark-and-backtrack<sup class="cite"><a href="#ref-6">6</a></sup></td>
+          <td>sort(R) + sort(S) + [R] + [S] on average<sup class="cite"><a href="#ref-6">6</a></sup></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Aggregate semantics you must match — the first two columns are SQL behavior as
+  PostgreSQL documents it,<sup class="cite"><a href="#ref-8">8</a></sup> the result types are
+  course choices (PostgreSQL widens instead, e.g. <code>avg</code> over integers returns
+  <code>numeric</code><sup class="cite"><a href="#ref-8">8</a></sup>):</p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Aggregate</th><th><code>NULL</code> inputs</th><th>Zero input rows (global)</th><th>Result type (course choice)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>COUNT(*)</code></td><td>counts every row</td><td><code>0</code></td><td><code>Integer</code></td></tr>
+        <tr><td><code>COUNT(e)</code></td><td>counts rows where <code>e</code> is non-null</td><td><code>0</code></td><td><code>Integer</code></td></tr>
+        <tr><td><code>SUM(e)</code></td><td>ignores <code>NULL</code>s</td><td><code>NULL</code> — not zero</td><td>type of <code>e</code> (<code>Integer</code> or <code>Float</code>)</td></tr>
+        <tr><td><code>AVG(e)</code></td><td>ignores <code>NULL</code>s</td><td><code>NULL</code></td><td>always <code>Float</code></td></tr>
+        <tr><td><code>MIN(e)</code> / <code>MAX(e)</code></td><td>ignores <code>NULL</code>s</td><td><code>NULL</code></td><td>type of <code>e</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <p>This is the largest executor milestone, but it decomposes cleanly: front-end first,
+  then joins, then aggregation, then sort. Each stage is independently testable, and nothing
+  here touches storage formats — the layers below you are stable. Expect the external sorter
+  to take as long as the other three stages combined; that is normal.</p>
+  <ol>
+    <li><strong>Grow the grammar: <code>JOIN … ON</code>.</strong> Extend the
+      <code>FROM</code>-clause parser so a table reference is a base table (with optional
+      alias) followed by zero or more join clauses, folded left-associatively into nested
+      <code>TableRef::Join</code> values. <code>CROSS JOIN</code> takes no <code>ON</code>;
+      plain <code>JOIN</code> requires one. A comma-separated <code>FROM</code> list stays
+      as multiple entries in <code>Select::from</code> — the binder treats those as an
+      implicit cross-join chain (course choice). Check yourself in the REPL with
+      <code>.ast SELECT * FROM a JOIN b ON a.x = b.y JOIN c ON b.z = c.z</code>: the tree
+      should nest to the left.</li>
+    <li><strong>Grow the grammar: <code>GROUP BY</code> and aggregate calls.</strong>
+      <code>GROUP BY</code> parses a comma-separated expression list between
+      <code>WHERE</code> and <code>ORDER BY</code>. In the Pratt expression parser, an
+      identifier followed by <code>(</code> becomes <code>Expr::Function(name, args)</code>.
+      Represent <code>COUNT(*)</code> as a zero-argument <code>count</code> call — a course
+      choice, since the AST has no star expression.</li>
+    <li><strong>Bind joins.</strong> Walk the <code>TableRef</code> tree and build the
+      combined schema (left columns, then right). Resolve qualified names through the alias
+      or table name; reject unqualified names that match more than one column with
+      <code>Error::Bind</code>. Bind the <code>ON</code> expression against the combined
+      schema — after binding, column references are positional, so a right-side column’s
+      index is offset by the left child’s column count. Get this offset right once, here,
+      and the executors never think about names again.</li>
+    <li><strong>Bind aggregates.</strong> Recognize <code>count/sum/avg/min/max</code>
+      case-insensitively in <code>Expr::Function</code>. Enforce three rules: aggregates
+      cannot nest; aggregates may not appear in <code>WHERE</code> (that is what
+      <code>HAVING</code> would be for — FerricDB doesn’t have it); and every projection
+      expression must either be an aggregate or appear in <code>GROUP BY</code>. Emitting
+      clear <code>Error::Bind</code> messages now saves you slt-debugging later.</li>
+    <li><strong><code>NestedLoopJoin</code> executor.</strong> On <code>open()</code>, open
+      both children and materialize the inner (right) side into a <code>Vec</code> of rows —
+      the same trick PostgreSQL uses in its materialized nested loop, where the inner table
+      is scanned once and written to <code>work_mem</code> or a temporary
+      file<sup class="cite"><a href="#ref-2">2</a></sup> (materializing to memory is fine
+      here; the provided tests keep nested-loop inputs small). <code>next()</code> holds the
+      current outer row and an index into the inner vector; concatenate the two rows,
+      evaluate the predicate, and emit only when it is <em>true</em> — a <code>NULL</code>
+      predicate result drops the pair, exactly like <code>WHERE</code>.<sup class="cite"><a href="#ref-9">9</a></sup>
+      With <code>on: None</code> you have a cross join for free. This operator is your
+      correctness baseline: it must work for <em>any</em> predicate, e.g.
+      <code>ON a.lo &lt;= b.x AND b.x &lt; a.hi</code>.</li>
+    <li><strong><code>HashJoin</code> executor.</strong> Two phases, matching PostgreSQL’s
+      in-memory hash join: the build phase inserts every build-side tuple into the hash
+      table, then the probe phase streams the other side and compares each tuple against the
+      matching bucket.<sup class="cite"><a href="#ref-4">4</a></sup> Build on the
+      <em>right</em> child (course convention; Milestone 7’s optimizer learns to put the
+      smaller input there, which is what you want when loading a partition into
+      memory<sup class="cite"><a href="#ref-6">6</a></sup>):
+      <pre><code>-- build phase                                (interdb §3.5.3, CS186 note 9)
+for each build-side row:
+    k := evaluate right_keys
+    if any value in k is NULL: skip row        -- NULL never joins
+    table[hash(k)].push(row)
+
+-- probe phase
+for each probe-side row:
+    k := evaluate left_keys
+    if any value in k is NULL: skip row
+    for each build row in table[hash(k)] whose keys equal k:
+        emit left row ++ right row</code></pre>
+      Two Rust snags to anticipate. First, <code>Value</code> is not <code>Eq + Hash</code>
+      (it contains <code>f64</code>), so a <code>HashMap&lt;Vec&lt;Value&gt;, …&gt;</code>
+      won’t compile; one workable approach is to serialize the evaluated key tuple to bytes
+      and key the map on those — you have already skipped <code>NULL</code>s, and the
+      encodings of <code>Integer</code>/<code>Boolean</code>/<code>Text</code> are canonical
+      (if you allow <code>Float</code> keys, decide what to do about <code>0.0</code> vs
+      <code>-0.0</code> and write it down). Second, buckets must hold <em>lists</em> of rows:
+      duplicate keys are normal, and each probe row joins with every match.</li>
+    <li><strong>Hash aggregation.</strong> One executor handles both grouped and global
+      aggregation. Drain the child in <code>open()</code> into a map from group key (empty
+      key when <code>group_by</code> is empty) to one accumulator per <code>AggExpr</code> —
+      hashing groups equal keys together without any sort, which is exactly why databases
+      hash for <code>GROUP BY</code>.<sup class="cite"><a href="#ref-7">7</a></sup>
+      Accumulators are small state machines: <code>COUNT</code> keeps a count;
+      <code>SUM</code> a running total; <code>AVG</code> keeps <em>sum and count</em> and
+      divides only when emitting; <code>MIN</code>/<code>MAX</code> keep the best value via
+      <code>sql_cmp</code>. Feed an accumulator only non-null inputs
+      (<code>COUNT(*)</code> excepted) — aggregates ignore nulls.<sup class="cite"><a href="#ref-8">8</a></sup>
+      Then the empty-input rule: with <code>GROUP BY</code> and zero input rows, emit zero
+      groups; without <code>GROUP BY</code>, emit exactly one row — <code>COUNT</code> is
+      <code>0</code>, everything else is <code>NULL</code>.<sup class="cite"><a href="#ref-8">8</a></sup></li>
+    <li><strong><code>ExternalSorter</code>: run generation.</strong> Follow the CS186
+      structure: “pass 0” fills your entire memory budget with input, sorts it in place, and
+      writes one sorted run, giving ⌈N/B⌉ runs from N pages of input with a budget of B
+      pages.<sup class="cite"><a href="#ref-5">5</a></sup>
+      <pre><code>-- run generation ("pass 0"), B = memory_pages       (CS186 note 8)
+while input has rows:
+    read rows until the budget (B pages of tuple bytes) is full
+    sort them in memory
+    write the run to freshly allocated pages       -- the final partial run too!
+
+-- merge passes
+while more than one run remains:
+    take up to B-1 runs; open one cursor per run (1 page each)
+    repeatedly move the smallest head tuple to the output page
+    flush the output page as it fills              -- this is the B-th page</code></pre>
+      Account for the budget in <em>bytes of serialized tuples against B ×
+      PAGE_SIZE</em>, not in row counts — rows vary in width. For the run pages themselves,
+      you already own a fine format: a run is a chain of slotted pages
+      (<code>HeapPage</code>) allocated through the <code>PageStore</code>, so runs flow
+      through the buffer pool like any other page (PostgreSQL spills sort data to temporary
+      files instead;<sup class="cite"><a href="#ref-3">3</a></sup> using ordinary pages is a
+      course simplification — whether you reclaim them afterwards is up to you, the tests
+      don’t check). Sort with a comparator built from <code>sql_cmp</code>, the per-key
+      <code>desc</code> flags, and the NULL-sorts-last rule from the spec section — that
+      combination is total, so <code>sort_by</code> and <code>BinaryHeap</code> are both
+      happy.</li>
+    <li><strong><code>ExternalSorter</code>: k-way merge.</strong> Open a cursor per run,
+      each holding one page in memory; repeatedly emit the minimum (a
+      <code>BinaryHeap&lt;Reverse&lt;…&gt;&gt;</code> keyed by your comparator works well);
+      when a cursor exhausts its page, load that run’s next page.<sup class="cite"><a href="#ref-5">5</a></sup>
+      Merge at most B−1 runs at once — the last budget page is the output buffer — and if
+      pass 0 produced more runs than that, merge in multiple passes: total passes are
+      1 + ⌈log<sub>B−1</sub>⌈N/B⌉⌉ and total I/O is 2N × that,<sup class="cite"><a href="#ref-5">5</a></sup>
+      which the tiny-budget test will make you feel. Figure 3 walks through B = 4, N = 24.</li>
+    <li><strong>Wire it into the planner and <code>Sort</code> executor.</strong> Fold the
+      bound <code>FROM</code> tree into a left-deep join chain. For each <code>ON</code>
+      clause, split top-level <code>AND</code>s into conjuncts; if every conjunct is
+      <code>left-column = right-column</code> (one side each), plan a <code>HashJoin</code>
+      with the paired key lists; otherwise plan a <code>NestedLoopJoin</code> (equality
+      conjuncts can still become hash keys with the leftovers as a <code>Filter</code> on
+      top — a nice refinement, not required). Plan <code>Aggregate</code> whenever
+      <code>group_by</code> is non-empty or any aggregate appears in the projection. The
+      <code>Sort</code> executor buffers its child while the accumulated tuple bytes fit the
+      budget and sorts in memory; the moment the budget overflows, hand everything to
+      <code>ExternalSorter</code>. The provided tests compare both paths on the same input —
+      they must agree exactly. Finally, run the slt file (small <code>customer</code> and
+      <code>orders</code> tables, TPC-H-flavored queries) end to end.</li>
+  </ol>
+
+  <figure>
+    <svg viewBox="0 0 960 350" role="img">
+      <title>Hash join: a build phase inserts rows into a hash table keyed on the join column; a probe phase streams the other input; rows with NULL keys are skipped on both sides.</title>
+      <text x="125" y="34" text-anchor="middle" class="d-text">build side · orders (right)</text>
+      <rect x="20" y="46" width="210" height="192" rx="8" class="d-box"/>
+      <rect x="35" y="60" width="180" height="24" rx="4" class="d-box"/>
+      <text x="125" y="76" text-anchor="middle" class="d-mono-sm">o_custkey = 1 · row a</text>
+      <rect x="35" y="92" width="180" height="24" rx="4" class="d-box"/>
+      <text x="125" y="108" text-anchor="middle" class="d-mono-sm">o_custkey = 2 · row b</text>
+      <rect x="35" y="124" width="180" height="24" rx="4" class="d-box-warn"/>
+      <text x="125" y="140" text-anchor="middle" class="d-mono-sm">o_custkey = NULL · row c</text>
+      <rect x="35" y="156" width="180" height="24" rx="4" class="d-box"/>
+      <text x="125" y="172" text-anchor="middle" class="d-mono-sm">o_custkey = 1 · row d</text>
+      <rect x="35" y="188" width="180" height="24" rx="4" class="d-box"/>
+      <text x="125" y="204" text-anchor="middle" class="d-mono-sm">o_custkey = 3 · row e</text>
+
+      <text x="495" y="34" text-anchor="middle" class="d-text">hash table on key</text>
+      <rect x="375" y="46" width="240" height="150" rx="8" class="d-box-hl"/>
+      <text x="495" y="86" text-anchor="middle" class="d-mono">h(1) → [a, d]</text>
+      <text x="495" y="126" text-anchor="middle" class="d-mono">h(2) → [b]</text>
+      <text x="495" y="166" text-anchor="middle" class="d-mono">h(3) → [e]</text>
+
+      <text x="832" y="34" text-anchor="middle" class="d-text">probe side · customer (left)</text>
+      <rect x="725" y="46" width="215" height="128" rx="8" class="d-box"/>
+      <rect x="740" y="60" width="185" height="24" rx="4" class="d-box"/>
+      <text x="832" y="76" text-anchor="middle" class="d-mono-sm">c_custkey = 1 · row c1</text>
+      <rect x="740" y="92" width="185" height="24" rx="4" class="d-box-warn"/>
+      <text x="832" y="108" text-anchor="middle" class="d-mono-sm">c_custkey = NULL · row c2</text>
+      <rect x="740" y="124" width="185" height="24" rx="4" class="d-box"/>
+      <text x="832" y="140" text-anchor="middle" class="d-mono-sm">c_custkey = 3 · row c3</text>
+
+      <path d="M 230 110 H 375" class="d-line"/>
+      <path d="M 366 104 L 375 110 L 366 116" class="d-line"/>
+      <text x="300" y="100" text-anchor="middle" class="d-text-sm">① build: insert</text>
+      <path d="M 725 110 H 615" class="d-line"/>
+      <path d="M 624 104 L 615 110 L 624 116" class="d-line"/>
+      <text x="672" y="100" text-anchor="middle" class="d-text-sm">② probe</text>
+
+      <rect x="375" y="272" width="240" height="58" rx="8" class="d-box-good"/>
+      <text x="495" y="294" text-anchor="middle" class="d-text-sm">output</text>
+      <text x="495" y="316" text-anchor="middle" class="d-mono-sm">(c1,a) (c1,d) (c3,e)</text>
+      <path d="M 495 196 V 272" class="d-line"/>
+      <path d="M 489 263 L 495 272 L 501 263" class="d-line"/>
+
+      <rect x="20" y="272" width="210" height="58" rx="8" class="d-box-warn"/>
+      <text x="125" y="296" text-anchor="middle" class="d-text-sm">NULL keys skipped:</text>
+      <text x="125" y="316" text-anchor="middle" class="d-mono-sm">rows c, c2 → no output</text>
+      <path d="M 125 238 V 272" class="d-line" stroke-dasharray="4 3"/>
+    </svg>
+    <figcaption>Figure 2 — HashJoin on <code>c_custkey = o_custkey</code>. Build inserts
+    every non-null-keyed row into a bucketed map; probe streams the other side and emits one
+    output row per equal-key match. Rows c and c2 carry <code>NULL</code> keys and are
+    skipped on both sides — <code>NULL = NULL</code> is unknown, never
+    true.<sup class="cite"><a href="#ref-9">9</a></sup></figcaption>
+  </figure>
+
+  <figure>
+    <svg viewBox="0 0 960 400" role="img">
+      <title>External merge sort with a four-page budget over a 24-page input: pass 0 creates six sorted runs of four pages, pass 1 merges three runs at a time into two runs of twelve pages, pass 2 merges those into one sorted output.</title>
+      <rect x="330" y="14" width="300" height="42" rx="8" class="d-box"/>
+      <text x="480" y="40" text-anchor="middle" class="d-text">unsorted input · N = 24 pages</text>
+      <path d="M 480 56 V 96" class="d-line"/>
+      <path d="M 474 87 L 480 96 L 486 87" class="d-line"/>
+      <text x="40" y="90" class="d-text-sm">pass 0 · fill B = 4 pages, sort, spill → ⌈24/4⌉ = 6 runs</text>
+
+      <rect x="40"  y="100" width="130" height="36" rx="6" class="d-box-good"/>
+      <text x="105" y="123" text-anchor="middle" class="d-mono-sm">R1 · 4p</text>
+      <rect x="190" y="100" width="130" height="36" rx="6" class="d-box-good"/>
+      <text x="255" y="123" text-anchor="middle" class="d-mono-sm">R2 · 4p</text>
+      <rect x="340" y="100" width="130" height="36" rx="6" class="d-box-good"/>
+      <text x="405" y="123" text-anchor="middle" class="d-mono-sm">R3 · 4p</text>
+      <rect x="490" y="100" width="130" height="36" rx="6" class="d-box-good"/>
+      <text x="555" y="123" text-anchor="middle" class="d-mono-sm">R4 · 4p</text>
+      <rect x="640" y="100" width="130" height="36" rx="6" class="d-box-good"/>
+      <text x="705" y="123" text-anchor="middle" class="d-mono-sm">R5 · 4p</text>
+      <rect x="790" y="100" width="130" height="36" rx="6" class="d-box-good"/>
+      <text x="855" y="123" text-anchor="middle" class="d-mono-sm">R6 · 4p</text>
+
+      <text x="40" y="182" class="d-text-sm">pass 1 · merge B − 1 = 3 runs per group (1 page per cursor + 1 output page)</text>
+      <path d="M 105 136 V 168 H 275 V 200" class="d-line"/>
+      <path d="M 255 136 V 200" class="d-line"/>
+      <path d="M 405 136 V 168 H 275" class="d-line" fill="none"/>
+      <path d="M 555 136 V 168 H 685 V 200" class="d-line"/>
+      <path d="M 705 136 V 200" class="d-line"/>
+      <path d="M 855 136 V 168 H 685" class="d-line"/>
+      <rect x="150" y="200" width="250" height="36" rx="6" class="d-box-good"/>
+      <text x="275" y="223" text-anchor="middle" class="d-mono-sm">R7 · 12 pages (R1+R2+R3)</text>
+      <rect x="560" y="200" width="250" height="36" rx="6" class="d-box-good"/>
+      <text x="685" y="223" text-anchor="middle" class="d-mono-sm">R8 · 12 pages (R4+R5+R6)</text>
+
+      <text x="40" y="282" class="d-text-sm">pass 2 · merge the 2 remaining runs</text>
+      <path d="M 275 236 V 268 H 480 V 300" class="d-line"/>
+      <path d="M 685 236 V 268 H 480" class="d-line"/>
+      <path d="M 474 291 L 480 300 L 486 291" class="d-line"/>
+      <rect x="330" y="300" width="300" height="42" rx="8" class="d-box-hl"/>
+      <text x="480" y="326" text-anchor="middle" class="d-text">sorted output · 24 pages</text>
+      <text x="480" y="378" text-anchor="middle" class="d-text-sm">3 passes total = 1 + ⌈log₃ 6⌉ → 2 × 24 × 3 = 144 page reads + writes</text>
+    </svg>
+    <figcaption>Figure 3 — External merge sort with budget B = 4 pages over N = 24 pages of
+    input. Pass 0 produces ⌈N/B⌉ = 6 sorted runs; each merge pass combines B − 1 = 3 runs;
+    total passes 1 + ⌈log<sub>B−1</sub>⌈N/B⌉⌉ = 3, for 2N × 3 = 144 page
+    I/Os.<sup class="cite"><a href="#ref-5">5</a></sup></figcaption>
+  </figure>
+
+  <div class="callout tip">
+    <span class="callout-title">Optional stretch: merge join and spilling hash operators</span>
+    <p>With <code>ExternalSorter</code> done, a merge join is close: sort both inputs on the
+    join keys and advance two cursors. It handles only equi-joins,<sup class="cite"><a href="#ref-3">3</a></sup>
+    and duplicate keys force you to mark the inner position and backtrack to it for the next
+    outer row.<sup class="cite"><a href="#ref-6">6</a></sup> Similarly, a build side that
+    overflows the budget can be partitioned to temp pages and joined batch by batch — that
+    is Grace hash join,<sup class="cite"><a href="#ref-6">6</a></sup> and PostgreSQL’s
+    production variant (hybrid hash join with a skew batch) keeps the hottest keys in
+    memory.<sup class="cite"><a href="#ref-4">4</a></sup> Both are excellent extensions
+    after the milestone is green; neither is graded.</p>
+  </div>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <p>The starter workspace ships this milestone’s tests marked
+  <code>#[ignore = "milestone 6"]</code>, named with the <code>ms6_</code> prefix. The
+  <code>--include-ignored</code> flag runs them without disturbing the rest of the suite;
+  once the milestone is green you may delete the <code>#[ignore]</code> attributes so they
+  run in a plain <code>cargo test</code> from then on.</p>
+  <pre><code># all Milestone 6 unit/integration tests (joins, aggregation, sort)
+cargo test -p ferricdb-exec -- --include-ignored ms6_
+
+# end-to-end SQL: the sqllogictest harness picks up ms6_joins_agg_sort.slt
+cargo test -p ferricdb -- slt_all
+
+# regression: everything from earlier milestones must stay green
+cargo test --workspace</code></pre>
+  <p>What the <code>ms6_</code> group exercises, so you can build in the same order:</p>
+  <ul>
+    <li><strong>Join tests</strong> — nested-loop results for equi and non-equi predicates,
+        cross joins, hash-join agreement with nested-loop on the same input, duplicate join
+        keys fanning out, and <code>NULL</code>-keyed rows producing nothing.</li>
+    <li><strong>Aggregation tests</strong> — grouped and global aggregates, <code>NULL</code>
+        inputs being ignored, the zero-row global aggregate row, and <code>AVG</code>
+        precision on integer columns.</li>
+    <li><strong>Sort tests</strong> — the important one constructs an <code>ExecContext</code>
+        with an artificially tiny memory budget (a few pages) so even a modest input is
+        forced through run generation and a multi-pass merge, then asserts the spilled
+        result is byte-for-byte equal to the in-memory sort of the same input, including
+        <code>NULL</code> ordering and multi-key <code>DESC</code>.</li>
+    <li><strong><code>ms6_joins_agg_sort.slt</code></strong> — TPC-H-inspired mini queries
+        over small <code>customer</code>/<code>orders</code> tables: joins under filters,
+        <code>GROUP BY</code> with several aggregates, and <code>ORDER BY</code> over the
+        join, checked against expected output by the sqllogictest harness.</li>
+  </ul>
+  <p>Debugging tip: when an slt query disagrees, re-run its pieces in the REPL and shrink —
+  drop the <code>ORDER BY</code>, then the <code>GROUP BY</code>, then swap
+  <code>HashJoin</code> for <code>NestedLoopJoin</code> in your planner temporarily. The
+  nested-loop operator is deliberately simple so it can arbitrate.</p>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — NULL join keys “match” in your hash table</span>
+    <p><em>Why:</em> in SQL, <code>NULL = NULL</code> yields unknown — “it is not known
+    whether two unknown values are equal”<sup class="cite"><a href="#ref-9">9</a></sup> — but
+    a hash map you key on serialized values will happily equate two <code>NULL</code>
+    encodings. Build and probe must skip (or segregate) <code>NULL</code> keys explicitly.
+    <em>Symptom:</em> extra output rows pairing null-keyed rows with each other; the slt
+    queries over nullable columns fail while non-null fixtures pass, and hash-join results
+    disagree with nested-loop results on the same data.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — AVG on integers, computed as an integer</span>
+    <p><em>Why:</em> summing into an <code>i64</code> and dividing with integer division
+    truncates (<code>AVG</code> of 1 and 2 becomes 1); updating a running <code>f64</code>
+    mean row-by-row accumulates error instead. Keep <em>sum and count</em>, divide once at
+    emit time, and return the documented result type — <code>Float</code>, a course choice
+    where PostgreSQL returns <code>numeric</code> for integer
+    inputs.<sup class="cite"><a href="#ref-8">8</a></sup>
+    <em>Symptom:</em> off-by-a-fraction aggregate values; slt expected-output diffs on any
+    <code>AVG</code> over an integer column that doesn’t divide evenly.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — aggregates over zero rows</span>
+    <p><em>Why:</em> with no input and no <code>GROUP BY</code>, SQL still returns one row:
+    <code>COUNT</code> is <code>0</code>, while <code>SUM</code>/<code>AVG</code>/<code>MIN</code>/<code>MAX</code>
+    are <code>NULL</code> — “<code>sum</code> of no rows returns null, not zero as one might
+    expect.”<sup class="cite"><a href="#ref-8">8</a></sup> With <code>GROUP BY</code>, zero
+    input rows mean zero output groups. A map-based implementation naturally emits nothing
+    for an empty input — you must special-case the global aggregate.
+    <em>Symptom:</em> <code>SELECT COUNT(*) FROM empty_table</code> returns no rows instead
+    of <code>0</code>, or returns <code>SUM = 0</code> instead of <code>NULL</code>.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — the final run never gets spilled</span>
+    <p><em>Why:</em> run generation spills whenever the buffer fills, so the loop’s natural
+    shape leaves the last, partially-filled buffer in memory at end-of-input. Either spill it
+    as a (shorter) run like the others, or treat it as an in-memory run in the merge — but if
+    your merge phase only enumerates on-disk runs, those buffered rows silently vanish.
+    <em>Symptom:</em> sorted output is missing up to one budget’s worth of rows — always the
+    ones that would have formed the last run; row-count assertions fail under the tiny-budget
+    test but pass when everything fits in memory.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — budgeting in tuples instead of pages</span>
+    <p><em>Why:</em> the budget is <code>memory_pages</code> buffer <em>pages</em> — a byte
+    limit of B × <code>PAGE_SIZE</code> — because that is the unit the buffer pool actually
+    manages, and it is how the sort cost model counts (N and B are both in
+    pages).<sup class="cite"><a href="#ref-5">5</a></sup> “1,000 rows” is meaningless when a
+    <code>Text</code> column can be 3 bytes or 3&nbsp;KB wide. Track the serialized size of
+    what you hold. <em>Symptom:</em> memory use explodes on wide rows (or you spill absurdly
+    early on narrow ones), and the tiny-budget test produces a different number of runs than
+    the pass-count math predicts.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — join output schema: ordering and duplicate names</span>
+    <p><em>Why:</em> after binding, every column reference is a bare offset into the combined
+    row. If the binder assumes left-then-right but an executor concatenates right-then-left —
+    or forgets to add the left child’s column count to right-side offsets — every reference
+    to the right table reads the wrong slot. And both children may legitimately contain a
+    column named <code>id</code>; the combined schema keeps both, disambiguated only by
+    qualifier at bind time. <em>Symptom:</em> values from the wrong table in query results,
+    type errors deep in expression evaluation, or projections that “work” on
+    <code>SELECT *</code> but break the moment column order changes.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li><code>cargo test -p ferricdb-exec -- --include-ignored ms6_</code> passes — every
+        provided Milestone 6 test is green.</li>
+    <li><code>cargo test -p ferricdb -- slt_all</code> passes, including
+        <code>ms6_joins_agg_sort.slt</code> (TPC-H-inspired mini queries over the small
+        <code>customer</code>/<code>orders</code> tables).</li>
+    <li>The external-sort test passes under its artificially tiny memory budget, and its
+        output is exactly equal to the in-memory sort result on the same input.</li>
+    <li><code>NestedLoopJoin</code> produces correct results for non-equality
+        <code>ON</code> predicates and for cross joins; the planner routes pure equi-join
+        <code>ON</code> clauses to <code>HashJoin</code> and everything else to
+        <code>NestedLoopJoin</code>.</li>
+    <li>Aggregates ignore <code>NULL</code> inputs, <code>COUNT(*)</code> counts rows, and a
+        global aggregate over zero rows returns one row of <code>COUNT = 0</code> and
+        <code>NULL</code>s.<sup class="cite"><a href="#ref-8">8</a></sup></li>
+    <li><code>ExternalSorter</code> never holds more than <code>memory_pages</code> pages’
+        worth of tuple bytes, spills every run — including the final partial one — through
+        the <code>PageStore</code>, and merges at most B − 1 runs per pass.</li>
+    <li><code>cargo test --workspace</code> stays green: no regressions in Milestones 0–5.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="Comparisons with NULL yield unknown, not true — “it is not known whether two unknown values are equal” (PostgreSQL docs). A join emits a row only when the predicate is true, so NULL-keyed rows on either side can never match anything. Your build and probe phases must skip them; a naive serialized-bytes hash key would wrongly equate them.">
+    <legend class="quiz-q">customer has one row with c_custkey = NULL and orders has one row
+    with o_custkey = NULL. How many output rows do these two rows contribute to
+    customer JOIN orders ON c_custkey = o_custkey?</legend>
+    <label><input type="radio" name="ms6-q1"> One — the NULL keys pair up</label>
+    <label><input type="radio" name="ms6-q1" data-correct> Zero — NULL never equals NULL</label>
+    <label><input type="radio" name="ms6-q1"> Depends on which side is the build side</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="A global aggregate (no GROUP BY) always returns exactly one row. COUNT of no rows is 0; the other aggregates return NULL — the PostgreSQL docs call out that sum of no rows is null, not zero. With a GROUP BY, the same query would instead return zero rows, because there are zero groups.">
+    <legend class="quiz-q">SELECT COUNT(*), SUM(o_total) FROM orders WHERE 1 = 2 — what comes
+    back?</legend>
+    <label><input type="radio" name="ms6-q2"> Zero rows</label>
+    <label><input type="radio" name="ms6-q2"> One row: 0, 0</label>
+    <label><input type="radio" name="ms6-q2" data-correct> One row: 0, NULL</label>
+    <label><input type="radio" name="ms6-q2"> One row: NULL, NULL</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Pass 0 fills all B = 4 pages at a time, producing ⌈24/4⌉ = 6 sorted runs. Each merge pass combines up to B − 1 = 3 runs (one page per input cursor plus one output page): 6 runs → 2 runs → 1 run, i.e. 2 merge passes. Total passes = 1 + ⌈log₃ 6⌉ = 3, and total I/O = 2 × 24 × 3 = 144 page reads and writes (CS186 Note 8).">
+    <legend class="quiz-q">With a memory budget of 4 pages and a 24-page input, how many
+    passes does the external sort make in total (run generation included)?</legend>
+    <label><input type="radio" name="ms6-q3"> 2</label>
+    <label><input type="radio" name="ms6-q3" data-correct> 3</label>
+    <label><input type="radio" name="ms6-q3"> 4</label>
+    <label><input type="radio" name="ms6-q3"> 6</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Hironobu Suzuki, “The Internals of PostgreSQL”, Ch. 3 §3.5 “Join Operations”.
+            <a href="https://www.interdb.jp/pg/pgsql03/05.html" rel="external">https://www.interdb.jp/pg/pgsql03/05.html</a></li>
+        <li id="ref-2">Hironobu Suzuki, “The Internals of PostgreSQL”, §3.5.1 “Nested Loop Join”.
+            <a href="https://www.interdb.jp/pg/pgsql03/05/01.html" rel="external">https://www.interdb.jp/pg/pgsql03/05/01.html</a></li>
+        <li id="ref-3">Hironobu Suzuki, “The Internals of PostgreSQL”, §3.5.2 “Merge Join”.
+            <a href="https://www.interdb.jp/pg/pgsql03/05/02.html" rel="external">https://www.interdb.jp/pg/pgsql03/05/02.html</a></li>
+        <li id="ref-4">Hironobu Suzuki, “The Internals of PostgreSQL”, §3.5.3 “Hash Join”.
+            <a href="https://www.interdb.jp/pg/pgsql03/05/03.html" rel="external">https://www.interdb.jp/pg/pgsql03/05/03.html</a></li>
+        <li id="ref-5">Berkeley CS186 staff, “Note 8: Sorting”, CS186 Course Notes.
+            <a href="https://cs186berkeley.net/notes/note8/" rel="external">https://cs186berkeley.net/notes/note8/</a></li>
+        <li id="ref-6">Berkeley CS186 staff, “Note 9: Iterators and Joins”, CS186 Course Notes.
+            <a href="https://cs186berkeley.net/notes/note9/" rel="external">https://cs186berkeley.net/notes/note9/</a></li>
+        <li id="ref-7">Berkeley CS186 staff, “Note 7: Hashing”, CS186 Course Notes.
+            <a href="https://cs186berkeley.net/notes/note7/" rel="external">https://cs186berkeley.net/notes/note7/</a></li>
+        <li id="ref-8">PostgreSQL Global Development Group, “Aggregate Functions”, PostgreSQL Documentation.
+            <a href="https://www.postgresql.org/docs/current/functions-aggregate.html" rel="external">https://www.postgresql.org/docs/current/functions-aggregate.html</a></li>
+        <li id="ref-9">PostgreSQL Global Development Group, “Comparison Functions and Operators”, PostgreSQL Documentation.
+            <a href="https://www.postgresql.org/docs/current/functions-comparison.html" rel="external">https://www.postgresql.org/docs/current/functions-comparison.html</a></li>
+        <li id="ref-10">PostgreSQL Global Development Group, “Sorting Rows (ORDER BY)”, PostgreSQL Documentation.
+            <a href="https://www.postgresql.org/docs/current/queries-order.html" rel="external">https://www.postgresql.org/docs/current/queries-order.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>The rest of interdb §3.5 — how the planner chooses among the three join
+          algorithms and represents them as plan nodes; a preview of Milestone 7.
+          <a href="https://www.interdb.jp/pg/pgsql03/05.html">interdb.jp §3.5</a></li>
+      <li>CS186 Note 10 “Query Optimization” — cost-based join ordering, the reason your
+          planner’s hash-vs-nested-loop rule is only a placeholder.
+          <a href="https://cs186berkeley.net/notes/note10/">cs186berkeley.net/notes/note10</a></li>
+      <li><code>std::collections::BinaryHeap</code> — the k-way merge’s best friend; note
+          it is a max-heap, hence <code>Reverse</code>.
+          <a href="https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html">doc.rust-lang.org</a></li>
+    </ul>
+
+    <nav class="prevnext">
+      <a href="../../modules/m07-joins-sorting-aggregation/index.html"><span class="dir">← Previous</span> M07 · Joins, Sorting, Aggregation</a>
+      <a class="next" href="../../modules/m08-query-optimization/index.html"><span class="dir">Next →</span> M08 · Query Optimization</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "index"],
+    current: ["executor"],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

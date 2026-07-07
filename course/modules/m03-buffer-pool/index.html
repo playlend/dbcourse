@@ -1,0 +1,694 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M03 · The Buffer Pool — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M03 Buffer Pool</span>
+  </nav>
+  <span class="badge">Module 03</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M03 · The Buffer Pool</h1>
+  <p class="subtitle">Why a database manages its own memory instead of trusting the operating
+  system — and how frames, pins, and eviction policies turn a slow disk into a fast cache
+  without ever lying about durability.</p>
+
+  <noscript><p class="noscript-warn">The eviction simulator and self-check quizzes on this page
+  need JavaScript; all explanatory content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-why">Why not just use the OS page cache?</a></li>
+      <li><a href="#sec-anatomy">Anatomy: frames, page table, metadata</a></li>
+      <li><a href="#sec-pins">Pin counts and dirty pages</a></li>
+      <li><a href="#sec-postgres">How PostgreSQL structures its buffer manager</a></li>
+      <li><a href="#sec-policies">Replacement policies: LRU, CLOCK, LRU-K</a></li>
+      <li><a href="#sec-sim">The eviction simulator</a></li>
+      <li><a href="#sec-prefetch">Prefetching and scan protection</a></li>
+      <li><a href="#sec-latches">Latches vs locks</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <p>Module 2 left you with a <code>DiskManager</code> that reads and writes 8&nbsp;KB pages and a
+  heap file that calls it for every single tuple access. That design is correct and unusably slow:
+  every <code>get</code> is a disk round trip. The fix is the most classic idea in systems —
+  a cache — but a DBMS cache has obligations an ordinary cache does not. It must never evict a
+  page someone is actively using, it must remember which cached copies are newer than the disk,
+  and — once Milestone 9 arrives — it must refuse to write a page until the write-ahead log has
+  caught up. This module is about that cache: the <strong>buffer pool</strong>.</p>
+
+  <h2 id="sec-why">Why not just use the OS page cache?</h2>
+  <p>The operating system already caches file blocks in memory. It seems wasteful to build a
+  second cache above it — and yet essentially every serious DBMS does exactly that. The reasons,
+  laid out in Hellerstein, Stonebraker, and Hamilton's <em>Architecture of a Database System</em>,
+  come in two flavors: correctness and performance.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <h3>Correctness: the DBMS must control <em>when</em> writes happen</h3>
+  <p>OS file buffering silently postpones and reorders writes. For most programs that is a pure
+  win; for a database it breaks the ACID promise. Atomic recovery after a crash depends on
+  explicit control over the timing and ordering of disk writes: the write-ahead logging protocol
+  requires that log records reach the log device <em>before</em> the corresponding database pages
+  are written, and that a commit does not return to the user until its commit record is durably
+  on disk.<sup class="cite"><a href="#ref-3">3</a></sup> An OS that helpfully flushes a dirty data
+  page ahead of the log — or holds back the log flush a commit is waiting on — has quietly
+  destroyed recoverability. So the DBMS buffers pages itself and writes through to disk at
+  moments <em>it</em> chooses. You will feel this directly in Milestone 9, when the buffer pool
+  you build in Milestone 2 grows a hook that refuses to flush a dirty page until the WAL has
+  flushed past that page's LSN.</p>
+
+  <h3>Performance: the DBMS knows its own future</h3>
+  <p>The OS predicts access patterns from physical file contiguity: it reads ahead when you scan
+  a file front to back. A DBMS can do better, because the query plan <em>tells it the future</em>
+  — a B+Tree range scan will visit leaf pages that are logically adjacent but physically
+  scattered, and the executor knows which pages it will want before it wants them. DBMS-level
+  read-ahead can act on that knowledge; file-system read-ahead cannot see
+  it.<sup class="cite"><a href="#ref-3">3</a></sup> There is also the blunt cost of
+  <em>double buffering</em>: if the OS caches a block and the DBMS caches it again, the second
+  copy wastes memory and every read pays an extra memory-to-memory copy — a real bottleneck,
+  since a well-tuned DBMS is typically limited by memory bandwidth, not
+  disk.<sup class="cite"><a href="#ref-3">3</a></sup> Modern OSes provide direct-I/O hooks
+  (<code>O_DIRECT</code> and friends) precisely so databases can opt out of the file
+  cache.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <div class="callout note">
+    <span class="callout-title">FerricDB's position</span>
+    <p>FerricDB uses ordinary buffered file I/O for simplicity — a common choice for educational
+    systems, and in fact PostgreSQL itself relies on the OS cache alongside its own buffer
+    pool.<sup class="cite"><a href="#ref-4">4</a></sup> What matters for this course is the part
+    every DBMS must own regardless: pinning, dirty tracking, replacement, and (later) write
+    ordering against the log.</p>
+  </div>
+
+  <h2 id="sec-anatomy">Anatomy: frames, page table, metadata</h2>
+  <p>The buffer pool is an array of <strong>frames</strong>, each a region of memory exactly one
+  page in size. Pages are copied from disk into frames without any format change, manipulated in
+  place, and written back — the fixed frame size sidesteps external fragmentation
+  entirely.<sup class="cite"><a href="#ref-3">3</a></sup> The distinction between page and frame
+  is subtle but load-bearing: a <em>page</em> is 8&nbsp;KB of logical data that may live in
+  memory, on disk, or both; a <em>frame</em> is a physical slot that holds some page's bytes
+  right now.<sup class="cite"><a href="#ref-1">1</a></sup> Frame 3 might hold page 917 this
+  millisecond and page 12 the next.</p>
+
+  <p>Because tuples move between frames, nothing above the buffer pool may hold a raw pointer
+  into one. Instead, the pool keeps a <strong>page table</strong> — a hash map from page id to
+  frame — plus per-frame metadata: a <em>dirty bit</em> recording whether the in-memory copy has
+  changed since it was read, whatever bookkeeping the replacement policy needs, and a
+  <em>pin count</em>.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 920 360" role="img">
+      <title>The buffer pool: a page table mapping page ids to frames, an array of frames holding
+      pages with pin counts and dirty bits, and the disk below holding all pages.</title>
+      <!-- page table -->
+      <rect x="30" y="40" width="200" height="180" rx="8" class="d-box"/>
+      <text x="130" y="28" text-anchor="middle" class="d-text" font-weight="600">Page table</text>
+      <text x="60" y="70" class="d-mono">pg 12 → f0</text>
+      <text x="60" y="100" class="d-mono">pg 917 → f1</text>
+      <text x="60" y="130" class="d-mono">pg 3 → f2</text>
+      <text x="60" y="160" class="d-mono">pg 44 → f3</text>
+      <text x="60" y="195" class="d-text-sm">(hash map)</text>
+      <!-- frames -->
+      <text x="560" y="28" text-anchor="middle" class="d-text" font-weight="600">Frames (the pool)</text>
+      <g>
+        <rect x="320" y="45" width="120" height="70" rx="6" class="d-box"/>
+        <text x="380" y="72" text-anchor="middle" class="d-mono">f0: pg 12</text>
+        <text x="380" y="95" text-anchor="middle" class="d-mono-sm">pin 0 · clean</text>
+        <rect x="450" y="45" width="120" height="70" rx="6" class="d-box-hl"/>
+        <text x="510" y="72" text-anchor="middle" class="d-mono">f1: pg 917</text>
+        <text x="510" y="95" text-anchor="middle" class="d-mono-sm">pin 2 · dirty</text>
+        <rect x="580" y="45" width="120" height="70" rx="6" class="d-box"/>
+        <text x="640" y="72" text-anchor="middle" class="d-mono">f2: pg 3</text>
+        <text x="640" y="95" text-anchor="middle" class="d-mono-sm">pin 0 · dirty</text>
+        <rect x="710" y="45" width="120" height="70" rx="6" class="d-box"/>
+        <text x="770" y="72" text-anchor="middle" class="d-mono">f3: pg 44</text>
+        <text x="770" y="95" text-anchor="middle" class="d-mono-sm">pin 1 · clean</text>
+      </g>
+      <path d="M 230 90 H 300 V 80 H 320" class="d-line"/>
+      <text x="270" y="78" class="d-text-sm">lookup</text>
+      <!-- annotations -->
+      <text x="510" y="145" text-anchor="middle" class="d-text-sm">pin &gt; 0 ⇒ never evicted; dirty ⇒ must be written before frame reuse</text>
+      <!-- disk -->
+      <ellipse cx="560" cy="270" rx="260" ry="18" class="d-box"/>
+      <rect x="300" y="270" width="520" height="50" class="d-box"/>
+      <ellipse cx="560" cy="320" rx="260" ry="18" class="d-box"/>
+      <text x="560" y="302" text-anchor="middle" class="d-text">disk: pages 0 … N (the whole database)</text>
+      <path d="M 640 165 V 250" class="d-line"/>
+      <text x="712" y="205" class="d-text-sm">write-back if dirty (evict)</text>
+      <path d="M 480 250 V 165" class="d-line"/>
+      <text x="365" y="205" class="d-text-sm">read on miss (fetch)</text>
+    </svg>
+    <figcaption>Figure 1 — the buffer pool. The page table finds pages already in memory;
+    misses read from disk into a free or victim frame; dirty victims are written back first.</figcaption>
+  </figure>
+
+  <p>Every page request now takes one of two paths. On a <strong>hit</strong>, the page table
+  points at a frame, the pin count goes up, and the caller gets access at memory speed. On a
+  <strong>miss</strong>, the pool must find a frame: a free one if any exist, otherwise a
+  <em>victim</em> chosen by the replacement policy. If the victim is dirty it is written back to
+  disk first — losing that write would lose committed data — and then the requested page is read
+  into the frame and the page table is updated on both
+  sides.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-5">5</a></sup></p>
+
+  <h2 id="sec-pins">Pin counts and dirty pages</h2>
+  <p>The pin count is the buffer pool's contract with its callers. Before touching a page's
+  bytes, a worker increments the page's pin count; while the count is non-zero the page is
+  <em>pinned</em>: it will not be evicted, written out from under the caller, or have its frame
+  reused.<sup class="cite"><a href="#ref-3">3</a></sup> When the worker finishes, it unpins. The
+  intent is that only a tiny fraction of the pool is pinned at any moment — a pinned page is a
+  page the replacement policy cannot touch, so leaked pins slowly strangle the
+  cache.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <p>In Rust, this contract has a beautiful spelling: <em>RAII</em>. FerricDB's
+  <code>fetch_page</code> returns a <code>PageGuard</code> that increments the pin count on
+  creation and decrements it on <code>Drop</code>. A leaked pin becomes a borrow you can grep
+  for, not a heisenbug. The guard also owns dirty tracking: getting mutable access through
+  <code>DerefMut</code> marks the frame dirty, so "I changed this page" can never be forgotten
+  separately from "I touched this page".</p>
+
+  <div class="callout pitfall">
+    <span class="callout-title">The unpin-too-early bug</span>
+    <p>The classic buffer pool bug is unpinning a page and continuing to use a reference into
+    its frame. In C++ this corrupts data at a distance when the frame is recycled; BusTub's
+    Project 1 dedicates a task to guard classes for exactly this reason.<sup class="cite"><a href="#ref-1">1</a></sup>
+    In FerricDB the borrow checker makes the bug unrepresentable — the reference's lifetime is
+    tied to the guard — which is a good moment to appreciate what the type system is doing for
+    you.</p>
+  </div>
+
+  <h2 id="sec-postgres">How PostgreSQL structures its buffer manager</h2>
+  <p>PostgreSQL's buffer manager is the same idea at production scale, split into three layers
+  that are worth knowing by name because you will meet them again in every systems
+  paper.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+
+  <div class="tabs">
+    <div class="tab-list" role="tablist">
+      <button role="tab" aria-selected="true">PostgreSQL</button>
+      <button role="tab" aria-selected="false">FerricDB (yours)</button>
+    </div>
+    <div class="tab-panel">
+      <ul>
+        <li><strong>Buffer table</strong> — a hash table mapping a <em>buffer tag</em> (which
+          page of which relation) to a <code>buffer_id</code>. This is the page table.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+        <li><strong>Buffer descriptors</strong> — an array of per-frame metadata. Each descriptor
+          packs three variables into one atomic 32-bit <code>state</code> field: flags (10 bits),
+          a <code>usage_count</code> (4 bits) for the replacement policy, and a
+          <code>refcount</code> (18 bits) — Postgres's pin count.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+        <li><strong>Buffer pool</strong> — a plain array of 8&nbsp;KB slots, one per descriptor,
+          holding the page bytes themselves.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+      </ul>
+      <p>Accessing a cached page means: hash the tag, take the mapping lock partition, find the
+      <code>buffer_id</code>, pin the descriptor (refcount and usage_count both increment), release
+      the mapping lock, and use the slot.<sup class="cite"><a href="#ref-5">5</a></sup></p>
+    </div>
+    <div class="tab-panel" hidden>
+      <ul>
+        <li><strong><code>HashMap&lt;PageId, FrameId&gt;</code></strong> — the page table, one map
+          instead of a partitioned hash table (single-file databases don't need relation-qualified
+          tags).</li>
+        <li><strong>Frame metadata</strong> — pin count, dirty bit, and replacer state kept as
+          ordinary struct fields behind a latch, not packed atomics. Same information, less
+          contention engineering.</li>
+        <li><strong><code>Box&lt;[Page]&gt;</code></strong> — the frames.</li>
+      </ul>
+      <p>The one-latch-for-the-whole-pool design is deliberately simple; the Milestone 2 stress
+      test only demands correctness under concurrency, not Postgres-grade scalability. The
+      pitfalls section of the milestone discusses where the single latch hurts and what
+      partitioning would buy.</p>
+    </div>
+  </div>
+
+  <h2 id="sec-policies">Replacement policies: LRU, CLOCK, LRU-K</h2>
+  <p>When every frame is full and none are free, someone has to go. The replacement policy
+  chooses — and the choice matters enormously, because a policy that evicts a page the workload
+  is about to re-read converts memory-speed hits back into disk-speed misses.</p>
+
+  <h3>LRU — and why databases don't trust it</h3>
+  <p>Least-Recently-Used evicts the page whose last access is oldest, betting that the recent
+  past predicts the near future. For many workloads it is a fine bet. Databases, however,
+  routinely run its worst case: the <strong>sequential flood</strong>. A full-table scan touches
+  every page exactly once, in order, and never again — yet under LRU each freshly scanned page
+  is the <em>most</em> recently used, so the scan systematically evicts the genuinely hot pages
+  and fills the pool with pages nobody will re-read.<sup class="cite"><a href="#ref-2">2</a></sup>
+  Cycle over a table even one page larger than the pool and LRU's hit rate drops to exactly
+  zero — the simulator below will show you.</p>
+
+  <h3>CLOCK — LRU's cheap, good-enough cousin</h3>
+  <p>Maintaining a strict LRU ordering costs a list update on <em>every</em> access. CLOCK
+  (second-chance) approximates it with one bit per frame: each frame has a <em>reference bit</em>
+  set whenever the frame is used. A conceptual hand sweeps the frames in a circle; to evict, it
+  examines the frame under the hand — if the reference bit is set, it clears the bit and moves
+  on (the second chance); if the bit is clear, that frame is the victim.<sup class="cite"><a href="#ref-2">2</a></sup>
+  Recently touched frames survive one sweep; untouched frames don't survive two. PostgreSQL
+  ships a refinement called <strong>clock sweep</strong>: instead of one bit, each descriptor's
+  <code>usage_count</code> is incremented on access (capped at 5); the hand
+  (<code>nextVictimBuffer</code>) decrements the count as it passes and takes the first unpinned
+  descriptor whose count is zero.<sup class="cite"><a href="#ref-4">4</a></sup><sup class="cite"><a href="#ref-5">5</a></sup>
+  It's CLOCK with five lives instead of two. FerricDB's Milestone 2 asks for classic one-bit
+  CLOCK.</p>
+
+  <h3>LRU-K — looking at the k-th-last access</h3>
+  <p>LRU's real flaw is that a single recent access says almost nothing about <em>frequency</em>.
+  LRU-K fixes this by remembering each frame's last K access times and ranking frames by
+  <strong>backward k-distance</strong>: the time since the k-th most recent access. The evicted
+  frame is the one with the <em>largest</em> backward k-distance; a frame with fewer than K
+  recorded accesses has infinite distance and is evicted first, with ties among the infinities
+  broken by evicting the frame whose oldest recorded access is the least
+  recent.<sup class="cite"><a href="#ref-2">2</a></sup> With K=2, a page touched once by a
+  passing scan has infinite 2-distance and leaves immediately, while a page accessed steadily
+  keeps a short 2-distance and stays — scan resistance falls out of the definition. The cost is
+  bookkeeping: K timestamps per frame and a smarter victim search. Milestone 2 offers LRU-2 as
+  its stretch goal.</p>
+
+  <p>A worked example, with accesses at times shown and K=2, pool asking "who goes?" at
+  t=10:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Frame</th><th>Access history</th><th>2nd-most-recent access</th>
+        <th>Backward 2-distance at t=10</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td>A</td><td>t=1, t=9</td><td>t=1</td><td>10 − 1 = 9</td><td>candidate</td></tr>
+        <tr><td>B</td><td>t=6, t=8</td><td>t=6</td><td>10 − 6 = 4</td><td>safe</td></tr>
+        <tr><td>C</td><td>t=7</td><td>—</td><td>+∞ (only one access)</td>
+          <td class="muted"><strong>evicted</strong></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>C is the scan-like page — touched once, never again — and LRU-K shows it the door even
+  though its single access is <em>more recent</em> than A's pair. Plain LRU would have evicted A,
+  the steady customer.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <h2 id="sec-sim">The eviction simulator</h2>
+  <p>Watch the three policies make different choices on the same workload. Four frames; the
+  request strip shows which page each step asks for. <em>Hot pages</em> keeps pages 1–2 popular;
+  <em>sequential flood</em> cycles pages 1–5 through a 4-frame pool — LRU's zero-hit worst case;
+  <em>scan with hot page</em> interleaves a one-off scan with a page the workload keeps
+  re-reading.</p>
+
+  <div class="widget" id="bp-sim">
+    <p class="widget-title">Buffer pool eviction simulator</p>
+    <p class="widget-sub">Pick a policy and a workload, then step through requests. Frames show
+    their policy metadata; the caption explains each decision.</p>
+    <div class="controls">
+      <label for="bp-policy">Policy</label>
+      <select id="bp-policy">
+        <option value="clock" selected>CLOCK</option>
+        <option value="lru">LRU</option>
+        <option value="lru2">LRU-2</option>
+      </select>
+      <label for="bp-workload">Workload</label>
+      <select id="bp-workload">
+        <option value="hot" selected>Hot pages</option>
+        <option value="flood">Sequential flood</option>
+        <option value="scan">Scan with hot page</option>
+      </select>
+      <button class="btn primary" type="button" id="bp-step">Next request</button>
+      <button class="btn" type="button" id="bp-run">Run to end</button>
+      <button class="btn" type="button" id="bp-reset">↺ Reset</button>
+    </div>
+    <div id="bp-strip" class="stat-row"></div>
+    <div id="bp-canvas"></div>
+    <div class="stat-row">
+      <span class="stat">hits <b id="bp-hits">0</b></span>
+      <span class="stat">misses <b id="bp-misses">0</b></span>
+      <span class="stat">hit rate <b id="bp-rate">–</b></span>
+    </div>
+    <div class="stepper-caption" id="bp-caption" role="status">Press “Next request” to begin.</div>
+    <div class="log" id="bp-scoreboard">scoreboard: run a policy to the end to record its hit rate here.</div>
+  </div>
+
+  <p>Two things to notice. First, on <em>sequential flood</em>, LRU scores zero after the pool
+  warms — every request evicts exactly the page that will be needed four steps from now. CLOCK
+  does no better on a pure cycle, which is honest: CLOCK approximates LRU, worst case included.
+  LRU-2 also struggles on a pure cycle (nothing is ever re-referenced within the window), which
+  is why real systems pair a policy with <em>scan protection</em> — see below. Second, on
+  <em>scan with hot page</em>, LRU-2 visibly protects the hot page where LRU dumps it: the
+  frequency signal in the second timestamp is doing its job.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <h2 id="sec-prefetch">Prefetching and scan protection</h2>
+  <p>Replacement is the defensive half of buffer management; the offensive half is
+  <strong>prefetching</strong>. Because the executor knows its plan, it can issue reads before it
+  needs the bytes — including <em>logical</em> read-ahead along a B+Tree leaf chain whose pages
+  are physically scattered, something no file system can infer.<sup class="cite"><a href="#ref-3">3</a></sup>
+  BusTub's Project 1 makes the same point structurally: its buffer pool routes I/O through a
+  <em>disk scheduler</em> that accepts asynchronous requests, so fetches can be batched, reordered,
+  and overlapped.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>And for the sequential flood specifically, PostgreSQL doesn't ask the policy to cope alone:
+  large sequential scans read through a small <strong>ring buffer</strong> (a few hundred KB)
+  instead of the main pool, so a giant scan recycles its own frames and leaves the hot working
+  set untouched.<sup class="cite"><a href="#ref-5">5</a></sup> Keep that trick in mind for
+  Milestone 6, when your external sort starts streaming runs through the pool.</p>
+
+  <h2 id="sec-latches">Latches vs locks</h2>
+  <p>One piece of vocabulary before the milestone, because the database literature is stubborn
+  about it: a <strong>latch</strong> is the low-level mutex protecting an in-memory structure
+  (a frame, the page table) for microseconds; a <strong>lock</strong> is the transactional
+  concept — held for a transaction's lifetime, subject to deadlock detection, about logical
+  database content rather than memory.<sup class="cite"><a href="#ref-1">1</a></sup> Postgres's
+  buffer manager takes <em>latches</em> (its light-weight locks) on the buffer table partitions
+  and descriptor content while a query holds <em>locks</em> on tables and
+  rows.<sup class="cite"><a href="#ref-4">4</a></sup> In Rust terms: <code>Mutex</code> and
+  <code>RwLock</code> are latches. Locks arrive in Module 9 and want an entirely different
+  machine. When Milestone 2's pitfalls warn about "latch ordering", they mean your mutexes, not
+  transactions.</p>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="The WAL protocol requires log records to reach disk before the data pages they describe, and commits to wait for durable commit records. OS buffering silently reorders and postpones writes, so the DBMS cannot keep either promise without controlling write timing itself.">
+    <legend class="quiz-q">Which failure does OS write buffering directly threaten?</legend>
+    <label><input type="radio" name="q1"> Slow queries, because the OS cache is smaller than the buffer pool</label>
+    <label><input type="radio" name="q1" data-correct> Broken crash recovery, because the write-ahead-log ordering can no longer be guaranteed</label>
+    <label><input type="radio" name="q1"> Deadlocks between the OS and the DBMS lock tables</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="A page is logical content that can be in memory, on disk, or both; a frame is the physical memory slot currently holding some page's bytes. The page table maps page ids to frames precisely because the association changes constantly.">
+    <legend class="quiz-q">Page vs frame — which statement is right?</legend>
+    <label><input type="radio" name="q2"> They are synonyms; Postgres says page, CMU says frame</label>
+    <label><input type="radio" name="q2"> A frame is the on-disk copy of a page</label>
+    <label><input type="radio" name="q2" data-correct> A page is logical data; a frame is a fixed memory slot that holds some page's bytes right now</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="With fewer than K recorded accesses, the backward k-distance is defined as infinite, so such frames are evicted first — ties broken by the oldest overall access. That rule is what makes one-touch scan pages leave before steadily re-used pages.">
+    <legend class="quiz-q">Under LRU-2, a frame has been accessed exactly once. What is its backward 2-distance?</legend>
+    <label><input type="radio" name="q3"> The time since that single access</label>
+    <label><input type="radio" name="q3" data-correct> Infinite — frames with fewer than 2 accesses are preferred victims</label>
+    <label><input type="radio" name="q3"> Zero — it was just loaded</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="The hand clears set reference bits as it sweeps (the second chance) and evicts at the first frame whose bit is already clear. Pinned frames are skipped entirely — pin counts outrank every policy.">
+    <legend class="quiz-q">CLOCK's hand reaches a frame with reference bit = 1. What happens?</legend>
+    <label><input type="radio" name="q4"> The frame is evicted — 1 means least recently used</label>
+    <label><input type="radio" name="q4" data-correct> The bit is cleared and the hand moves on; the frame survives until the next sweep</label>
+    <label><input type="radio" name="q4"> The hand stops and waits for the frame to be unpinned</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">CMU 15-445/645 (Fall 2025), Project #1: Buffer Pool Manager — frames vs
+          8&nbsp;KB pages, pin/eviction semantics, guard classes, and the disk scheduler.
+          <a href="https://15445.courses.cs.cmu.edu/fall2025/project1/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project1/</a></li>
+        <li id="ref-2">CMU 15-445/645 (Fall 2024), Project #1: LRU-K Replacement Policy — the
+          backward k-distance definition, infinite distance for under-observed frames, and
+          tie-breaking.
+          <a href="https://15445.courses.cs.cmu.edu/fall2024/project1/" rel="external">https://15445.courses.cs.cmu.edu/fall2024/project1/</a></li>
+        <li id="ref-3">Hellerstein, Stonebraker, Hamilton, "Architecture of a Database System",
+          Foundations and Trends in Databases 1(2), 2007 — §5.2 Temporal Control: Buffering and
+          §5.3 Buffer Management.
+          <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf" rel="external">https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf</a></li>
+        <li id="ref-4">Hironobu Suzuki, The Internals of PostgreSQL, §8.2 Buffer Manager
+          Structure — buffer table, descriptors (state = flags/usage_count/refcount), and the
+          8&nbsp;KB slot pool.
+          <a href="https://www.interdb.jp/pg/pgsql08/02.html" rel="external">https://www.interdb.jp/pg/pgsql08/02.html</a></li>
+        <li id="ref-5">Hironobu Suzuki, The Internals of PostgreSQL, §8.4 Buffer Management
+          Mechanisms — page access protocol, the clock-sweep algorithm and nextVictimBuffer, and
+          ring buffers for large scans.
+          <a href="https://www.interdb.jp/pg/pgsql08/04.html" rel="external">https://www.interdb.jp/pg/pgsql08/04.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>CMU 15-445 Fall 2025 asks students to implement <em>ARC</em>, an adaptive policy from
+        IBM research that balances recency and frequency automatically — a satisfying read after
+        LRU-K. <a href="https://15445.courses.cs.cmu.edu/fall2025/project1/" rel="external">15445.courses.cs.cmu.edu/fall2025/project1/</a></li>
+      <li>The Internals of PostgreSQL, §8.3 — how Postgres partitions its buffer-table lock to
+        keep the page table from becoming the bottleneck your single-latch pool will have.
+        <a href="https://www.interdb.jp/pg/pgsql08/03.html" rel="external">interdb.jp/pg/pgsql08/03.html</a></li>
+      <li>Architecture of a Database System, §5.1 — spatial control: why databases care where on
+        disk pages land, the other half of the storage story.
+        <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf" rel="external">dsf.berkeley.edu/papers/fntdb07-architecture.pdf</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>What to build now: <a href="../../project/milestone-02/index.html">Milestone 2 — Buffer
+    Pool Manager</a>. You will implement the page table, pin-counting page guards, CLOCK
+    eviction (LRU-2 as stretch), and route every page access in FerricDB through the pool —
+    permanently.</p>
+
+    <nav class="prevnext">
+      <a href="../../project/milestone-01/index.html"><span class="dir">← Previous</span> Milestone 1 · Pages, Tuples, Heap Storage</a>
+      <a class="next" href="../../project/milestone-02/index.html"><span class="dir">Next →</span> Milestone 2 · Buffer Pool Manager</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+
+  var FRAMES = 4;
+  var WORKLOADS = {
+    hot:   [1, 2, 1, 3, 1, 2, 4, 1, 2, 5, 1, 2, 3, 1, 2, 6, 1, 2, 4, 1],
+    flood: [1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5, 1, 2, 3, 4, 5],
+    scan:  [1, 9, 1, 8, 1, 7, 1, 6, 1, 5, 1, 4, 1, 9, 1, 8, 1, 7, 1, 6]
+  };
+
+  var policySel = document.getElementById("bp-policy");
+  var workloadSel = document.getElementById("bp-workload");
+  var stepBtn = document.getElementById("bp-step");
+  var runBtn = document.getElementById("bp-run");
+  var resetBtn = document.getElementById("bp-reset");
+  var strip = document.getElementById("bp-strip");
+  var canvas = document.getElementById("bp-canvas");
+  var caption = document.getElementById("bp-caption");
+  var hitsEl = document.getElementById("bp-hits");
+  var missesEl = document.getElementById("bp-misses");
+  var rateEl = document.getElementById("bp-rate");
+  var board = document.getElementById("bp-scoreboard");
+
+  var st;            // simulator state
+  var scores = {};   // "policy/workload" -> hit rate string
+
+  function freshState() {
+    return {
+      time: 0, pos: 0, hits: 0, misses: 0,
+      // frames: {page, ref (clock bit), hist (access times, newest first)}
+      frames: [null, null, null, null],
+      hand: 0,
+      lastEvent: null // {frame, kind: "hit"|"load"|"evict", victimPage}
+    };
+  }
+
+  function policyName() {
+    return policySel.value === "clock" ? "CLOCK" :
+           policySel.value === "lru" ? "LRU" : "LRU-2";
+  }
+
+  // choose a victim frame index; every frame is full when called
+  function chooseVictim() {
+    var i, f;
+    if (policySel.value === "lru") {
+      var oldest = -1, oldestT = Infinity;
+      for (i = 0; i < FRAMES; i++) {
+        f = st.frames[i];
+        if (f.hist[0] < oldestT) { oldestT = f.hist[0]; oldest = i; }
+      }
+      return { idx: oldest, why: "LRU: frame " + oldest + " (page " +
+        st.frames[oldest].page + ") has the oldest last access (t=" + oldestT + ")." };
+    }
+    if (policySel.value === "clock") {
+      var sweeps = [];
+      while (true) {
+        f = st.frames[st.hand];
+        if (f.ref) {
+          sweeps.push("f" + st.hand + " bit 1→0");
+          f.ref = 0;
+          st.hand = (st.hand + 1) % FRAMES;
+        } else {
+          var idx = st.hand;
+          st.hand = (st.hand + 1) % FRAMES;
+          return { idx: idx, why: "CLOCK: " + (sweeps.length ?
+            "hand cleared " + sweeps.join(", ") + "; then " : "") +
+            "frame " + idx + " (page " + st.frames[idx].page + ") had bit 0 — evicted." };
+        }
+      }
+    }
+    // LRU-2: max backward 2-distance; <2 accesses => infinite,
+    // ties among infinite broken by earliest (oldest) single access
+    var best = -1, bestKey = null;
+    for (i = 0; i < FRAMES; i++) {
+      f = st.frames[i];
+      var infinite = f.hist.length < 2;
+      var dist = infinite ? Infinity : (st.time - f.hist[1]);
+      var tie = infinite ? f.hist[0] : 0;
+      // prefer: infinite over finite; among infinite, smaller (older) first access;
+      // among finite, larger distance
+      var key = infinite ? [1, -tie] : [0, dist];
+      if (best === -1 ||
+          key[0] > bestKey[0] ||
+          (key[0] === bestKey[0] && key[1] > bestKey[1])) {
+        best = i; bestKey = key;
+      }
+    }
+    var bf = st.frames[best];
+    return { idx: best, why: "LRU-2: frame " + best + " (page " + bf.page + ") has " +
+      (bf.hist.length < 2 ? "only one recorded access — backward 2-distance ∞." :
+       "the largest backward 2-distance (" + (st.time - bf.hist[1]) + ").") };
+  }
+
+  function step() {
+    var seq = WORKLOADS[workloadSel.value];
+    if (st.pos >= seq.length) return false;
+    var page = seq[st.pos];
+    st.pos += 1;
+    st.time += 1;
+    var i, msg;
+    // hit?
+    var hitIdx = -1;
+    for (i = 0; i < FRAMES; i++) {
+      if (st.frames[i] && st.frames[i].page === page) { hitIdx = i; break; }
+    }
+    if (hitIdx >= 0) {
+      var f = st.frames[hitIdx];
+      f.ref = 1;
+      f.hist.unshift(st.time);
+      if (f.hist.length > 2) f.hist.length = 2;
+      st.hits += 1;
+      st.lastEvent = { frame: hitIdx, kind: "hit" };
+      msg = "t=" + st.time + ": page " + page + " → HIT in frame " + hitIdx + ".";
+    } else {
+      st.misses += 1;
+      var free = -1;
+      for (i = 0; i < FRAMES; i++) if (!st.frames[i]) { free = i; break; }
+      if (free >= 0) {
+        st.frames[free] = { page: page, ref: 1, hist: [st.time] };
+        st.lastEvent = { frame: free, kind: "load" };
+        msg = "t=" + st.time + ": page " + page + " → MISS; loaded into free frame " + free + ".";
+      } else {
+        var v = chooseVictim();
+        var victimPage = st.frames[v.idx].page;
+        st.frames[v.idx] = { page: page, ref: 1, hist: [st.time] };
+        st.lastEvent = { frame: v.idx, kind: "evict", victimPage: victimPage };
+        msg = "t=" + st.time + ": page " + page + " → MISS. " + v.why +
+              " Page " + victimPage + " evicted; page " + page + " loaded.";
+      }
+    }
+    caption.textContent = msg;
+    render();
+    return true;
+  }
+
+  function render() {
+    var seq = WORKLOADS[workloadSel.value];
+    // request strip
+    strip.textContent = "";
+    var lbl = Course.el("span", { "class": "stat" }, "requests: ");
+    strip.appendChild(lbl);
+    seq.forEach(function (p, i) {
+      var s = Course.el("span", null, String(p));
+      s.style.padding = "0 0.25rem";
+      s.style.fontFamily = "var(--mono)";
+      if (i < st.pos) s.style.opacity = "0.35";
+      if (i === st.pos - 1) {
+        s.style.opacity = "1";
+        s.style.fontWeight = "700";
+        s.style.textDecoration = "underline";
+      }
+      strip.appendChild(s);
+    });
+
+    // frames
+    canvas.textContent = "";
+    var svg = Course.svgEl("svg", { viewBox: "0 0 760 150", role: "img" });
+    svg.appendChild(Course.svgEl("title", null,
+      "Buffer pool frames with per-frame policy metadata."));
+    for (var i = 0; i < FRAMES; i++) {
+      var x = 20 + i * 185;
+      var f = st.frames[i];
+      var cls = "d-box";
+      if (st.lastEvent && st.lastEvent.frame === i) {
+        cls = st.lastEvent.kind === "hit" ? "d-box-good" :
+              st.lastEvent.kind === "evict" ? "d-box-bad" : "d-box-hl";
+      }
+      svg.appendChild(Course.svgEl("rect",
+        { x: x, y: 20, width: 165, height: 84, rx: 8, "class": cls }));
+      svg.appendChild(Course.svgEl("text",
+        { x: x + 82, y: 48, "text-anchor": "middle", "class": "d-text",
+          "font-weight": "600" },
+        f ? "frame " + i + " · page " + f.page : "frame " + i + " · empty"));
+      var meta = "";
+      if (f) {
+        if (policySel.value === "clock") meta = "ref bit " + f.ref;
+        else if (policySel.value === "lru") meta = "last access t=" + f.hist[0];
+        else meta = "hist [" + f.hist.slice().reverse().map(function (t) {
+          return "t" + t; }).join(", ") + "]";
+      }
+      svg.appendChild(Course.svgEl("text",
+        { x: x + 82, y: 72, "text-anchor": "middle", "class": "d-mono-sm" }, meta));
+      if (st.lastEvent && st.lastEvent.frame === i && st.lastEvent.kind === "evict") {
+        svg.appendChild(Course.svgEl("text",
+          { x: x + 82, y: 94, "text-anchor": "middle", "class": "d-text-sm" },
+          "evicted page " + st.lastEvent.victimPage));
+      }
+      // clock hand
+      if (policySel.value === "clock" && st.hand === i) {
+        svg.appendChild(Course.svgEl("path",
+          { d: "M " + (x + 72) + " 132 L " + (x + 92) + " 132 L " + (x + 82) + " 112 Z",
+            "class": "d-line-hl" }));
+        svg.appendChild(Course.svgEl("text",
+          { x: x + 82, y: 147, "text-anchor": "middle", "class": "d-text-sm" }, "hand"));
+      }
+    }
+    canvas.appendChild(svg);
+
+    hitsEl.textContent = String(st.hits);
+    missesEl.textContent = String(st.misses);
+    var total = st.hits + st.misses;
+    rateEl.textContent = total ? Math.round(100 * st.hits / total) + "%" : "–";
+
+    var done = st.pos >= seq.length;
+    stepBtn.disabled = done;
+    runBtn.disabled = done;
+    if (done && total) {
+      scores[policyName() + " / " + workloadSel.options[workloadSel.selectedIndex].text] =
+        st.hits + "/" + total + " (" + Math.round(100 * st.hits / total) + "%)";
+      var lines = ["scoreboard (completed runs):"];
+      for (var k in scores) lines.push("  " + k + ": " + scores[k]);
+      board.textContent = lines.join("\n");
+    }
+  }
+
+  function reset() {
+    st = freshState();
+    caption.textContent = "Press “Next request” to begin.";
+    render();
+  }
+
+  stepBtn.addEventListener("click", step);
+  runBtn.addEventListener("click", function () { while (step()) { /* run out */ } });
+  resetBtn.addEventListener("click", reset);
+  policySel.addEventListener("change", reset);
+  workloadSel.addEventListener("change", reset);
+  reset();
+});
+</script>
+</body>
+</html>

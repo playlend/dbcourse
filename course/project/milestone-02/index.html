@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 2 · Buffer Pool Manager — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 2</span>
+  </nav>
+  <span class="badge milestone">Milestone 2</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 2 · Buffer Pool Manager</h1>
+  <p class="subtitle">Put a cache in front of the disk: fixed frames, a page table, RAII pin
+  guards, CLOCK eviction — and from this milestone on, every page in FerricDB flows through it.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <p>Milestone 1 gave FerricDB correct storage with the performance profile of a filing cabinet:
+  one disk round trip per page touch. This milestone builds the layer that makes the next eight
+  milestones fast enough to enjoy — and it is the first piece of real <em>concurrent</em> systems
+  code in the course. The multi-threaded stress test at the end has ended many first drafts;
+  the guidance below is ordered to keep yours out of that statistic.</p>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li><strong>Implement</strong> a fixed-size buffer pool: page table, frames, and miss
+      handling that reads through the <code>DiskManager</code> from Milestone 1.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Implement</strong> pin counting as an RAII guard type, so a page can never be
+      evicted while in use and pins can never leak.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Implement</strong> the CLOCK replacement policy behind a trait, with LRU-2 as a
+      stretch goal.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Enforce</strong> the dirty-victim rule: a modified page is written back before
+      its frame is reused, never silently dropped.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Reason</strong> about latch scope: what the pool-wide latch protects, what it
+      must never be held across, and why.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m03-buffer-pool/index.html">M03 · The Buffer Pool</a> — the
+      concept module for this milestone; the eviction simulator there is your CLOCK reference
+      behavior.</li>
+    <li>CMU 15-445 Project #1 — the component breakdown (replacement policy, disk interaction,
+      buffer pool manager) and the pin/eviction semantics this milestone mirrors.
+      <a href="https://15445.courses.cs.cmu.edu/fall2025/project1/" rel="external">15445.courses.cs.cmu.edu/fall2025/project1/</a></li>
+    <li>The Internals of PostgreSQL, Ch. 8 — how a production buffer manager arranges the same
+      pieces (buffer table / descriptors / pool, clock sweep).
+      <a href="https://www.interdb.jp/pg/pgsql08.html" rel="external">interdb.jp/pg/pgsql08.html</a></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — the buffer pool slots in between the access methods and the disk
+    manager you built in Milestone 1. Everything above it will be written against
+    <code>PageStore</code> and never know the difference.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+  <p>You implement <code>crates/buffer</code>. The public surface (from the workspace API
+  contract; the stubs carry the full rustdoc):</p>
+
+  <pre><code>pub trait Replacer: Send {
+    fn record_access(&amp;mut self, frame: FrameId);
+    fn set_evictable(&amp;mut self, frame: FrameId, evictable: bool);
+    fn evict(&amp;mut self) -&gt; Option&lt;FrameId&gt;;
+    fn evictable_count(&amp;self) -&gt; usize;
+}
+pub struct ClockReplacer { /* ref bits + hand */ }
+impl ClockReplacer { pub fn new(num_frames: usize) -&gt; Self; }
+pub struct LruKReplacer { /* stretch: history of last K accesses */ }
+impl LruKReplacer { pub fn new(num_frames: usize, k: usize) -&gt; Self; }
+
+/// Log hook for the WAL rule (Milestone 9): before a dirty page with
+/// pageLSN = L is written out, flush_until(L) must succeed.
+pub trait LogFlusher: Send + Sync {
+    fn flush_until(&amp;self, lsn: Lsn) -&gt; Result&lt;()&gt;;
+}
+
+pub struct BufferPoolManager { /* frames, page table, replacer, disk, log hook */ }
+impl BufferPoolManager {
+    pub fn new(pool_size: usize, disk: DiskManager, replacer: Box&lt;dyn Replacer&gt;) -&gt; Self;
+    pub fn set_log_flusher(&amp;self, log: std::sync::Arc&lt;dyn LogFlusher&gt;); // wired in MS9
+    pub fn fetch_page(&amp;self, id: PageId) -&gt; Result&lt;PageGuard&gt;;   // pins
+    pub fn new_page(&amp;self) -&gt; Result&lt;(PageId, PageGuard)&gt;;       // allocate + pin
+    pub fn flush_page(&amp;self, id: PageId) -&gt; Result&lt;()&gt;;
+    pub fn flush_all(&amp;self) -&gt; Result&lt;()&gt;;
+    pub fn pool_size(&amp;self) -&gt; usize;
+}
+impl ferricdb_storage::PageStore for BufferPoolManager { /* via fetch/guards */ }
+
+/// RAII pin. Deref/DerefMut to Page; DerefMut marks the frame dirty;
+/// Drop unpins.
+pub struct PageGuard&lt;'a&gt; { /* pool ref, frame */ }</code></pre>
+
+  <p>Semantics you must honor (they are what the tests check):</p>
+  <ul>
+    <li><code>fetch_page</code> on a resident page pins it and touches the replacer's access
+      history — no disk I/O.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><code>fetch_page</code> on a non-resident page finds a frame (free, else victim). A dirty
+      victim is written to disk <em>before</em> the frame is reused. Then the requested page is
+      read in, the page table is updated (old mapping out, new mapping in), and the frame comes
+      back pinned.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li>A frame with pin count &gt; 0 is not evictable — <code>set_evictable(frame, false)</code>
+      on first pin, <code>true</code> again when the count returns to zero.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li>If every frame is pinned, <code>fetch_page</code>/<code>new_page</code> fail with
+      <code>Error::BufferPoolExhausted</code> — never block forever, never evict a pinned
+      page.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li>CLOCK: one reference bit per frame, set on access; the hand clears set bits as it sweeps
+      and evicts at the first evictable frame with a clear bit.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><code>flush_page</code>/<code>flush_all</code> write dirty frames through and clear
+      dirty bits; they do not evict. Once <code>set_log_flusher</code> is wired (Milestone 9),
+      every dirty-page write is preceded by <code>flush_until(page_lsn)</code> — build the call
+      site now, as a no-op when the hook is absent.</li>
+    <li>The <code>PageStore</code> impl makes the pool a drop-in replacement for
+      <code>DiskManager</code>: from this milestone on, <code>HeapFile::create/open</code> in
+      your tests and in the REPL take <code>Arc&lt;BufferPoolManager&gt;</code>.</li>
+  </ul>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <ol>
+    <li><strong>Start with <code>ClockReplacer</code> in isolation.</strong> It is a pure data
+      structure: ref bits, an evictable set, a hand index. Get its unit behavior right against
+      the M03 simulator before any latching exists to confuse the picture.</li>
+    <li><strong>Design the shared state as one struct.</strong> Page table, frame metadata
+      (pin count, dirty, the <code>Page</code> itself), and the replacer live together behind one
+      <code>Mutex</code> (or the frames' bytes behind per-frame <code>RwLock</code>s if you want
+      finer grain — see the pitfall on latch scope first). Resist premature cleverness: the
+      stress test rewards <em>correct</em>, not <em>fastest</em>.</li>
+    <li><strong>Write <code>fetch_page</code> as a state machine.</strong> Hit → pin, record
+      access, return guard. Miss with free frame → read, install, pin. Miss with victim → evict
+      (flush if dirty), install, pin. Miss with nothing evictable → error. Make each arm a few
+      lines and test them separately.</li>
+    <li><strong>Do disk I/O outside the latch if you can.</strong> The straightforward version
+      holds the pool latch across <code>read_page</code>/<code>write_page</code>; it passes the
+      tests but serializes all misses. The better shape marks the frame "busy", drops the latch,
+      does I/O, re-takes the latch to finish installation. Attempt it after the simple version is
+      green — with the tests as your safety net.</li>
+    <li><strong>Make <code>PageGuard</code> boring.</strong> It stores the pool reference and
+      frame id; <code>Deref</code> hands out <code>&amp;Page</code>; <code>DerefMut</code> sets
+      the dirty flag then hands out <code>&amp;mut Page</code>; <code>Drop</code> decrements the
+      pin and flips evictability at zero. All the subtlety belongs to the pool, not the guard.</li>
+    <li><strong>Wire <code>PageStore</code> and re-run Milestone 1.</strong> The ms1_ suite must
+      still pass with <code>HeapFile</code> running over the pool — that regression is the whole
+      point of the trait.</li>
+    <li><strong>Only then run the stress test.</strong> <code>ms2_stress_multithreaded</code>
+      hammers <code>fetch_page</code>/writes/drops from many threads. When it fails, shrink:
+      2 threads, 2 frames, 3 pages reproduces almost every latching bug in miniature.</li>
+    <li><strong>Stretch — LRU-2.</strong> Implement <code>LruKReplacer</code> per the backward
+      k-distance rule (max distance evicted; fewer than k accesses ⇒ infinite, ties by oldest
+      overall access).<sup class="cite"><a href="#ref-2">2</a></sup> The replacer trait means the
+      pool doesn't change at all — that was the point of the trait, too.</li>
+  </ol>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <pre><code># the milestone group
+cargo test -p ferricdb-buffer -- --include-ignored ms2_
+
+# regression: Milestone 1 must still pass over the pool
+cargo test -p ferricdb-storage -- --include-ignored ms1_
+
+# after everything is green: the hit-rate benchmark
+cargo bench -p ferricdb-buffer</code></pre>
+  <p>The group starts with <code>ms2_clock_evicts_unpinned</code> — CLOCK ordering with pins in
+  play — then covers: pinned pages surviving full-pool pressure (expect
+  <code>BufferPoolExhausted</code>), dirty victims being readable after eviction, resident
+  fetches doing no I/O, pins releasing on guard drop, and the multi-threaded stress test. The
+  criterion bench in <code>benches/hit_rate.rs</code> reports fetch throughput on a skewed
+  workload; record the number in your notes — the Definition of Done asks for it, and it
+  becomes your baseline when you tune later.</p>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Evicting a pinned page</span>
+    <p><em>Symptom:</em> data corruption that reproduces only under load, when a page's bytes
+    change under a live guard. <em>Cause:</em> the replacer saw a frame the pool considered
+    pinned. Keep evictability inside the replacer (via <code>set_evictable</code>) and update it
+    on every pin-count edge — first pin and last unpin — not on every access.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Dropping a dirty victim</span>
+    <p><em>Symptom:</em> a value written moments ago reads back stale after unrelated activity.
+    <em>Cause:</em> the eviction path forgot the write-back. The test constructs exactly this:
+    write page A, evict it via pressure, fetch it again. The rule is unconditional — and in
+    Milestone 9 it grows the WAL prefix (<code>flush_until(pageLSN)</code> first), which is why
+    the spec asks you to shape the call site now.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Holding the pool latch across disk I/O — then adding a second latch</span>
+    <p><em>Symptom:</em> deadlock under the stress test; threads parked forever. The classic
+    shape: thread 1 holds the pool latch and waits on a frame latch; thread 2 holds that frame
+    latch and calls back into the pool. Pick a strict order (pool before frame, never the
+    reverse), or stay with the single coarse latch — a slow pool passes; a deadlocked one does
+    not.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Page table desync</span>
+    <p><em>Symptom:</em> two frames both claim page N, or a fetch returns an evicted page's stale
+    frame. <em>Cause:</em> eviction removed the victim's mapping but installation of the new
+    mapping happened outside the same critical section. Table-out and table-in must be atomic
+    with respect to other fetches of either page.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li><code>ms2_</code> tests all pass, including <code>ms2_stress_multithreaded</code>, run
+      at least five times in a row (latching bugs are shy).</li>
+    <li><code>ms1_</code> tests still pass with <code>HeapFile</code> over
+      <code>BufferPoolManager</code>.</li>
+    <li><code>cargo bench -p ferricdb-buffer</code> runs and you have written down the hit-rate
+      benchmark number.</li>
+    <li>You can explain, out loud, why <code>fetch_page</code> of a resident page must not touch
+      the disk and what would break if flushing skipped the dirty check.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="Pins outrank policies. The replacer only ranks frames the pool has marked evictable; a pinned frame is invisible to it. If everything is pinned, the correct behavior is an error — blocking or evicting anyway both corrupt someone's world.">
+    <legend class="quiz-q">All frames are pinned and a new page is requested. What does fetch_page do?</legend>
+    <label><input type="radio" name="q1"> Evicts the least recently used frame anyway — the request has priority</label>
+    <label><input type="radio" name="q1"> Blocks until a pin is released</label>
+    <label><input type="radio" name="q1" data-correct> Returns Error::BufferPoolExhausted without evicting anything</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+  <fieldset class="quiz" data-explain="DerefMut is the single choke point where mutable access is granted, so setting the dirty flag there means no code path can modify a page while forgetting to record it. Setting it in Drop would mark clean pages dirty; setting it in fetch_page would mark readers dirty.">
+    <legend class="quiz-q">Why does PageGuard set the dirty flag in DerefMut rather than in Drop?</legend>
+    <label><input type="radio" name="q2" data-correct> Mutable access flows through DerefMut, so dirtiness is recorded exactly when mutation becomes possible</label>
+    <label><input type="radio" name="q2"> Drop cannot access the pool's state</label>
+    <label><input type="radio" name="q2"> Because Drop may not run if the thread panics</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">CMU 15-445/645 (Fall 2025), Project #1: Buffer Pool Manager — frames,
+          8&nbsp;KB pages, pin semantics, dirty write-back, and the fetch/evict contract this
+          milestone mirrors.
+          <a href="https://15445.courses.cs.cmu.edu/fall2025/project1/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project1/</a></li>
+        <li id="ref-2">CMU 15-445/645 (Fall 2024), Project #1 — evictable-frame accounting and
+          the LRU-K backward k-distance rule used for the stretch goal.
+          <a href="https://15445.courses.cs.cmu.edu/fall2024/project1/" rel="external">https://15445.courses.cs.cmu.edu/fall2024/project1/</a></li>
+        <li id="ref-3">Hironobu Suzuki, The Internals of PostgreSQL, §8.3–8.4 — how Postgres
+          scopes its buffer-manager locks and runs clock sweep; the model for the latch-ordering
+          discussion.
+          <a href="https://www.interdb.jp/pg/pgsql08/04.html" rel="external">https://www.interdb.jp/pg/pgsql08/04.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>The Internals of PostgreSQL, §8.5 — ring buffers: how Postgres keeps huge sequential
+        scans from flushing the working set, the production answer to the flood your M03
+        simulator demonstrated.
+        <a href="https://www.interdb.jp/pg/pgsql08/05.html" rel="external">interdb.jp/pg/pgsql08/05.html</a></li>
+      <li>Architecture of a Database System, §5.3 — buffer management in the large, including
+        why frames are fixed-size and what metadata production pools carry.
+        <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf" rel="external">dsf.berkeley.edu/papers/fntdb07-architecture.pdf</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>Next on the path:
+    <a href="../../modules/m05-sql-parsing/index.html">M05 · SQL Front-End</a>, then
+    <a href="../milestone-03/index.html">Milestone 3</a> — FerricDB learns to read.</p>
+
+    <nav class="prevnext">
+      <a href="../../modules/m03-buffer-pool/index.html"><span class="dir">← Previous</span> M03 · The Buffer Pool</a>
+      <a class="next" href="../../modules/m05-sql-parsing/index.html"><span class="dir">Next →</span> M05 · SQL Front-End</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk"],
+    current: ["buffer"],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

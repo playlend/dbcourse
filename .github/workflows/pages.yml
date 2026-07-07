@@ -1,0 +1,44 @@
+# Publishes the course site (course/, minus the Rust workspace) to GitHub
+# Pages. The course is pure static HTML with only relative links and no
+# build step, so "deployment" is just uploading the directory.
+#
+# One-time repo setup: Settings → Pages → Source: "GitHub Actions".
+# The Rust workspace is excluded here — learners get it from the standalone
+# starter repo produced by `git subtree split --prefix=course/ferricdb`.
+
+name: Deploy course to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble site (course without the Rust workspace)
+        run: |
+          mkdir -p _site
+          rsync -a course/ _site/ --exclude ferricdb/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

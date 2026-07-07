@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M12 · Advanced Topics and Where to Go Next — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M12 Advanced Topics</span>
+  </nav>
+  <span class="badge">Module 12</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M12 · Advanced Topics and Where to Go Next</h1>
+  <p class="subtitle">A survey from the summit: LSM engines, column stores, distributed SQL,
+  what production Postgres has that FerricDB doesn't — and sixty years of data-model lessons.</p>
+
+  <noscript><p class="noscript-warn">The quizzes on this page need JavaScript; everything else
+  reads fine without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-vantage">The view from here</a></li>
+      <li><a href="#sec-lsm">LSM storage engines</a></li>
+      <li><a href="#sec-olap">Column stores and OLAP</a></li>
+      <li><a href="#sec-distributed">Raft and distributed SQL</a></li>
+      <li><a href="#sec-prod">What production Postgres adds</a></li>
+      <li><a href="#sec-lessons">What goes around comes around</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-vantage">The view from here</h2>
+  <p>You have built a disk-oriented, row-store, single-node, MVCC relational database — the
+  architecture that has anchored the industry since System R. This closing module surveys the
+  major departures from that design and what each one buys. Every section pairs with either a
+  stretch milestone (S1–S4) or a reading trail; none of it is required to consider the course
+  complete, and all of it is easier to learn now than it would have been thirteen modules
+  ago.</p>
+
+  <h2 id="sec-lsm">LSM storage engines</h2>
+  <p>Your heap files and B+Tree update pages <em>in place</em>. The log-structured merge tree
+  takes the opposite bet: all modifications — inserts, updates, deletes — are applied lazily,
+  batched in memory (the <em>memtable</em>) and written to disk as immutable <em>sorted string
+  table</em> (SST) files; a background <em>compaction</em> process merges SSTs to physically
+  apply updates and deletions.<sup class="cite"><a href="#ref-1">1</a></sup> Immutability is the
+  design's engine: on-disk data never changes, so concurrency control simplifies dramatically
+  and even offloading compaction to other machines becomes possible.<sup class="cite"><a href="#ref-1">1</a></sup>
+  The cost is paid on the read path — a lookup may consult the memtable and several SSTs — and
+  in write/space amplification from rewriting data during compaction. RocksDB (built on
+  LevelDB) is the canonical implementation, and distributed systems like TiDB and CockroachDB
+  sit on LSM storage.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 920 300" role="img">
+      <title>B+Tree in-place write path versus LSM append path with memtable, SST files, and
+      compaction.</title>
+      <text x="230" y="30" text-anchor="middle" class="d-text" font-weight="600">B+Tree (FerricDB)</text>
+      <rect x="130" y="50" width="200" height="44" rx="8" class="d-box"/>
+      <text x="230" y="77" text-anchor="middle" class="d-text-sm">write → find page → modify in place</text>
+      <rect x="130" y="130" width="200" height="44" rx="8" class="d-box-good"/>
+      <text x="230" y="157" text-anchor="middle" class="d-text-sm">read: one tree descent</text>
+      <rect x="130" y="210" width="200" height="44" rx="8" class="d-box-warn"/>
+      <text x="230" y="231" text-anchor="middle" class="d-text-sm">random page writes;</text>
+      <text x="230" y="247" text-anchor="middle" class="d-text-sm">pages update in place</text>
+      <text x="660" y="30" text-anchor="middle" class="d-text" font-weight="600">LSM tree</text>
+      <rect x="480" y="50" width="160" height="44" rx="8" class="d-box-hl"/>
+      <text x="560" y="70" text-anchor="middle" class="d-text-sm">memtable (RAM)</text>
+      <text x="560" y="86" text-anchor="middle" class="d-text-sm">absorbs all writes</text>
+      <rect x="690" y="50" width="170" height="44" rx="8" class="d-box"/>
+      <text x="775" y="70" text-anchor="middle" class="d-text-sm">flush → immutable SSTs</text>
+      <text x="775" y="86" text-anchor="middle" class="d-text-sm">sorted, never edited</text>
+      <path d="M 640 72 H 690" class="d-line"/>
+      <rect x="480" y="130" width="380" height="44" rx="8" class="d-box"/>
+      <text x="670" y="150" text-anchor="middle" class="d-text-sm">compaction: merge SSTs, apply updates/deletes,</text>
+      <text x="670" y="166" text-anchor="middle" class="d-text-sm">drop tombstones</text>
+      <path d="M 775 94 V 130" class="d-line"/>
+      <rect x="480" y="210" width="380" height="44" rx="8" class="d-box-warn"/>
+      <text x="670" y="231" text-anchor="middle" class="d-text-sm">reads may consult memtable + several SSTs</text>
+      <text x="670" y="247" text-anchor="middle" class="d-text-sm">(read amplification; bloom filters help)</text>
+    </svg>
+    <figcaption>Figure 1 — in-place vs log-structured write paths.<sup class="cite"><a href="#ref-1">1</a></sup></figcaption>
+  </figure>
+
+  <p><strong>Go build it:</strong> <a href="../../project/stretch-s3/index.html">Stretch S3</a>
+  follows Mini-LSM — a course structured as weeks of seven ~2-hour chapters, building memtables,
+  SSTs, and compaction in Rust — and then swaps FerricDB's heap for the
+  result.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <h2 id="sec-olap">Column stores and OLAP</h2>
+  <p>FerricDB stores rows contiguously — perfect for OLTP, where queries touch few rows and
+  many columns. Analytics inverts the pattern: scan millions of rows, read three columns,
+  aggregate. Columnar systems store each column contiguously instead, which reads only the
+  bytes the query needs, compresses spectacularly (a column is self-similar), and enables
+  vectorized execution — the design direction the 2024 Stonebraker/Pavlo survey singles out as
+  the architecture story for modern OLAP workloads.<sup class="cite"><a href="#ref-2">2</a></sup>
+  A caution from the same survey while you're near the terminology: <em>column-family</em>
+  stores (Bigtable, Cassandra) are not columnar storage despite the
+  name.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 920 240" role="img">
+      <title>Row store pages hold whole rows; column store pages hold one column's values
+      across many rows.</title>
+      <text x="230" y="30" text-anchor="middle" class="d-text" font-weight="600">Row store page (FerricDB)</text>
+      <g>
+        <rect x="80" y="50" width="300" height="36" rx="5" class="d-box"/>
+        <text x="230" y="73" text-anchor="middle" class="d-mono-sm">id:1 · name:"ada" · age:36 · city:"london"</text>
+        <rect x="80" y="92" width="300" height="36" rx="5" class="d-box"/>
+        <text x="230" y="115" text-anchor="middle" class="d-mono-sm">id:2 · name:"bob" · age:29 · city:"paris"</text>
+        <rect x="80" y="134" width="300" height="36" rx="5" class="d-box"/>
+        <text x="230" y="157" text-anchor="middle" class="d-mono-sm">id:3 · name:"eve" · age:41 · city:"oslo"</text>
+      </g>
+      <text x="230" y="205" text-anchor="middle" class="d-text-sm">SELECT AVG(age): reads every byte of every row</text>
+      <text x="680" y="30" text-anchor="middle" class="d-text" font-weight="600">Column store pages</text>
+      <g>
+        <rect x="530" y="50" width="90" height="120" rx="5" class="d-box"/>
+        <text x="575" y="70" text-anchor="middle" class="d-mono-sm">id</text>
+        <text x="575" y="95" text-anchor="middle" class="d-mono-sm">1 2 3</text>
+        <rect x="630" y="50" width="90" height="120" rx="5" class="d-box"/>
+        <text x="675" y="70" text-anchor="middle" class="d-mono-sm">name</text>
+        <text x="675" y="95" text-anchor="middle" class="d-mono-sm">ada bob eve</text>
+        <rect x="730" y="50" width="90" height="120" rx="5" class="d-box-hl"/>
+        <text x="775" y="70" text-anchor="middle" class="d-mono-sm">age</text>
+        <text x="775" y="95" text-anchor="middle" class="d-mono-sm">36 29 41</text>
+      </g>
+      <text x="680" y="205" text-anchor="middle" class="d-text-sm">SELECT AVG(age): reads one column, tightly packed, compressible</text>
+    </svg>
+    <figcaption>Figure 2 — the same table, two layouts, opposite strengths.</figcaption>
+  </figure>
+
+  <p><strong>Go read it:</strong> RisingLight is an educational OLAP database in Rust — columnar
+  storage and vectorized execution at a codebase size one person can
+  absorb.<sup class="cite"><a href="#ref-3">3</a></sup> Your Module 6 executor knowledge maps
+  directly; the difference is that <code>next()</code> returns column <em>batches</em> instead
+  of single rows.</p>
+
+  <h2 id="sec-distributed">Raft and distributed SQL</h2>
+  <p>One machine bounds durability, capacity, and availability. The distributed answer layers a
+  <em>consensus protocol</em> under the database: writes go through a replicated log that a
+  majority of nodes must acknowledge, and each node applies the log to its local state machine —
+  producing linearizable replication of exactly the kind toyDB demonstrates with Raft
+  underneath an MVCC SQL engine.<sup class="cite"><a href="#ref-4">4</a></sup> toyDB is the
+  recommended tour: an educational distributed SQL database in Rust whose author went on to
+  build CockroachDB and Neon, deliberately trading performance and availability for
+  understandability.<sup class="cite"><a href="#ref-4">4</a></sup> Notice how much transfers:
+  its storage engines, MVCC layer, and iterator-based SQL engine are the architecture you just
+  built — consensus slides in <em>underneath</em> a design you already own.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+  <p><strong>Go build it:</strong> <a href="../../project/stretch-s4/index.html">Stretch S4</a>
+  maps toyDB's Raft architecture onto FerricDB for a three-node local cluster.</p>
+
+  <h2 id="sec-prod">What production Postgres adds</h2>
+  <p>FerricDB is Postgres-shaped; production Postgres is that shape plus decades of hardening.
+  The honest inventory of what you skipped:</p>
+  <ul>
+    <li><strong>Full TOAST</strong> — values too large for a page are compressed and sliced
+      into an out-of-line toast table transparently; you documented the concept in M02 and
+      stored only page-sized tuples.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li><strong>True SERIALIZABLE via SSI</strong> — non-blocking predicate locks that detect
+      dangerous dependency structures; your write-skew test documents the gap, stretch S2
+      narrows it.<sup class="cite"><a href="#ref-6">6</a></sup></li>
+    <li><strong>Parallel query</strong> — one query fanned across worker backends; your Volcano
+      operators are single-threaded by design.</li>
+    <li><strong>Replication and PITR</strong> — streaming WAL to standbys and archiving it for
+      point-in-time recovery: the log you built in Milestone 9, weaponized. interdb's
+      Chapters 10–11 cover both mechanisms in the same depth this course's chapters relied
+      on.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li><strong>An extensible type system</strong> — Postgres's founding idea. Hellerstein's
+      recollection of the Berkeley project traces how user-defined types, functions, and access
+      methods — radical in the 1980s — became the feature that kept Postgres relevant for every
+      new workload since.<sup class="cite"><a href="#ref-7">7</a></sup></li>
+  </ul>
+
+  <h2 id="sec-lessons">What goes around comes around</h2>
+  <p>In 2005, Stonebraker and Hellerstein surveyed 35 years of data models and concluded that
+  the relational model with an extendable type system had dominated all comers. The 2024 sequel
+  by Stonebraker and Pavlo re-runs the exercise over the NoSQL era — MapReduce, key-value,
+  document, column-family, text, array, vector, and graph systems — and lands in the same
+  place: systems that deviated from SQL and the relational model have not dominated the
+  landscape, often serving niche markets, while many that rejected the RM with fanfare later
+  converged back toward it.<sup class="cite"><a href="#ref-2">2</a></sup> The moral for a
+  systems builder is not that innovation is futile — it is that data outlives code, and models
+  with sound foundations absorb their challengers' best features. You now know, from the
+  inside, why the architecture you built is the one that keeps winning: every layer of it is
+  replaceable, and this module just showed you the replacements.</p>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="SSTs are immutable — updates and deletes are new records (tombstones) that win by recency; compaction later merges files and physically drops superseded data. That immutability is what simplifies concurrency and makes background offloading possible.">
+    <legend class="quiz-q">How does an LSM engine update a key that already lives in an SST?</legend>
+    <label><input type="radio" name="q1"> It edits the SST in place, like a heap page</label>
+    <label><input type="radio" name="q1" data-correct> It writes a new record to the memtable; compaction eventually merges away the old one</label>
+    <label><input type="radio" name="q1"> It rewrites that SST immediately</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Columnar layouts win when queries scan many rows but few columns — the OLAP pattern — reading only needed bytes and compressing homogeneous data. Row stores win at OLTP where whole-row reads and writes dominate. And per the 2024 survey: column-FAMILY (Cassandra) is a data model, not columnar storage.">
+    <legend class="quiz-q">Which workload favors a column store over your row store?</legend>
+    <label><input type="radio" name="q2"> Point lookups and single-row updates (OLTP)</label>
+    <label><input type="radio" name="q2" data-correct> Aggregations scanning millions of rows but touching few columns (OLAP)</label>
+    <label><input type="radio" name="q2"> Any workload — columnar is strictly newer and better</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="The 2024 survey's throughline: challengers either stayed niche or re-adopted relational ideas (SQL layers, schemas, transactions). Data stickiness keeps old systems alive, but new applications keep choosing the relational model — now with the challengers' best features absorbed.">
+    <legend class="quiz-q">What is the Stonebraker/Pavlo 2024 survey's core finding about post-2005 data models?</legend>
+    <label><input type="radio" name="q3"> NoSQL systems have largely displaced relational databases</label>
+    <label><input type="radio" name="q3" data-correct> Deviations from SQL/RM mostly stayed niche or converged back; the relational model absorbed their innovations</label>
+    <label><input type="radio" name="q3"> Data models no longer matter; only storage engines do</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">skyzh, "Mini-LSM: LSM in a Week" — memtables, SSTs, compaction,
+          immutability's benefits, and the RocksDB/LevelDB lineage.
+          <a href="https://skyzh.github.io/mini-lsm/" rel="external">https://skyzh.github.io/mini-lsm/</a>
+          (repo: <a href="https://github.com/skyzh/mini-lsm" rel="external">github.com/skyzh/mini-lsm</a>)</li>
+        <li id="ref-2">Stonebraker &amp; Pavlo, "What Goes Around Comes Around... And Around...",
+          SIGMOD Record 53(2), 2024 — the 20-year data-model retrospective, columnar OLAP
+          architectures, and the column-family clarification.
+          <a href="https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf" rel="external">https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf</a></li>
+        <li id="ref-3">risinglightdb/risinglight — an educational OLAP database system in Rust.
+          <a href="https://github.com/risinglightdb/risinglight" rel="external">https://github.com/risinglightdb/risinglight</a></li>
+        <li id="ref-4">erikgrinaker/toydb — distributed SQL in Rust: Raft for linearizable
+          state-machine replication over MVCC snapshot isolation and an iterator query engine;
+          written for understandability by an author who later built CockroachDB and Neon.
+          <a href="https://github.com/erikgrinaker/toydb" rel="external">https://github.com/erikgrinaker/toydb</a></li>
+        <li id="ref-5">Hironobu Suzuki, The Internals of PostgreSQL, Chs. 10–11 — base backup
+          &amp; point-in-time recovery, and streaming replication.
+          <a href="https://www.interdb.jp/pg/pgsql10.html" rel="external">https://www.interdb.jp/pg/pgsql10.html</a>
+          and <a href="https://www.interdb.jp/pg/pgsql11.html" rel="external">pgsql11.html</a></li>
+        <li id="ref-6">PostgreSQL Documentation, "Transaction Isolation" — SSI's predicate
+          locking and the serializable guarantees FerricDB documents rather than implements.
+          <a href="https://www.postgresql.org/docs/current/transaction-iso.html" rel="external">https://www.postgresql.org/docs/current/transaction-iso.html</a></li>
+        <li id="ref-7">Hellerstein, "Looking Back at Postgres", 2019 — the Berkeley Postgres
+          recollection: extensibility as the project's enduring idea.
+          <a href="https://arxiv.org/pdf/1901.01973" rel="external">https://arxiv.org/pdf/1901.01973</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>Mini-LSM week 2 — compaction strategies (leveled vs tiered): where the real
+        engineering trade-offs of LSM live.
+        <a href="https://skyzh.github.io/mini-lsm/" rel="external">skyzh.github.io/mini-lsm</a></li>
+      <li>toyDB's architecture guide, Raft chapter — leader election, log replication, and
+        client forwarding in readable Rust.
+        <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">github.com/erikgrinaker/toydb/docs/architecture</a></li>
+      <li>The Red Book (Readings in Database Systems, 5th ed.) — the annotated reading list for
+        everything this course compressed.
+        <a href="http://www.redbook.io/" rel="external">redbook.io</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>What to build now: whichever stretch milestone matches your curiosity —
+    <a href="../../project/stretch-s1/index.html">S1 · Lock Manager</a>,
+    <a href="../../project/stretch-s2/index.html">S2 · SSI</a>,
+    <a href="../../project/stretch-s3/index.html">S3 · LSM Engine</a>, or
+    <a href="../../project/stretch-s4/index.html">S4 · Raft Replication</a>
+    (overview: <a href="../../project/index.html#sec-stretch">project page</a>).</p>
+
+    <nav class="prevnext">
+      <a href="../../project/milestone-10/index.html"><span class="dir">← Previous</span> Milestone 10 · Wire Protocol Server</a>
+      <a class="next" href="../../project/stretch-s1/index.html"><span class="dir">Next →</span> Stretch S1 · Lock Manager &amp; Row Locks</a>
+    </nav>
+  </footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M04 · Index Data Structures: B+Trees (and Friends) — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M04 B+Trees</span>
+  </nav>
+  <span class="badge">Module 04</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M04 · Index Data Structures: B+Trees (and Friends)</h1>
+  <p class="subtitle">The data structure that runs the database world: why trees beat hash maps,
+  how a B+Tree lives on 8&nbsp;KB pages, what really happens during a split — plus hash indexes
+  and LSM-trees for perspective.</p>
+
+  <noscript><p class="noscript-warn">The B+Tree visualizer and quizzes on this page need
+  JavaScript; all explanatory content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-why">Why a tree at all?</a></li>
+      <li><a href="#sec-shape">The shape of a B+Tree</a></li>
+      <li><a href="#sec-page">A node is a page</a></li>
+      <li><a href="#sec-ops">Search, insert, split</a></li>
+      <li><a href="#sec-viz">The B+Tree visualizer</a></li>
+      <li><a href="#sec-delete">Deletion: lazy vs merge</a></li>
+      <li><a href="#sec-concurrency">Latch crabbing (survey)</a></li>
+      <li><a href="#sec-friends">The friends: hash indexes and LSM-trees</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <p>Your executor currently answers <code>WHERE id = 42</code> the only way it can: read every
+  tuple and check. That is O(N) disk pages for one row. This module is about the data structure
+  that turns point lookups and range scans into a handful of page reads, and it is the single
+  most consequential data structure in database history — every major relational engine keeps
+  its tables or indexes in some variant of it.</p>
+
+  <h2 id="sec-why">Why a tree at all?</h2>
+  <p>The requirements come first. An index must make three things fast, and cstack's tutorial
+  states them crisply: searching for a particular value (logarithmic, not linear), inserting or
+  deleting a value you have already found (cheap rebalancing), and — the one that eliminates
+  most alternatives — traversing a <em>range</em> of values in order, which a hash map cannot do
+  at all.<sup class="cite"><a href="#ref-1">1</a></sup> A sorted array gives log-time search and
+  ranges but O(N) insertion; a binary search tree gives all three asymptotically but is a
+  disaster on disk: a million-key balanced binary tree is ~20 levels deep, and each level is a
+  separate page read.</p>
+
+  <p>The fix is to let each node have <em>many</em> children — up to <code>m</code>, the tree's
+  <strong>order</strong> — with every node except the root required to stay at least half
+  full so the tree stays shallow and balanced.<sup class="cite"><a href="#ref-1">1</a></sup>
+  Make <code>m</code> big enough that one node fills one disk page, and the tree's height
+  collapses. That is the whole insight: <strong>a B+Tree is a search tree whose node size is
+  chosen for the disk, not the CPU</strong>.</p>
+
+  <p>Two flavors matter, and SQLite ships both. In its file format, <em>indexes</em> use B-trees
+  (interior nodes store values too) while <em>tables</em> use B+Trees, where interior nodes hold
+  only keys for routing, all data lives in the leaves, and interior nodes consequently fit more
+  children per page.<sup class="cite"><a href="#ref-1">1</a></sup> FerricDB builds the B+Tree:
+  data in leaves, and the leaves chained left-to-right so a range scan is one descent plus a
+  linked-list walk.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <h2 id="sec-shape">The shape of a B+Tree</h2>
+  <p>A B+Tree is a balanced search tree in which internal pages direct the search and leaf pages
+  contain the actual entries.<sup class="cite"><a href="#ref-3">3</a></sup> An internal node with
+  keys <code>k₁ … kₙ</code> has <code>n+1</code> children: the i-th subtree holds keys in
+  <code>[kᵢ₋₁, kᵢ)</code>. Every leaf sits at the same depth — the balance invariant — and each
+  node (root excepted) stays at least half full.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <p>Now the arithmetic that makes it magic. Take FerricDB's numbers — our course choice of
+  8&nbsp;KB pages, matching PostgreSQL's default block size<sup class="cite"><a href="#ref-6">6</a></sup> —
+  with 8-byte integer keys, 4-byte child pointers, and 6-byte record ids. An internal page holds
+  roughly <code>8192 / 12 ≈ 680</code> separator keys; a leaf holds roughly
+  <code>8192 / 14 ≈ 580</code> entries. Then:</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Height</th><th>Leaves reachable</th><th>Keys (≈)</th><th>Page reads per lookup</th></tr></thead>
+      <tbody>
+        <tr><td>1 (root is a leaf)</td><td>1</td><td>580</td><td>1</td></tr>
+        <tr><td>2</td><td>680</td><td>~394,000</td><td>2</td></tr>
+        <tr><td>3</td><td>680²</td><td>~268 million</td><td>3</td></tr>
+        <tr><td>4</td><td>680³</td><td>~182 billion</td><td>4</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Any key among hundreds of millions in three page reads — and the top two levels are a few
+  hundred pages, which your Milestone 2 buffer pool will keep resident essentially forever. In
+  practice a warm B+Tree lookup costs about one disk read: the leaf.</p>
+
+  <h2 id="sec-page">A node is a page</h2>
+  <p>"Node = one page" is a design rule, and SQLite's file format shows exactly how to lay one
+  out. A SQLite b-tree page is divided into regions in a fixed order: the page header, the
+  <strong>cell pointer array</strong> growing from the front, unallocated space, and the
+  <strong>cell content area</strong> growing backward from the end — with each cell holding one
+  key (plus payload in leaves, plus a child pointer in interiors).<sup class="cite"><a href="#ref-2">2</a></sup>
+  The header packs a type byte, the first-freeblock offset, the cell count, the content-area
+  start, and — on interior pages only — the right-most child pointer.<sup class="cite"><a href="#ref-2">2</a></sup>
+  If this sounds familiar, it should: it is your Milestone 1 slotted page with a sort order.
+  The cell pointer array is kept in key order so binary search works over the pointers, while
+  the cells themselves sit wherever they landed.</p>
+
+  <figure>
+    <svg viewBox="0 0 920 300" role="img">
+      <title>A B+Tree node laid out on one 8 KB page: header, sorted cell pointer array growing
+      forward, free space, and cells growing backward from the page end.</title>
+      <rect x="20" y="60" width="880" height="90" rx="6" class="d-box"/>
+      <rect x="20" y="60" width="120" height="90" class="d-box-warn"/>
+      <text x="80" y="98" text-anchor="middle" class="d-text-sm">page header</text>
+      <text x="80" y="116" text-anchor="middle" class="d-mono-sm">type · count ·</text>
+      <text x="80" y="130" text-anchor="middle" class="d-mono-sm">content start</text>
+      <rect x="140" y="60" width="60" height="90" class="d-box-hl"/>
+      <text x="170" y="100" text-anchor="middle" class="d-mono-sm">ptr₀</text>
+      <rect x="200" y="60" width="60" height="90" class="d-box-hl"/>
+      <text x="230" y="100" text-anchor="middle" class="d-mono-sm">ptr₁</text>
+      <rect x="260" y="60" width="60" height="90" class="d-box-hl"/>
+      <text x="290" y="100" text-anchor="middle" class="d-mono-sm">ptr₂</text>
+      <text x="425" y="105" text-anchor="middle" class="d-text-sm">free space</text>
+      <rect x="530" y="60" width="130" height="90" class="d-box-good"/>
+      <text x="595" y="98" text-anchor="middle" class="d-mono-sm">cell: key 42</text>
+      <text x="595" y="116" text-anchor="middle" class="d-mono-sm">→ rid (7, 3)</text>
+      <rect x="660" y="60" width="120" height="90" class="d-box-good"/>
+      <text x="720" y="98" text-anchor="middle" class="d-mono-sm">cell: key 17</text>
+      <text x="720" y="116" text-anchor="middle" class="d-mono-sm">→ rid (2, 11)</text>
+      <rect x="780" y="60" width="120" height="90" class="d-box-good"/>
+      <text x="840" y="98" text-anchor="middle" class="d-mono-sm">cell: key 58</text>
+      <text x="840" y="116" text-anchor="middle" class="d-mono-sm">→ rid (4, 0)</text>
+      <path d="M 170 150 V 190 H 720 V 155" class="d-line"/>
+      <path d="M 230 150 V 175 H 595 V 155" class="d-line"/>
+      <path d="M 290 150 V 205 H 840 V 155" class="d-line"/>
+      <text x="460 " y="228" text-anchor="middle" class="d-text-sm">pointers are sorted by key (17 &lt; 42 &lt; 58); cells sit wherever they were written</text>
+      <path d="M 140 40 H 320" class="d-line-hl"/>
+      <text x="230" y="32" text-anchor="middle" class="d-text-sm">grows forward →</text>
+      <path d="M 900 40 H 530" class="d-line-hl"/>
+      <text x="715" y="32" text-anchor="middle" class="d-text-sm">← grows backward</text>
+      <text x="460" y="275" text-anchor="middle" class="d-text-sm">binary search runs over the pointer array — no cell movement needed to keep order</text>
+    </svg>
+    <figcaption>Figure 1 — a leaf node on one page, SQLite-cell style: a sorted pointer array
+    over unsorted cells.<sup class="cite"><a href="#ref-2">2</a></sup> Insertion appends a cell
+    and shifts only 2-byte pointers.</figcaption>
+  </figure>
+
+  <h2 id="sec-ops">Search, insert, split</h2>
+  <p><strong>Search</strong> is a descent: binary-search the internal node's keys to pick a
+  child, repeat until a leaf, binary-search the leaf. Height page reads, full stop.</p>
+  <p><strong>Insert</strong> is a search followed by a leaf insertion — until the leaf is full.
+  Then the tree grows by <strong>splitting</strong>, and this is where implementations are won
+  and lost, because leaves and internals split <em>differently</em>:</p>
+  <ul>
+    <li><strong>Leaf split — the separator is <em>copied</em> up.</strong> Half the entries move
+      to a new right sibling; the first key of the right sibling is copied into the parent as a
+      router. Copied, not moved: the key still lives in the leaf, because in a B+Tree
+      <em>every</em> entry must be findable in a leaf.</li>
+    <li><strong>Internal split — the separator is <em>pushed</em> up.</strong> The middle key
+      moves up to the parent and does <em>not</em> remain in either half — internal keys are
+      pure routers, and keeping a copy would leave a phantom route with no subtree between the
+      halves.</li>
+    <li><strong>Root split — the tree grows.</strong> When a split propagates to the root, a new
+      root is allocated with one key and two children. This is the only way a B+Tree gains
+      height, which is why every leaf always sits at the same depth: growth happens at the top,
+      never the bottom.</li>
+  </ul>
+  <p>Splitting versus <em>redistributing</em> into a sibling with spare room is a legitimate
+  design choice — CMU's project spec calls both out as acceptable, along with merge-vs-redistribute
+  on the delete side.<sup class="cite"><a href="#ref-3">3</a></sup> FerricDB's Milestone 5 asks
+  for plain splits; they are simpler and the invariant checker doesn't care which you chose.</p>
+
+  <h2 id="sec-viz">The B+Tree visualizer</h2>
+  <p>An order-4 tree (at most 3 keys per node) so splits come fast. Insert your own keys, run a
+  preset, search, and step through every split decision. The invariant panel re-checks the tree
+  after every step — the same three invariants your Milestone 5 fuzz test asserts.</p>
+
+  <div class="widget" id="bt-viz">
+    <p class="widget-title">B+Tree insert / search / delete — order 4</p>
+    <p class="widget-sub">Operations are broken into steps; use the stepper to walk each one.
+    Deleted keys are struck through (lazy deletion — see below).</p>
+    <div class="controls">
+      <label for="bt-key">key</label>
+      <input type="number" id="bt-key" value="42" style="width:6rem">
+      <button class="btn primary" type="button" id="bt-insert">Insert</button>
+      <button class="btn" type="button" id="bt-search">Search</button>
+      <button class="btn" type="button" id="bt-delete">Delete</button>
+      <button class="btn" type="button" id="bt-preset1">Preset: 1…10 in order</button>
+      <button class="btn" type="button" id="bt-preset2">Preset: shuffled</button>
+      <button class="btn" type="button" id="bt-reset">↺ Reset tree</button>
+    </div>
+    <div id="bt-stepper"></div>
+    <div id="bt-canvas"></div>
+    <div class="stat-row">
+      <span class="stat">keys <b id="bt-count">0</b></span>
+      <span class="stat">height <b id="bt-height">1</b></span>
+      <span class="stat">invariants <b id="bt-inv">✓ sorted · ✓ uniform depth · ✓ occupancy</b></span>
+    </div>
+  </div>
+
+  <p>Watch two moments closely. Insert <code>1…4</code> in order: the fourth key overflows the
+  root leaf, and the copied-up separator (<code>3</code>) appears both in the new root and in
+  the right leaf. Then keep going to <code>10</code>: when the <em>root</em> splits you can see
+  the pushed-up key vanish from the internal level it left — copy-up versus push-up, live.
+  Sequential insertion also shows you why every split leaves the left node half-empty: real
+  engines special-case rightmost-leaf splits for append workloads, a refinement your Milestone 5
+  can skip.</p>
+
+  <h2 id="sec-delete">Deletion: lazy vs merge</h2>
+  <p>Textbook deletion mirrors insertion: removing a key that underflows a node (below half
+  full) triggers borrowing from a sibling or <em>merging</em> two half-empty nodes — potentially
+  cascading to the root, shrinking the tree.<sup class="cite"><a href="#ref-3">3</a></sup>
+  Real systems very often don't bother. The pragmatic alternative is <strong>lazy
+  deletion</strong>: mark the entry dead (a tombstone) and reclaim space later — the current CMU
+  project even specifies a tombstone <em>buffer</em> design, where deleted entries are only
+  physically removed once enough of them accumulate in a leaf.<sup class="cite"><a href="#ref-3">3</a></sup>
+  The tree may carry some dead weight, but every invariant still holds and no rebalancing code
+  path exists to get wrong. FerricDB's Milestone 5 follows this school — lazy delete required,
+  merges as stretch — and the visualizer above does the same (struck-through keys).</p>
+
+  <h2 id="sec-concurrency">Latch crabbing (survey)</h2>
+  <p>A single latch around the whole tree serializes every lookup; per-node latches deadlock the
+  moment writers meet. The classic protocol is <strong>latch coupling</strong>, or
+  <em>crabbing</em>: latch the parent, latch the child, and release the parent as soon as it is
+  <em>safe</em> — where "safe" means the child cannot split or merge in a way that would touch
+  the parent (for an insert: the child has room; for a delete: the child is above minimum).
+  The current CMU project prescribes the <em>optimistic</em> variant: descend taking read
+  latches as if only the leaf will change, and restart with pessimistic write latches on the
+  rare unsafe path.<sup class="cite"><a href="#ref-3">3</a></sup> The name is the image: a crab
+  moving claw by claw, never letting go of both at once. Deeper still lies ARIES/IM, which works
+  out index concurrency <em>and</em> recovery together — the optional deep dive in Go
+  deeper.<sup class="cite"><a href="#ref-5">5</a></sup> In FerricDB, crabbing is the stretch
+  goal of Milestone 5; the core milestone runs the tree single-threaded.</p>
+
+  <h2 id="sec-friends">The friends: hash indexes and LSM-trees</h2>
+  <div class="grid-2">
+    <div class="callout note">
+      <span class="callout-title">Hash indexes</span>
+      <p>A hash table on disk gives O(1) point lookups and nothing else: no ranges, no ordered
+      scans, no prefix queries — the exact trade cstack's requirements list rules
+      out for a general index.<sup class="cite"><a href="#ref-1">1</a></sup> They shine where
+      equality is the only question (join build sides, key-value stores). Postgres ships hash
+      indexes; its planner uses them for <code>=</code> and nothing more. FerricDB skips them —
+      once you have a B+Tree, equality is just a range of size one.</p>
+    </div>
+    <div class="callout note">
+      <span class="callout-title">LSM-trees</span>
+      <p>The write-optimized school: buffer writes in a memtable, flush batches to immutable
+      <em>sorted string table</em> (SST) files, and let a background <em>compaction</em> merge
+      files to apply updates and deletions lazily.<sup class="cite"><a href="#ref-4">4</a></sup>
+      Immutable files make concurrency and crash-safety simpler, at the price of read and space
+      amplification — a read may consult many SSTs. RocksDB (after LevelDB) is the canonical
+      implementation, and distributed systems like TiDB and CockroachDB build on
+      it.<sup class="cite"><a href="#ref-4">4</a></sup> Stretch milestone S3 swaps FerricDB's
+      heap for one, following the Mini-LSM course.</p>
+    </div>
+  </div>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="Ranges are the killer requirement. Hash maps scatter adjacent keys deliberately, so 'all keys between 100 and 200' degenerates to a full scan. Trees keep order, and the B+Tree's chained leaves make ranges one descent plus a walk.">
+    <legend class="quiz-q">Which index requirement disqualifies a hash map outright?</legend>
+    <label><input type="radio" name="q1"> Fast point lookups</label>
+    <label><input type="radio" name="q1" data-correct> Traversing a range of keys in order</label>
+    <label><input type="radio" name="q1"> Fast insertion of new keys</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Leaf splits copy the separator up because every entry must remain findable in a leaf — internal keys are only routers. Internal splits push the middle key up without keeping a copy, since a copy would route searches into a gap between the two halves.">
+    <legend class="quiz-q">Why does a leaf split COPY its separator up while an internal split PUSHES it up?</legend>
+    <label><input type="radio" name="q2"> Historical accident preserved for file-format compatibility</label>
+    <label><input type="radio" name="q2" data-correct> Leaf data must stay in leaves (routers are copies); internal keys are only routers, so the middle key moves up entirely</label>
+    <label><input type="radio" name="q2"> Copying is faster than moving for leaf pages</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Height grows only when the root splits and a new root is created above it. Leaves never gain children; growth at the top preserves the all-leaves-same-depth invariant automatically.">
+    <legend class="quiz-q">How does a B+Tree gain height?</legend>
+    <label><input type="radio" name="q3"> A leaf splits into two levels when full</label>
+    <label><input type="radio" name="q3"> The deepest subtree grows one level and others catch up over time</label>
+    <label><input type="radio" name="q3" data-correct> Only at the top: a root split allocates a new root above the old one</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="~680 separators per internal page and ~580 entries per leaf give 680² × 580 ≈ 268 billion... careful — that's height 4. At height 3 the root and one internal level reach 680² leaves ≈ 268 million entries. The point of the arithmetic: fanout in the hundreds makes height 3–4 cover any realistic table.">
+    <legend class="quiz-q">With ~680-way fanout and ~580 entries per leaf, about how many keys fit in a height-3 tree (root → internal → leaf)?</legend>
+    <label><input type="radio" name="q4"> About 400 thousand</label>
+    <label><input type="radio" name="q4" data-correct> Hundreds of millions (≈ 680 × 680 × 580)</label>
+    <label><input type="radio" name="q4"> About 4 billion</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="LSM engines never modify SSTs in place — updates and deletes are new records that win by recency, and compaction merges files in the background to apply them physically. That immutability is what simplifies concurrency and crash-safety, at the cost of read amplification.">
+    <legend class="quiz-q">In an LSM engine, how does a delete reach the data in an SST file?</legend>
+    <label><input type="radio" name="q5"> The SST is edited in place, like a heap page</label>
+    <label><input type="radio" name="q5" data-correct> A tombstone record is written; compaction later merges files and drops the dead entry</label>
+    <label><input type="radio" name="q5"> The whole SST is rewritten immediately on every delete</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">cstack, "Let's Build a Simple Database", Part 7 — Introduction to the
+          B-Tree: the three index requirements, B-tree vs B+ tree, order and occupancy rules.
+          <a href="https://cstack.github.io/db_tutorial/parts/part7.html" rel="external">https://cstack.github.io/db_tutorial/parts/part7.html</a></li>
+        <li id="ref-2">SQLite, "Database File Format" — b-tree page regions: header fields, the
+          cell pointer array, and the cell content area.
+          <a href="https://www.sqlite.org/fileformat.html" rel="external">https://www.sqlite.org/fileformat.html</a></li>
+        <li id="ref-3">CMU 15-445/645 (Fall 2025), Project #2: B+Tree Index — operation
+          semantics, split/merge/redistribute choices, the tombstone-buffer lazy delete, the
+          index iterator, and optimistic latch crabbing.
+          <a href="https://15445.courses.cs.cmu.edu/fall2025/project2/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project2/</a></li>
+        <li id="ref-4">skyzh, "Mini-LSM: LSM in a Week" — memtables, SSTs, compaction, and the
+          LSM design rationale.
+          <a href="https://skyzh.github.io/mini-lsm/" rel="external">https://skyzh.github.io/mini-lsm/</a></li>
+        <li id="ref-5">Mohan &amp; Levine, "ARIES/IM: An Efficient and High Concurrency Index
+          Management Method Using Write-Ahead Logging" — index concurrency and recovery together
+          (note: the linked file is named aries.pdf but contains ARIES/IM).
+          <a href="https://users.cs.utah.edu/~pandey/courses/cs6530/fall22/papers/logrecover/aries.pdf" rel="external">https://users.cs.utah.edu/~pandey/courses/cs6530/fall22/papers/logrecover/aries.pdf</a></li>
+        <li id="ref-6">PostgreSQL Documentation, "Database Physical Storage" — the 8&nbsp;KB
+          default block size FerricDB's page (and node) size matches.
+          <a href="https://www.postgresql.org/docs/current/storage.html" rel="external">https://www.postgresql.org/docs/current/storage.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>ARIES/IM (ref 5) in full — how splits interact with recovery when a crash lands
+        mid-split; read after Milestone 9 for maximum effect.</li>
+      <li>SQLite file format, "B-tree Pages" section — the varint cell encodings and overflow
+        chains a production single-file engine needs.
+        <a href="https://www.sqlite.org/fileformat.html" rel="external">sqlite.org/fileformat.html</a></li>
+      <li>Mini-LSM, week 1 — build a memtable and SSTs in a weekend; the fastest way to make the
+        LSM trade-offs concrete. <a href="https://skyzh.github.io/mini-lsm/" rel="external">skyzh.github.io/mini-lsm</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>What to build now: <a href="../../project/milestone-05/index.html">Milestone 5 — B+Tree
+    Index</a>. Per the recommended path you arrive here after Milestones 3–4, so your IndexScan
+    operator plugs straight into the executor you already have.</p>
+
+    <nav class="prevnext">
+      <a href="../../project/milestone-04/index.html"><span class="dir">← Previous</span> Milestone 4 · Planner &amp; Volcano Executor</a>
+      <a class="next" href="../../project/milestone-05/index.html"><span class="dir">Next →</span> Milestone 5 · B+Tree Index</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+
+  var ORDER = 4;               // max children per internal node
+  var MAX_KEYS = ORDER - 1;    // 3 keys per node before overflow
+  var nextId = 1;
+
+  function leaf() { return { id: nextId++, leaf: true, keys: [] }; }   // keys: [{k, dead}]
+  function internal() { return { id: nextId++, leaf: false, keys: [], children: [] }; }
+
+  var root = leaf();
+  var events = [];             // [{tree, focus, caption}]
+  var stepperHost = document.getElementById("bt-stepper");
+  var canvas = document.getElementById("bt-canvas");
+  var invEl = document.getElementById("bt-inv");
+  var countEl = document.getElementById("bt-count");
+  var heightEl = document.getElementById("bt-height");
+
+  function clone(node) { return JSON.parse(JSON.stringify(node)); }
+  function snap(focus, caption) {
+    events.push({ tree: clone(root), focus: focus, caption: caption });
+  }
+
+  // ---------- insert ----------
+  function insertRec(node, k) {
+    if (node.leaf) {
+      var i = 0;
+      while (i < node.keys.length && node.keys[i].k < k) i++;
+      if (i < node.keys.length && node.keys[i].k === k) {
+        if (node.keys[i].dead) {
+          node.keys[i].dead = false;
+          snap(node.id, "Key " + k + " existed as a tombstone — revived in place.");
+        } else {
+          snap(node.id, "Key " + k + " already exists — B+Tree keys are unique; nothing to do.");
+        }
+        return null;
+      }
+      node.keys.splice(i, 0, { k: k, dead: false });
+      snap(node.id, "Descended to this leaf; inserted " + k + " in sorted position.");
+      if (node.keys.length <= MAX_KEYS) return null;
+      // leaf split: right gets upper half; separator = first key of right (COPY up)
+      var mid = Math.ceil(node.keys.length / 2);
+      var right = leaf();
+      right.keys = node.keys.splice(mid);
+      var sep = right.keys[0].k;
+      snap(node.id, "Leaf overflow (4 keys > 3): split. Right sibling takes the upper half; separator " +
+        sep + " is COPIED up (it stays in the right leaf).");
+      return { key: sep, right: right };
+    }
+    // internal
+    var ci = 0;
+    while (ci < node.keys.length && k >= node.keys[ci]) ci++;
+    snap(node.id, "At internal node: " + k + " belongs in child " + ci +
+      " (keys route: " + node.keys.join(", ") + ").");
+    var split = insertRec(node.children[ci], k);
+    if (!split) return null;
+    node.keys.splice(ci, 0, split.key);
+    node.children.splice(ci + 1, 0, split.right);
+    snap(node.id, "Split arrived from below: separator " + split.key +
+      " and the new right child were installed here.");
+    if (node.keys.length <= MAX_KEYS) return null;
+    // internal split: middle key is PUSHED up (removed from both halves)
+    var m = Math.floor(node.keys.length / 2);
+    var up = node.keys[m];
+    var rightNode = internal();
+    rightNode.keys = node.keys.splice(m + 1);
+    node.keys.pop(); // remove the pushed-up key from the left half
+    rightNode.children = node.children.splice(m + 1);
+    snap(node.id, "Internal overflow: split. Middle key " + up +
+      " is PUSHED up — note it remains in neither half (internal keys are pure routers).");
+    return { key: up, right: rightNode };
+  }
+
+  function doInsert(k) {
+    events = [];
+    var split = insertRec(root, k);
+    if (split) {
+      var nr = internal();
+      nr.keys = [split.key];
+      nr.children = [root, split.right];
+      root = nr;
+      snap(root.id, "The split reached the root: a new root was allocated with the single key " +
+        split.key + ". The tree grew one level — the only way height increases.");
+    }
+    snap(null, "Insert of " + k + " complete. Invariants re-checked below.");
+    playEvents();
+  }
+
+  // ---------- search ----------
+  function doSearch(k) {
+    events = [];
+    var node = root;
+    while (!node.leaf) {
+      var ci = 0;
+      while (ci < node.keys.length && k >= node.keys[ci]) ci++;
+      snap(node.id, "Internal node: routing " + k + " to child " + ci + ".");
+      node = node.children[ci];
+    }
+    var hit = node.keys.some(function (e) { return e.k === k && !e.dead; });
+    var dead = node.keys.some(function (e) { return e.k === k && e.dead; });
+    snap(node.id, hit ? "Leaf reached: key " + k + " FOUND." :
+      dead ? "Leaf reached: key " + k + " present but tombstoned — reported as not found." :
+      "Leaf reached: key " + k + " NOT found. Total page reads = tree height.");
+    playEvents();
+  }
+
+  // ---------- delete (lazy) ----------
+  function doDelete(k) {
+    events = [];
+    var node = root;
+    while (!node.leaf) {
+      var ci = 0;
+      while (ci < node.keys.length && k >= node.keys[ci]) ci++;
+      snap(node.id, "Routing delete of " + k + " to child " + ci + ".");
+      node = node.children[ci];
+    }
+    var entry = null;
+    node.keys.forEach(function (e) { if (e.k === k) entry = e; });
+    if (entry && !entry.dead) {
+      entry.dead = true;
+      snap(node.id, "Lazy delete: key " + k +
+        " is tombstoned in place. No rebalancing, no merges — the space is reclaimed later.");
+    } else {
+      snap(node.id, "Key " + k + " is not (live) in the tree; nothing to delete.");
+    }
+    playEvents();
+  }
+
+  // ---------- rendering ----------
+  function layout(tree) {
+    var leaves = [];
+    (function collect(n) {
+      if (n.leaf) leaves.push(n);
+      else n.children.forEach(collect);
+    })(tree);
+    var W = 940, H = 320;
+    var lw = Math.min(120, (W - 40) / Math.max(leaves.length, 1) - 14);
+    var pos = {};
+    leaves.forEach(function (n, i) {
+      pos[n.id] = { x: 20 + i * ((W - 40) / Math.max(leaves.length, 1)) +
+        ((W - 40) / Math.max(leaves.length, 1) - lw) / 2, w: lw };
+    });
+    var depth = 0;
+    (function d(n, lvl) {
+      depth = Math.max(depth, lvl);
+      if (!n.leaf) n.children.forEach(function (c) { d(c, lvl + 1); });
+    })(tree, 0);
+    (function place(n, lvl) {
+      if (!n.leaf) {
+        n.children.forEach(function (c) { place(c, lvl + 1); });
+        var first = pos[n.children[0].id], last = pos[n.children[n.children.length - 1].id];
+        pos[n.id] = { x: (first.x + last.x + last.w) / 2 - lw / 2, w: lw };
+      }
+      pos[n.id].y = 20 + lvl * ((H - 90) / Math.max(depth, 1));
+    })(tree, 0);
+    return { pos: pos, W: W, H: H };
+  }
+
+  function renderTree(tree, focus) {
+    canvas.textContent = "";
+    var L = layout(tree);
+    var svg = Course.svgEl("svg", { viewBox: "0 0 " + L.W + " " + L.H, role: "img" });
+    svg.appendChild(Course.svgEl("title", null, "B+Tree visualizer state."));
+    (function edges(n) {
+      if (n.leaf) return;
+      var p = L.pos[n.id];
+      n.children.forEach(function (c) {
+        var q = L.pos[c.id];
+        svg.appendChild(Course.svgEl("path", {
+          d: "M " + (p.x + p.w / 2) + " " + (p.y + 44) +
+             " L " + (q.x + q.w / 2) + " " + q.y,
+          "class": "d-line"
+        }));
+        edges(c);
+      });
+    })(tree);
+    (function boxes(n) {
+      var p = L.pos[n.id];
+      svg.appendChild(Course.svgEl("rect", {
+        x: p.x, y: p.y, width: p.w, height: 44, rx: 7,
+        "class": n.id === focus ? "d-box-hl" : (n.leaf ? "d-box-good" : "d-box")
+      }));
+      var label = n.leaf
+        ? n.keys.map(function (e) { return e.dead ? "(" + e.k + ")" : String(e.k); }).join(" ")
+        : n.keys.join(" | ");
+      var t = Course.svgEl("text", {
+        x: p.x + p.w / 2, y: p.y + 27, "text-anchor": "middle", "class": "d-mono"
+      }, label || "·");
+      svg.appendChild(t);
+      if (!n.leaf) n.children.forEach(boxes);
+    })(tree);
+    // leaf chain arrows
+    var leaves = [];
+    (function collect(n) { if (n.leaf) leaves.push(n); else n.children.forEach(collect); })(tree);
+    for (var i = 0; i + 1 < leaves.length; i++) {
+      var a = L.pos[leaves[i].id], b = L.pos[leaves[i + 1].id];
+      svg.appendChild(Course.svgEl("path", {
+        d: "M " + (a.x + a.w) + " " + (a.y + 22) + " L " + b.x + " " + (b.y + 22),
+        "class": "d-line-hl", "stroke-dasharray": "4 3"
+      }));
+    }
+    canvas.appendChild(svg);
+    updateStats(tree);
+  }
+
+  function updateStats(tree) {
+    var count = 0, height = 1, ok = { sorted: true, depth: true, occ: true };
+    var lastKey = -Infinity, leafDepths = [];
+    (function walk(n, d) {
+      if (n.leaf) {
+        leafDepths.push(d);
+        n.keys.forEach(function (e) {
+          if (e.k <= lastKey) ok.sorted = false;
+          lastKey = e.k;
+          if (!e.dead) count++;
+        });
+      } else {
+        if (n.keys.length > MAX_KEYS) ok.occ = false;
+        n.children.forEach(function (c) { walk(c, d + 1); });
+      }
+      height = Math.max(height, d + 1);
+    })(tree, 0);
+    if (leafDepths.some(function (d) { return d !== leafDepths[0]; })) ok.depth = false;
+    countEl.textContent = String(count);
+    heightEl.textContent = String(height);
+    invEl.textContent = (ok.sorted ? "✓" : "✗") + " sorted · " +
+      (ok.depth ? "✓" : "✗") + " uniform depth · " +
+      (ok.occ ? "✓" : "✗") + " occupancy";
+  }
+
+  function playEvents() {
+    stepperHost.textContent = "";
+    if (!events.length) return;
+    var evs = events;
+    Course.stepper(stepperHost, {
+      total: evs.length,
+      captions: evs.map(function (e) { return e.caption; }),
+      render: function (i) { renderTree(evs[i].tree, evs[i].focus); }
+    });
+  }
+
+  // ---------- controls ----------
+  var keyInput = document.getElementById("bt-key");
+  function keyVal() {
+    var v = parseInt(keyInput.value, 10);
+    return isNaN(v) ? null : v;
+  }
+  document.getElementById("bt-insert").addEventListener("click", function () {
+    var k = keyVal(); if (k !== null) { doInsert(k); keyInput.value = String(k + 7); }
+  });
+  document.getElementById("bt-search").addEventListener("click", function () {
+    var k = keyVal(); if (k !== null) doSearch(k);
+  });
+  document.getElementById("bt-delete").addEventListener("click", function () {
+    var k = keyVal(); if (k !== null) doDelete(k);
+  });
+  document.getElementById("bt-preset1").addEventListener("click", function () {
+    resetTree();
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 10].forEach(function (k) {
+      events = [];
+      var s = insertRec(root, k);
+      if (s) {
+        var nr = internal(); nr.keys = [s.key]; nr.children = [root, s.right]; root = nr;
+      }
+    });
+    events = [];
+    snap(null, "Inserted 1…10 in order. Note the half-empty left nodes sequential insertion leaves behind.");
+    playEvents();
+  });
+  document.getElementById("bt-preset2").addEventListener("click", function () {
+    resetTree();
+    // fixed shuffle — deterministic on every run
+    [7, 2, 9, 1, 12, 5, 15, 3, 11, 8, 14, 4].forEach(function (k) {
+      events = [];
+      var s = insertRec(root, k);
+      if (s) {
+        var nr = internal(); nr.keys = [s.key]; nr.children = [root, s.right]; root = nr;
+      }
+    });
+    events = [];
+    snap(null, "Inserted a fixed shuffled sequence. Compare the occupancy with the in-order preset.");
+    playEvents();
+  });
+  function resetTree() {
+    nextId = 1;
+    root = leaf();
+    events = [];
+    stepperHost.textContent = "";
+    renderTree(root, null);
+  }
+  document.getElementById("bt-reset").addEventListener("click", resetTree);
+
+  renderTree(root, null);
+});
+</script>
+</body>
+</html>

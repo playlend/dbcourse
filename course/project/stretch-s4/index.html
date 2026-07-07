@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stretch S4 · Raft Replication — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Stretch S4</span>
+  </nav>
+  <span class="badge stretch">Stretch S4</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Stretch S4 · Raft Replication</h1>
+  <p class="subtitle">Replicate FerricDB across a local three-node cluster following toyDB's
+  architecture — a guided reading and integration plan, not a Raft tutorial.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quiz need JavaScript;
+  the plan reads fine without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-goal">The goal</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-map">The toyDB map</a></li>
+      <li><a href="#sec-integration">Integration plan</a></li>
+      <li><a href="#sec-pitfalls">Pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <p class="muted">Stretch pages are deliberately lower-detail: this one maps toyDB's
+  documentation onto FerricDB rather than re-deriving consensus theory.</p>
+
+  <h2 id="sec-goal">The goal</h2>
+  <p>One FerricDB process is one failure away from downtime. The distributed answer is to
+  replicate the database as a <em>state machine</em> behind a consensus log: toyDB uses Raft
+  for exactly this — linearizable state machine replication over its MVCC SQL
+  engine.<sup class="cite"><a href="#ref-1">1</a></sup> This stretch builds the miniature: a
+  three-process local FerricDB cluster that elects a leader, replicates writes through a Raft
+  log, applies committed entries to each node's engine, and survives killing any single node.
+  toyDB is Apache-2.0 — attribute anything you adapt.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — S4 wraps the entire finished system: Raft sits between the protocol
+    server and the execution engine, turning execute() into a replicated state machine.</figcaption>
+  </figure>
+
+  <h2 id="sec-map">The toyDB map</h2>
+  <p>Read toyDB's architecture guide front to back once — it is a guided tour written for
+  exactly this purpose<sup class="cite"><a href="#ref-1">1</a></sup> — then study its Raft
+  documentation in this order: log storage; the state machine interface; node roles
+  (leader/follower/candidate); leader election and terms; client request forwarding; and write
+  replication and application.<sup class="cite"><a href="#ref-2">2</a></sup> The state machine
+  interface is the piece to internalize: Raft neither knows nor cares that the entries are SQL —
+  it delivers committed byte blobs to an <code>apply()</code> function in log order, one at a
+  time, on every node.</p>
+
+  <h2 id="sec-integration">Integration plan</h2>
+  <ol>
+    <li><strong>Define the state machine.</strong>
+      <code>trait StateMachine { fn apply(&amp;mut self, entry: &amp;[u8]) -&gt; Result&lt;Vec&lt;u8&gt;&gt;; }</code>
+      — entries are serialized write statements; apply() wraps your <code>execute()</code>.
+      Reads can bypass the log on the leader (see pitfalls).</li>
+    <li><strong>Implement Raft small.</strong> Follow toyDB's decomposition: a node struct with
+      role state, a persisted log, election timers with randomized timeouts, AppendEntries
+      heartbeats, and commit-index advancement on majority acknowledgment.<sup class="cite"><a href="#ref-2">2</a></sup>
+      Keep transport simple: length-prefixed messages over tokio TCP between the three fixed
+      peers.</li>
+    <li><strong>Route writes through the leader.</strong> The wire-protocol server on a follower
+      forwards write statements to the leader (toyDB documents this client-forwarding pattern)
+      and returns the applied result.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Persist the applied index.</strong> Each node stores how far it has applied, so
+      restart re-applies only newer committed entries.</li>
+    <li><strong>Cluster harness.</strong> A test script that launches three processes on
+      different ports, drives psql at whichever is leader, kills nodes, and asserts
+      convergence.</li>
+  </ol>
+
+  <h2 id="sec-pitfalls">Pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Non-deterministic entries</span>
+    <p>Every node applies every entry independently — entries must be deterministic. Anything
+    involving randomness, time, or per-node state (even txid assignment!) must be resolved by
+    the leader <em>before</em> the entry enters the log, or the replicas diverge silently.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Applying entries twice after restart</span>
+    <p>If the applied index isn't persisted atomically with application effects, a crash between
+    them replays an entry. Make apply idempotent or gate it on the stored index — this is the
+    ARIES pageLSN lesson wearing a distributed costume.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Two logs, different jobs</span>
+    <p>The Raft log orders <em>commands</em> across nodes; the Milestone 9 WAL protects each
+    node's local storage. They are not interchangeable and you likely keep both — decide and
+    document whether snapshot reads on followers are allowed (stale) or forbidden
+    (leader-only reads, linearizable).</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li>A three-node local cluster elects a leader and serves psql through it.</li>
+    <li>Writes are visible on all nodes; a killed-and-restarted follower catches up
+      automatically.</li>
+    <li>Killing the leader elects a new one, and reads after failover see all previously
+      committed writes.</li>
+    <li>A design note records determinism decisions, applied-index persistence, and the
+      follower-read policy.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="Raft delivers committed entries in log order to every replica's apply(); if applying an entry can produce different results on different nodes (time, randomness, local counters), the state machines diverge with no error raised. Determinism is the contract that makes 'replicated log' equal 'replicated database'.">
+    <legend class="quiz-q">Why must every logged command be deterministic?</legend>
+    <label><input type="radio" name="q1"> Raft rejects entries containing random bytes</label>
+    <label><input type="radio" name="q1" data-correct> Each node applies entries independently — non-determinism silently diverges the replicas</label>
+    <label><input type="radio" name="q1"> Deterministic entries compress better in the log</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">erikgrinaker/toydb — distributed SQL in Rust: Raft-based linearizable
+          state machine replication over an MVCC engine, written for understandability.
+          <a href="https://github.com/erikgrinaker/toydb" rel="external">https://github.com/erikgrinaker/toydb</a></li>
+        <li id="ref-2">toyDB architecture guide — the guided tour, including the Raft chapters:
+          log storage, state machine interface, roles, elections, forwarding, replication.
+          <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md</a></li>
+      </ol>
+    </div>
+
+    <nav class="prevnext">
+      <a href="../stretch-s3/index.html"><span class="dir">← Previous</span> Stretch S3 · LSM Storage Engine</a>
+      <a class="next" href="../../index.html"><span class="dir">Next →</span> Course home</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor", "index", "txn", "wal", "protocol", "client"],
+    current: [],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

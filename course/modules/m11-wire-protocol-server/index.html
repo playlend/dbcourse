@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M11 · Talking to the World: The Postgres Wire Protocol — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M11 Wire Protocol</span>
+  </nav>
+  <span class="badge">Module 11</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M11 · Talking to the World: The Postgres Wire Protocol</h1>
+  <p class="subtitle">Message framing, the startup handshake, simple and extended query flows —
+  and why speaking Postgres's language gives your database an instant ecosystem.</p>
+
+  <noscript><p class="noscript-warn">The byte explorer and quizzes on this page need JavaScript;
+  the sequence diagrams and all explanatory content are readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-why">Why speak someone else's protocol</a></li>
+      <li><a href="#sec-framing">Framing: type byte + length</a></li>
+      <li><a href="#sec-bytes">The byte explorer</a></li>
+      <li><a href="#sec-startup">Startup and authentication</a></li>
+      <li><a href="#sec-simple">The simple query cycle</a></li>
+      <li><a href="#sec-extended">The extended query protocol</a></li>
+      <li><a href="#sec-errors">Errors and transaction status</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-why">Why speak someone else's protocol</h2>
+  <p>Everything you have built so far talks to one client: your REPL, through function calls.
+  Module 11 is about the moment FerricDB becomes a <em>server</em> — and about a strategic
+  choice. Instead of inventing a protocol and writing clients for it, FerricDB speaks the
+  PostgreSQL frontend/backend protocol, version 3.<sup class="cite"><a href="#ref-1">1</a></sup>
+  The payoff is disproportionate: <code>psql</code>, every language's Postgres driver, GUI
+  tools, dashboards — none of them know or care that the thing on port 5433 is a teaching
+  database. A protocol, after all, carries no SQL semantics — it moves strings and rows, and the
+  Rust ecosystem's pgwire library is built around exactly that split: startup, simple query,
+  extended query, as three separable sub-protocols.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <h2 id="sec-framing">Framing: type byte + length</h2>
+  <p>Once past startup, every message in either direction has the same skeleton: one
+  <strong>type byte</strong> (an ASCII letter — <code>'Q'</code> query, <code>'T'</code> row
+  description, <code>'D'</code> data row, <code>'E'</code> error, <code>'Z'</code> ready), then
+  an <strong>Int32 length</strong>, then the payload. The length counts the message contents
+  <em>including the length field itself but excluding the type byte</em> — the single most
+  bug-prone sentence in this module, so read it twice.<sup class="cite"><a href="#ref-3">3</a></sup>
+  Integers are big-endian; strings are NUL-terminated. That is the entire transport layer: a
+  loop that reads one byte, reads four more, then reads exactly
+  <code>length − 4</code> payload bytes, forever.</p>
+
+  <h2 id="sec-bytes">The byte explorer</h2>
+  <div class="widget" id="bx">
+    <p class="widget-title">Every byte of Query("SELECT 1;")</p>
+    <p class="widget-sub">The frontend message psql sends for a simple query, annotated
+    byte-group by byte-group.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+    <div id="bx-stepper"></div>
+    <div id="bx-canvas"></div>
+  </div>
+
+  <h2 id="sec-startup">Startup and authentication</h2>
+  <p>The one message that breaks the framing rule is the first: <strong>StartupMessage has no
+  type byte</strong> — just Int32 length, then Int32 protocol version (major 3 in the high 16
+  bits), then name/value parameter pairs (<code>user</code>, <code>database</code>, …)
+  terminated by a zero byte.<sup class="cite"><a href="#ref-3">3</a></sup> There is no type byte
+  because at connection start there is nothing to disambiguate — and because the version field
+  doubles as one (special values in it distinguish SSL and cancel requests).</p>
+  <p>The server answers with an authentication conversation — reject with ErrorResponse, demand
+  a password, or accept with <code>AuthenticationOk</code> — and then, in the normal case, a
+  burst of <code>ParameterStatus</code> messages (server settings the client should know),
+  <code>BackendKeyData</code> (a secret for out-of-band query cancellation), and finally
+  <code>ReadyForQuery</code>: the prompt.<sup class="cite"><a href="#ref-1">1</a></sup>
+  FerricDB's Milestone 10 implements trust auth (accept anyone) first, cleartext password as the
+  optional upgrade.</p>
+
+  <figure>
+    <svg viewBox="0 0 920 330" role="img">
+      <title>Startup message sequence: client sends StartupMessage; server replies
+      AuthenticationOk, ParameterStatus messages, BackendKeyData, then ReadyForQuery.</title>
+      <line x1="200" y1="40" x2="200" y2="310" class="d-line"/>
+      <line x1="720" y1="40" x2="720" y2="310" class="d-line"/>
+      <rect x="140" y="14" width="120" height="30" rx="6" class="d-box"/>
+      <text x="200" y="34" text-anchor="middle" class="d-text">client (psql)</text>
+      <rect x="660" y="14" width="120" height="30" rx="6" class="d-box"/>
+      <text x="720" y="34" text-anchor="middle" class="d-text">FerricDB server</text>
+      <path d="M 200 80 H 712" class="d-line-hl"/>
+      <text x="460" y="72" text-anchor="middle" class="d-mono-sm">StartupMessage (no type byte: len, version 3, user=…, database=…)</text>
+      <path d="M 720 130 H 208" class="d-line"/>
+      <text x="460" y="122" text-anchor="middle" class="d-mono-sm">AuthenticationOk ('R')</text>
+      <path d="M 720 180 H 208" class="d-line"/>
+      <text x="460" y="172" text-anchor="middle" class="d-mono-sm">ParameterStatus ('S') × n — server_version, client_encoding, …</text>
+      <path d="M 720 230 H 208" class="d-line"/>
+      <text x="460" y="222" text-anchor="middle" class="d-mono-sm">BackendKeyData ('K') — pid + secret for CancelRequest</text>
+      <path d="M 720 285 H 208" class="d-line-hl"/>
+      <text x="460" y="277" text-anchor="middle" class="d-mono-sm">ReadyForQuery ('Z') status 'I' — the prompt appears</text>
+    </svg>
+    <figcaption>Figure 1 — the startup flow under trust authentication.<sup class="cite"><a href="#ref-1">1</a></sup></figcaption>
+  </figure>
+
+  <h2 id="sec-simple">The simple query cycle</h2>
+  <p>The workhorse. The frontend sends <code>Query</code> with the SQL as text (it may contain
+  several statements); the backend responds per statement and closes the cycle with
+  <code>ReadyForQuery</code> — sent as its own message precisely because a query string can
+  contain multiple statements, and the client needs one unambiguous "done with all of
+  it".<sup class="cite"><a href="#ref-1">1</a></sup> For a SELECT: <code>RowDescription</code>
+  describing the columns (name, type OID, size per field), then one <code>DataRow</code> per
+  row — each column as an Int32 length + bytes, with <strong>−1 meaning NULL</strong> — then
+  <code>CommandComplete</code> with a command tag like <code>SELECT 3</code> or
+  <code>INSERT 0 5</code>.<sup class="cite"><a href="#ref-3">3</a></sup> An empty query string
+  gets its own answer, <code>EmptyQueryResponse</code> — psql actually sends this, and a server
+  that doesn't handle it hangs the session.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 920 330" role="img">
+      <title>Simple query sequence: Query from client; RowDescription, DataRows,
+      CommandComplete, ReadyForQuery from server.</title>
+      <line x1="200" y1="40" x2="200" y2="310" class="d-line"/>
+      <line x1="720" y1="40" x2="720" y2="310" class="d-line"/>
+      <rect x="140" y="14" width="120" height="30" rx="6" class="d-box"/>
+      <text x="200" y="34" text-anchor="middle" class="d-text">client</text>
+      <rect x="660" y="14" width="120" height="30" rx="6" class="d-box"/>
+      <text x="720" y="34" text-anchor="middle" class="d-text">server</text>
+      <path d="M 200 75 H 712" class="d-line-hl"/>
+      <text x="460" y="67" text-anchor="middle" class="d-mono-sm">Query ('Q') — "SELECT id, name FROM users;"</text>
+      <path d="M 720 125 H 208" class="d-line"/>
+      <text x="460" y="117" text-anchor="middle" class="d-mono-sm">RowDescription ('T') — 2 fields: id (oid 20), name (oid 25)</text>
+      <path d="M 720 170 H 208" class="d-line"/>
+      <text x="460" y="162" text-anchor="middle" class="d-mono-sm">DataRow ('D') × N — lengths + text values; NULL = length −1</text>
+      <path d="M 720 225 H 208" class="d-line"/>
+      <text x="460" y="217" text-anchor="middle" class="d-mono-sm">CommandComplete ('C') — tag "SELECT N"</text>
+      <path d="M 720 285 H 208" class="d-line-hl"/>
+      <text x="460" y="277" text-anchor="middle" class="d-mono-sm">ReadyForQuery ('Z') — status 'I' | 'T' | 'E'</text>
+    </svg>
+    <figcaption>Figure 2 — one simple query cycle.<sup class="cite"><a href="#ref-1">1</a></sup>
+    Values travel as text in this course (the protocol also defines a binary format).</figcaption>
+  </figure>
+
+  <h2 id="sec-extended">The extended query protocol</h2>
+  <p>The simple protocol re-parses and re-plans every statement. The extended protocol splits
+  the cycle into reusable steps: <code>Parse</code> ships the SQL once (with optional parameter
+  types) and names a <em>prepared statement</em>; <code>Bind</code> supplies parameter values,
+  turning the statement into a <em>portal</em>; <code>Execute</code> runs the portal (with an
+  optional row limit — zero means all rows); and <code>Sync</code> ends the batch, closing the
+  implicit transaction and triggering <code>ReadyForQuery</code>.<sup class="cite"><a href="#ref-1">1</a></sup>
+  The names matter: empty-string statement and portal names denote the <em>unnamed</em> ones,
+  which drivers use constantly. Prepared statements are why parameterized queries
+  (<code>WHERE id = $1</code>) are both faster and immune to SQL injection — the value never
+  passes through the parser.</p>
+
+  <figure>
+    <svg viewBox="0 0 920 300" role="img">
+      <title>Extended query sequence: Parse, Bind, Execute, Sync from client; ParseComplete,
+      BindComplete, DataRows, CommandComplete, ReadyForQuery from server.</title>
+      <line x1="200" y1="40" x2="200" y2="280" class="d-line"/>
+      <line x1="720" y1="40" x2="720" y2="280" class="d-line"/>
+      <rect x="140" y="14" width="120" height="30" rx="6" class="d-box"/>
+      <text x="200" y="34" text-anchor="middle" class="d-text">client</text>
+      <rect x="660" y="14" width="120" height="30" rx="6" class="d-box"/>
+      <text x="720" y="34" text-anchor="middle" class="d-text">server</text>
+      <path d="M 200 70 H 712" class="d-line-hl"/>
+      <text x="460" y="62" text-anchor="middle" class="d-mono-sm">Parse ('P') "SELECT … WHERE id = $1" → stmt S1</text>
+      <path d="M 720 100 H 208" class="d-line"/>
+      <text x="460" y="92" text-anchor="middle" class="d-mono-sm">ParseComplete ('1')</text>
+      <path d="M 200 130 H 712" class="d-line-hl"/>
+      <text x="460" y="122" text-anchor="middle" class="d-mono-sm">Bind ('B') S1 + params → portal</text>
+      <path d="M 720 160 H 208" class="d-line"/>
+      <text x="460" y="152" text-anchor="middle" class="d-mono-sm">BindComplete ('2')</text>
+      <path d="M 200 190 H 712" class="d-line-hl"/>
+      <text x="460" y="182" text-anchor="middle" class="d-mono-sm">Execute ('E') portal, max rows 0</text>
+      <path d="M 720 220 H 208" class="d-line"/>
+      <text x="460" y="212" text-anchor="middle" class="d-mono-sm">DataRow × N, CommandComplete</text>
+      <path d="M 200 250 H 712" class="d-line-hl"/>
+      <text x="330" y="242" text-anchor="middle" class="d-mono-sm">Sync ('S')</text>
+      <path d="M 720 272 H 208" class="d-line"/>
+      <text x="560" y="266" text-anchor="middle" class="d-mono-sm">ReadyForQuery ('Z')</text>
+    </svg>
+    <figcaption>Figure 3 — the extended protocol; Bind/Execute can repeat with new parameters
+    without re-parsing.<sup class="cite"><a href="#ref-1">1</a></sup></figcaption>
+  </figure>
+
+  <h2 id="sec-errors">Errors and transaction status</h2>
+  <p><code>ErrorResponse</code> is structured, not a string: a sequence of fields, each one code
+  byte plus a NUL-terminated value — <code>S</code>everity, SQLSTATE <code>C</code>ode,
+  <code>M</code>essage, optionally position and detail — terminated by a zero
+  byte.<sup class="cite"><a href="#ref-3">3</a></sup> FerricDB maps its error enum onto
+  SQLSTATEs (<code>Error::Serialization</code> → <code>40001</code>, parse errors →
+  <code>42601</code>), which is what lets a Rust client's retry loop work unmodified against
+  your server. And every <code>ReadyForQuery</code> carries the transaction status byte —
+  <code>'I'</code>dle, in-<code>'T'</code>ransaction, or <code>'E'</code>rror (statements
+  rejected until ROLLBACK) — which is how psql knows to change its prompt to
+  <code>=!&gt;</code>.<sup class="cite"><a href="#ref-3">3</a></sup> The classic beginner
+  mistake is forgetting to send ReadyForQuery after an error: the client waits politely,
+  forever.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="The Int32 length includes its own four bytes but not the type byte. Query('SELECT 1;') = 9 chars + NUL = 10 payload bytes, so length = 14, and the full wire message is 1 (type) + 14 = 15 bytes. Off-by-one here desynchronizes the whole stream.">
+    <legend class="quiz-q">For Query("SELECT 1;"), what value goes in the length field?</legend>
+    <label><input type="radio" name="q1"> 10 — the string plus its NUL terminator</label>
+    <label><input type="radio" name="q1" data-correct> 14 — payload (10) plus the length field itself (4), excluding the type byte</label>
+    <label><input type="radio" name="q1"> 15 — everything on the wire</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="A DataRow column is Int32 length + bytes, and the special length −1 marks NULL, with no value bytes following. An empty string is length 0 — different from NULL, on the wire as in SQL.">
+    <legend class="quiz-q">How does a NULL travel in a DataRow?</legend>
+    <label><input type="radio" name="q2"> As the 4-byte string "NULL"</label>
+    <label><input type="radio" name="q2"> As a zero-length value</label>
+    <label><input type="radio" name="q2" data-correct> As column length −1, with no value bytes</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="A Query string may contain several statements, each producing its own RowDescription/DataRow/CommandComplete series — so completion of one command can't signal the end of the cycle. ReadyForQuery is the single, separate 'all done, send the next thing' marker.">
+    <legend class="quiz-q">Why is ReadyForQuery a separate message rather than implied by CommandComplete?</legend>
+    <label><input type="radio" name="q3" data-correct> A query string may hold multiple statements; the client needs one end-of-cycle marker after all of them</label>
+    <label><input type="radio" name="q3"> Backward compatibility with protocol version 2</label>
+    <label><input type="radio" name="q3"> It carries the authentication state</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Parse compiles once; Bind supplies values without touching the parser; Execute runs the portal. Repeated Bind/Execute reuses the parse and plan — and because parameters never enter the SQL text, injection through values is structurally impossible.">
+    <legend class="quiz-q">What do prepared statements (Parse/Bind/Execute) buy over repeated simple Query?</legend>
+    <label><input type="radio" name="q4"> Compression of the result rows</label>
+    <label><input type="radio" name="q4" data-correct> One parse/plan reused across executions, plus parameters that bypass the SQL text entirely</label>
+    <label><input type="radio" name="q4"> They run outside transactions for speed</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">PostgreSQL Documentation, "Frontend/Backend Protocol — Message Flow" —
+          startup, simple query, extended query, and error/ReadyForQuery semantics.
+          <a href="https://www.postgresql.org/docs/current/protocol-flow.html" rel="external">https://www.postgresql.org/docs/current/protocol-flow.html</a>
+          (overview: <a href="https://www.postgresql.org/docs/current/protocol.html" rel="external">protocol.html</a>)</li>
+        <li id="ref-2">sunng87/pgwire — the Rust wire-protocol library structured as startup /
+          simple query / extended query sub-protocols; the Milestone 10 escape hatch.
+          <a href="https://github.com/sunng87/pgwire" rel="external">https://github.com/sunng87/pgwire</a>
+          (API docs: <a href="https://docs.rs/pgwire/latest/pgwire/" rel="external">docs.rs/pgwire</a>)</li>
+        <li id="ref-3">PostgreSQL Documentation, "Message Formats" — the byte-level layout of
+          every message: type bytes, self-inclusive lengths, StartupMessage's missing type
+          byte, DataRow's −1 NULL, ErrorResponse fields, ReadyForQuery status.
+          <a href="https://www.postgresql.org/docs/current/protocol-message-formats.html" rel="external">https://www.postgresql.org/docs/current/protocol-message-formats.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>Message Formats (ref 3), the full catalog — CopyData, NoticeResponse, and the cancel
+        request you get to ignore in Milestone 10.</li>
+      <li>pgwire's examples directory — a complete SQLite-backed Postgres-protocol server in a
+        few hundred lines; read it after hand-rolling yours to see what the library abstracts.
+        <a href="https://github.com/sunng87/pgwire" rel="external">github.com/sunng87/pgwire</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>What to build now: <a href="../../project/milestone-10/index.html">Milestone 10 —
+    PostgreSQL Wire Protocol Server</a>: the codec, the tokio accept loop, per-session
+    transactions — and then <code>psql -h localhost -p 5433</code>.</p>
+
+    <nav class="prevnext">
+      <a href="../../project/milestone-09/index.html"><span class="dir">← Previous</span> Milestone 9 · WAL &amp; ARIES Recovery</a>
+      <a class="next" href="../../project/milestone-10/index.html"><span class="dir">Next →</span> Milestone 10 · Wire Protocol Server</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+
+  // Query("SELECT 1;") on the wire: 'Q' + Int32(14) + "SELECT 1;\0"
+  var GROUPS = [
+    { bytes: ["51"], label: "'Q'", note: "Type byte: ASCII 'Q' = 0x51 identifies a simple Query message. Exactly one byte — and the one byte the length field does NOT count." },
+    { bytes: ["00", "00", "00", "0E"], label: "Int32 length = 14", note: "Big-endian Int32: 0x0000000E = 14 = 4 (this field itself) + 10 (payload). The receiver now reads exactly 10 more bytes." },
+    { bytes: ["53", "45", "4C", "45", "43", "54"], label: '"SELECT"', note: "The query string, UTF-8 text: S E L E C T." },
+    { bytes: ["20", "31", "3B"], label: '" 1;"', note: "space, '1', ';' — the rest of the statement text." },
+    { bytes: ["00"], label: "NUL", note: "Strings in the protocol are NUL-terminated. Total on the wire: 1 + 14 = 15 bytes. The server replies with RowDescription, one DataRow ('1'), CommandComplete 'SELECT 1', ReadyForQuery." }
+  ];
+
+  var canvas = document.getElementById("bx-canvas");
+  function render(step) {
+    canvas.textContent = "";
+    var svg = Course.svgEl("svg", { viewBox: "0 0 920 120", role: "img" });
+    svg.appendChild(Course.svgEl("title", null, "Byte layout of the Query message for SELECT 1;"));
+    var x = 20, idx = 0;
+    GROUPS.forEach(function (g, gi) {
+      g.bytes.forEach(function (b) {
+        var cls = gi === step ? "d-box-hl" : (gi < step ? "d-box-good" : "d-box");
+        svg.appendChild(Course.svgEl("rect", { x: x, y: 22, width: 54, height: 40, rx: 5, "class": cls }));
+        svg.appendChild(Course.svgEl("text", { x: x + 27, y: 47, "text-anchor": "middle", "class": "d-mono" }, b));
+        svg.appendChild(Course.svgEl("text", { x: x + 27, y: 14, "text-anchor": "middle", "class": "d-mono-sm" }, String(idx)));
+        x += 58; idx += 1;
+      });
+      svg.appendChild(Course.svgEl("text", {
+        x: x - g.bytes.length * 58 + (g.bytes.length * 58 - 4) / 2, y: 84,
+        "text-anchor": "middle", "class": gi === step ? "d-text" : "d-text-sm"
+      }, g.label));
+    });
+    canvas.appendChild(svg);
+  }
+  Course.stepper(document.getElementById("bx-stepper"), {
+    total: GROUPS.length,
+    captions: GROUPS.map(function (g) { return g.note; }),
+    render: render
+  });
+});
+</script>
+</body>
+</html>

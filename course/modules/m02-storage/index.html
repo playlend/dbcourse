@@ -1,0 +1,1003 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M02 · Storage: Files, Pages, Tuples — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+/* set theme before first paint to avoid flashing */
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M02 Storage</span>
+  </nav>
+  <span class="badge">Module 02</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M02 · Storage: Files, Pages, Tuples</h1>
+  <p class="subtitle">How a table becomes bytes: block devices, fixed-size pages, the slotted-page
+  layout, tuple headers, heap files, free-space tracking, and what to do with values too big to fit —
+  the ground floor you will pour in Milestone 1.</p>
+
+  <noscript><p class="noscript-warn">Interactive demos and self-check quizzes on this page need JavaScript;
+  all explanatory content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-disk">Why the disk dictates the design</a></li>
+      <li><a href="#sec-files">Files and fixed-size pages</a></li>
+      <li><a href="#sec-slotted">The slotted page</a></li>
+      <li><a href="#sec-tuples">Inside a tuple</a></li>
+      <li><a href="#sec-heap">Heap tables: writing and reading</a></li>
+      <li><a href="#sec-fsm">Free space management</a></li>
+      <li><a href="#sec-large">Large values: overflow and TOAST</a></li>
+      <li><a href="#sec-sqlite">Contrast: SQLite's single-file world</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-disk">Why the disk dictates the design</h2>
+
+  <p>Everything in this module — and most of what makes database internals interesting — follows from
+  one asymmetry: computation happens in memory, but the data does not fit there and must survive power
+  loss, so it lives on secondary storage that is orders of magnitude slower to reach.<sup class="cite"><a href="#ref-11">11</a></sup>
+  A spinning disk is a mechanical device: an arm assembly positions read/write heads over tracks on
+  platters rotating at around 15,000 RPM.<sup class="cite"><a href="#ref-11">11</a></sup> Reaching a byte
+  therefore costs three things: a <em>seek</em> to move the arm to the right track (2–3&nbsp;ms on
+  average), a <em>rotational delay</em> waiting for the sector to swing under the head (0–4&nbsp;ms at
+  15,000&nbsp;RPM), and the <em>transfer</em> itself (about 0.25&nbsp;ms per 64&nbsp;KB).<sup class="cite"><a href="#ref-11">11</a></sup></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Cost component</th><th>Ballpark</th><th>Paid when</th></tr></thead>
+      <tbody>
+        <tr><td>Seek time</td><td>2–3 ms average</td><td>Every jump to a different track</td></tr>
+        <tr><td>Rotational delay</td><td>0–4 ms (15,000 RPM)</td><td>Every non-adjacent read</td></tr>
+        <tr><td>Transfer time</td><td>≈ 0.25 ms per 64 KB</td><td>Always — the only cost you pay for sequential streaming</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Two consequences shape every storage engine. First, <strong>block granularity</strong>: the disk
+  does not sell you single bytes. The unit of transfer between disk and memory is a fixed-size
+  <em>block</em> (a multiple of the device's sector size); the database's <em>page</em> is sized to
+  match, and it is the smallest thing you ever read or write.<sup class="cite"><a href="#ref-11">11</a></sup>
+  Asking for one 8-byte integer costs the same I/O as asking for the whole page around it, so the game
+  is to make every page you touch earn its trip. Second, <strong>sequential beats random</strong>: if
+  the next page you want is physically adjacent, you pay only transfer time; if it is somewhere else,
+  you pay seek plus rotation again. Hard disks are therefore very bad at random reads, and laying data
+  out with spatial locality makes sequential scans dramatically faster.<sup class="cite"><a href="#ref-11">11</a></sup>
+  SSDs remove the mechanical penalty and offer fast random reads,<sup class="cite"><a href="#ref-11">11</a></sup>
+  but they still transfer fixed-size blocks, and the classic page-oriented design — which FerricDB
+  follows — remains how PostgreSQL, SQLite, and nearly every production engine is built.<sup class="cite"><a href="#ref-5">5</a></sup><sup class="cite"><a href="#ref-10">10</a></sup></p>
+
+  <div class="callout note">
+    <span class="callout-title">Where this goes next</span>
+    <p>Because pages are the unit of I/O, the database keeps a cache of recently used pages in memory
+    and counts its costs in "pages touched", not "bytes read". That cache is the buffer pool — the
+    whole subject of <a href="../m03-buffer-pool/index.html">M03</a>. This module is about what is
+    <em>inside</em> the pages.</p>
+  </div>
+
+  <h2 id="sec-files">Files and fixed-size pages</h2>
+
+  <p>Start from the top. A PostgreSQL server manages one <em>database cluster</em> — a collection of
+  databases — and identifies every database object (tables, indexes, and the databases themselves) by
+  an OID, an unsigned 4-byte integer recorded in system catalogs such as <code>pg_database</code> and
+  <code>pg_class</code>.<sup class="cite"><a href="#ref-1">1</a></sup> On disk, the cluster is a
+  directory tree: each database is a subdirectory of <code>base/</code> named after its OID, and each
+  table or index within it is stored in its own file, named by a number called the
+  <em>relfilenode</em> (usually, but not always, equal to the object's OID — operations like
+  <code>TRUNCATE</code>, <code>REINDEX</code>, or <code>CLUSTER</code> assign a fresh
+  filenode).<sup class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-6">6</a></sup>
+  When a relation grows past 1&nbsp;GB it is split into gigabyte-sized segment files named
+  <code>relfilenode.1</code>, <code>relfilenode.2</code>, and so on.<sup class="cite"><a href="#ref-6">6</a></sup>
+  Alongside the main file live auxiliary <em>forks</em>: a free space map (suffix <code>_fsm</code>)
+  and a visibility map (suffix <code>_vm</code>).<sup class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 940 330" role="img">
+      <title>Left: PostgreSQL stores each database as a directory of per-relation files with segments and forks. Right: FerricDB stores a whole database in a single file of equal-size pages.</title>
+      <text x="20" y="26" class="d-text">PostgreSQL — a directory tree, one file per relation</text>
+      <text x="20" y="58" class="d-mono">$PGDATA/</text>
+      <text x="40" y="84" class="d-mono">└─ base/</text>
+      <text x="60" y="110" class="d-mono">└─ 16384/</text>
+      <text x="180" y="110" class="d-text-sm">← database OID</text>
+      <rect x="100" y="126" width="130" height="26" rx="5" class="d-box"/>
+      <text x="110" y="143" class="d-mono-sm">16385</text>
+      <text x="245" y="143" class="d-text-sm">table, segment 0 (≤ 1 GB)</text>
+      <rect x="100" y="160" width="130" height="26" rx="5" class="d-box"/>
+      <text x="110" y="177" class="d-mono-sm">16385.1</text>
+      <text x="245" y="177" class="d-text-sm">segment 1: bytes past 1 GB</text>
+      <rect x="100" y="194" width="130" height="26" rx="5" class="d-box-warn"/>
+      <text x="110" y="211" class="d-mono-sm">16385_fsm</text>
+      <text x="245" y="211" class="d-text-sm">free space map fork</text>
+      <rect x="100" y="228" width="130" height="26" rx="5" class="d-box-warn"/>
+      <text x="110" y="245" class="d-mono-sm">16385_vm</text>
+      <text x="245" y="245" class="d-text-sm">visibility map fork</text>
+      <rect x="100" y="262" width="130" height="26" rx="5" class="d-box"/>
+      <text x="110" y="279" class="d-mono-sm">16386</text>
+      <text x="245" y="279" class="d-text-sm">an index — its own file</text>
+      <line x1="470" y1="20" x2="470" y2="310" class="d-line" stroke-dasharray="4 4"/>
+      <text x="500" y="26" class="d-text">FerricDB — one file per database (course choice)</text>
+      <rect x="500" y="46" width="420" height="200" rx="8" class="d-box"/>
+      <text x="512" y="70" class="d-mono-sm">bank.ferric</text>
+      <rect x="516" y="86" width="46" height="60" rx="4" class="d-box-hl"/>
+      <text x="539" y="120" text-anchor="middle" class="d-mono-sm">p0</text>
+      <rect x="566" y="86" width="46" height="60" rx="4" class="d-box-good"/>
+      <text x="589" y="120" text-anchor="middle" class="d-mono-sm">p1</text>
+      <rect x="616" y="86" width="46" height="60" rx="4" class="d-box-good"/>
+      <text x="639" y="120" text-anchor="middle" class="d-mono-sm">p2</text>
+      <rect x="666" y="86" width="46" height="60" rx="4" class="d-box"/>
+      <text x="689" y="120" text-anchor="middle" class="d-mono-sm">p3</text>
+      <rect x="716" y="86" width="46" height="60" rx="4" class="d-box"/>
+      <text x="739" y="120" text-anchor="middle" class="d-mono-sm">p4</text>
+      <rect x="766" y="86" width="46" height="60" rx="4" class="d-box"/>
+      <text x="789" y="120" text-anchor="middle" class="d-mono-sm">p5</text>
+      <rect x="816" y="86" width="46" height="60" rx="4" class="d-box"/>
+      <text x="839" y="120" text-anchor="middle" class="d-mono-sm">…</text>
+      <text x="516" y="176" class="d-text-sm">every page is 8,192 bytes</text>
+      <text x="516" y="198" class="d-text-sm">page N starts at byte N × 8192</text>
+      <text x="516" y="220" class="d-text-sm">p1, p2: heap pages of one table (linked)</text>
+      <text x="500" y="286" class="d-text-sm">SQLite makes the same single-file choice:</text>
+      <text x="500" y="306" class="d-text-sm">one “main database file”, pages numbered from 1.</text>
+    </svg>
+    <figcaption>Figure 1 — Two physical layouts for the same logical database. PostgreSQL maps each
+    relation to its own file (with 1&nbsp;GB segments and <code>_fsm</code>/<code>_vm</code>
+    forks);<sup class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-6">6</a></sup>
+    SQLite keeps the complete state of a database in one main database
+    file,<sup class="cite"><a href="#ref-10">10</a></sup> and FerricDB follows the single-file design.</figcaption>
+  </figure>
+
+  <p><strong>FerricDB's course choice:</strong> one file per database, managed by the
+  <code>DiskManager</code> in <code>course/ferricdb/crates/storage</code>. A table is not a file of its
+  own but a chain of pages inside the shared file — closer to SQLite's model, where the complete state
+  of a database normally lives in a single "main database file",<sup class="cite"><a href="#ref-10">10</a></sup>
+  than to PostgreSQL's file-per-relation tree. You get the same lessons with far less filesystem
+  bookkeeping.</p>
+
+  <p>Whatever the file layout, every engine here slices its files into <strong>fixed-size pages</strong>.
+  PostgreSQL uses pages of 8,192 bytes by default;<sup class="cite"><a href="#ref-7">7</a></sup>
+  SQLite allows any power of two between 512 and 65,536 bytes, fixed per database and recorded in the
+  file header.<sup class="cite"><a href="#ref-10">10</a></sup> Why fixed sizes? Because they buy you
+  <em>random access by arithmetic</em>: page <code>N</code> begins at byte <code>N × PAGE_SIZE</code>,
+  so any page can be located with one multiplication and fetched with one read — PostgreSQL numbers
+  the pages of a heap file sequentially from 0 and addresses them by block number this
+  way.<sup class="cite"><a href="#ref-3">3</a></sup> Fixed sizes also make free space interchangeable:
+  a page freed anywhere can be reused for anything, with no external fragmentation between pages, and
+  the buffer pool of M03 can manage memory as an array of identical frames. All reads and writes are
+  page-aligned and whole pages — SQLite states this explicitly for its main database
+  file.<sup class="cite"><a href="#ref-10">10</a></sup></p>
+
+  <div class="callout tip">
+    <span class="callout-title">FerricDB fixes the page size at 8 KB</span>
+    <p><code>ferricdb-common</code> declares <code>pub const PAGE_SIZE: usize = 8192;</code>. That is a
+    <em>course choice</em>, made to match PostgreSQL's default block size of
+    8&nbsp;kB<sup class="cite"><a href="#ref-7">7</a></sup> so that every number you compute for
+    FerricDB pages transfers directly to what you would observe in a real Postgres data directory.</p>
+  </div>
+
+  <h2 id="sec-slotted">The slotted page</h2>
+
+  <p>Now zoom into one 8&nbsp;KB heap page. If rows were fixed-size you could treat the page as an
+  array and index records by position, using a count or a bitmap to track occupied
+  slots.<sup class="cite"><a href="#ref-11">11</a></sup> Real rows are variable-length —
+  <code>TEXT</code> ruins everything — so pages need a smarter internal map. The near-universal answer
+  is the <em>slotted page</em>. PostgreSQL's version has three moving parts inside each
+  page:<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-7">7</a></sup></p>
+
+  <ul>
+    <li>a fixed 24-byte <strong>page header</strong> at offset 0 (<code>PageHeaderData</code>);<sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li>an array of 4-byte <strong>line pointers</strong> (<code>ItemIdData</code>) growing
+    <em>forward</em> from the header, each holding the byte offset, length, and a few flag bits of one
+    tuple;<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-7">7</a></sup></li>
+    <li>the <strong>tuple data</strong> itself, stacked <em>backward</em> from the end of the page toward
+    the middle.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+  </ul>
+
+  <p>The unallocated region between the end of the line-pointer array and the lowest-placed tuple is
+  the free space, informally "the hole".<sup class="cite"><a href="#ref-3">3</a></sup> Two header
+  fields fence it: <code>pd_lower</code> points just past the last line pointer (the start of free
+  space) and <code>pd_upper</code> points at the start of the most recently placed tuple (the end of
+  free space).<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-7">7</a></sup>
+  The full PostgreSQL page header, 24 bytes in all:<sup class="cite"><a href="#ref-7">7</a></sup></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Field</th><th>Bytes</th><th>What it stores</th></tr></thead>
+      <tbody>
+        <tr><td><code>pd_lsn</code></td><td>8</td><td>WAL position of the last change to this page (M10 territory)</td></tr>
+        <tr><td><code>pd_checksum</code></td><td>2</td><td>Page checksum</td></tr>
+        <tr><td><code>pd_flags</code></td><td>2</td><td>Flag bits</td></tr>
+        <tr><td><code>pd_lower</code></td><td>2</td><td>Offset to the start of free space</td></tr>
+        <tr><td><code>pd_upper</code></td><td>2</td><td>Offset to the end of free space</td></tr>
+        <tr><td><code>pd_special</code></td><td>2</td><td>Offset to the "special space" — empty in ordinary tables, used by index pages</td></tr>
+        <tr><td><code>pd_pagesize_version</code></td><td>2</td><td>Page size and layout version</td></tr>
+        <tr><td><code>pd_prune_xid</code></td><td>4</td><td>Oldest unpruned XMAX on the page, or zero</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>FerricDB's heap page is a deliberate near-copy. The <code>Page</code> type in
+  <code>course/ferricdb/crates/storage</code> reserves its first 16 bytes for a page LSN
+  (<code>u64</code>), a page-type tag (<code>u32</code>), and a reserved word (<code>u32</code>);
+  the <code>HeapPage</code> view adds <code>lower</code>, <code>upper</code>, a slot count, and flags,
+  bringing the heap header to the same 24 bytes as Postgres:</p>
+
+  <figure>
+    <svg viewBox="0 0 940 320" role="img">
+      <title>A FerricDB heap page: 24-byte header, slot array growing forward, free space, and tuple data growing backward from byte 8192. A zoomed strip shows the header fields with byte offsets.</title>
+      <path d="M150 26 h90 m0 0 l-10 -6 m10 6 l-10 6" class="d-line-hl"/>
+      <text x="152" y="18" class="d-text-sm">slot array grows →</text>
+      <path d="M880 26 h-90 m0 0 l10 -6 m-10 6 l10 6" class="d-line-hl"/>
+      <text x="700" y="18" class="d-text-sm">← tuple data grows</text>
+      <rect x="30" y="40" width="90" height="58" class="d-box-hl"/>
+      <text x="75" y="66" text-anchor="middle" class="d-text-sm">page</text>
+      <text x="75" y="82" text-anchor="middle" class="d-text-sm">header</text>
+      <rect x="120" y="40" width="180" height="58" class="d-box-good"/>
+      <text x="210" y="66" text-anchor="middle" class="d-text-sm">slot array</text>
+      <text x="210" y="82" text-anchor="middle" class="d-mono-sm">4 B per slot</text>
+      <rect x="300" y="40" width="330" height="58" class="d-box"/>
+      <text x="465" y="66" text-anchor="middle" class="d-text-sm">free space — “the hole”</text>
+      <text x="465" y="82" text-anchor="middle" class="d-mono-sm">upper − lower bytes</text>
+      <rect x="630" y="40" width="280" height="58" class="d-box-good"/>
+      <text x="770" y="66" text-anchor="middle" class="d-text-sm">tuple data</text>
+      <text x="770" y="82" text-anchor="middle" class="d-mono-sm">newest tuple lowest</text>
+      <text x="30" y="118" class="d-mono-sm">0</text>
+      <text x="120" y="118" text-anchor="middle" class="d-mono-sm">24</text>
+      <text x="300" y="118" text-anchor="middle" class="d-mono-sm">lower</text>
+      <text x="630" y="118" text-anchor="middle" class="d-mono-sm">upper</text>
+      <text x="910" y="118" text-anchor="end" class="d-mono-sm">8192</text>
+      <line x1="30" y1="98" x2="30" y2="170" class="d-line" stroke-dasharray="3 4"/>
+      <line x1="120" y1="98" x2="910" y2="170" class="d-line" stroke-dasharray="3 4"/>
+      <text x="30" y="162" class="d-text-sm">zoom: the 24-byte FerricDB heap page header</text>
+      <rect x="30" y="176" width="220" height="56" class="d-box-warn"/>
+      <text x="140" y="200" text-anchor="middle" class="d-mono-sm">page_lsn: u64</text>
+      <text x="140" y="218" text-anchor="middle" class="d-text-sm">written by the WAL (M10)</text>
+      <rect x="250" y="176" width="120" height="56" class="d-box"/>
+      <text x="310" y="200" text-anchor="middle" class="d-mono-sm">page_type</text>
+      <text x="310" y="218" text-anchor="middle" class="d-mono-sm">u32</text>
+      <rect x="370" y="176" width="120" height="56" class="d-box"/>
+      <text x="430" y="200" text-anchor="middle" class="d-mono-sm">reserved</text>
+      <text x="430" y="218" text-anchor="middle" class="d-mono-sm">u32</text>
+      <rect x="490" y="176" width="90" height="56" class="d-box-hl"/>
+      <text x="535" y="200" text-anchor="middle" class="d-mono-sm">lower</text>
+      <text x="535" y="218" text-anchor="middle" class="d-mono-sm">u16</text>
+      <rect x="580" y="176" width="90" height="56" class="d-box-hl"/>
+      <text x="625" y="200" text-anchor="middle" class="d-mono-sm">upper</text>
+      <text x="625" y="218" text-anchor="middle" class="d-mono-sm">u16</text>
+      <rect x="670" y="176" width="110" height="56" class="d-box"/>
+      <text x="725" y="200" text-anchor="middle" class="d-mono-sm">slot_count</text>
+      <text x="725" y="218" text-anchor="middle" class="d-mono-sm">u16</text>
+      <rect x="780" y="176" width="130" height="56" class="d-box"/>
+      <text x="845" y="200" text-anchor="middle" class="d-mono-sm">flags: u16</text>
+      <text x="30" y="256" class="d-mono-sm">0</text>
+      <text x="250" y="256" text-anchor="middle" class="d-mono-sm">8</text>
+      <text x="370" y="256" text-anchor="middle" class="d-mono-sm">12</text>
+      <text x="490" y="256" text-anchor="middle" class="d-mono-sm">16</text>
+      <text x="580" y="256" text-anchor="middle" class="d-mono-sm">18</text>
+      <text x="670" y="256" text-anchor="middle" class="d-mono-sm">20</text>
+      <text x="780" y="256" text-anchor="middle" class="d-mono-sm">22</text>
+      <text x="910" y="256" text-anchor="end" class="d-mono-sm">24</text>
+      <text x="30" y="292" class="d-text-sm">Slot states: live (points at a tuple) · dead (tombstone) · unused (reusable). Postgres packs offset,</text>
+      <text x="30" y="310" class="d-text-sm">flags and length into each 4-byte ItemIdData the same way.</text>
+    </svg>
+    <figcaption>Figure 2 — The FerricDB heap page (byte offsets exact, widths not to scale). The
+    layout mirrors PostgreSQL's: a 24-byte header with free-space fences <code>pd_lower</code> /
+    <code>pd_upper</code>, 4-byte line pointers growing forward, tuples stacked from byte 8192
+    backward.<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-7">7</a></sup></figcaption>
+  </figure>
+
+  <p>Why this mirror-image arrangement? Because neither side knows in advance how many entries it will
+  need. A page might hold three enormous tuples or three hundred tiny ones; letting the pointer array
+  and the data area grow toward each other means neither has to be pre-sized, and the page is full
+  exactly when they meet. CS186's notes describe the same design with the directory placed in a footer
+  growing from the page's other end — a mirror image with identical
+  properties.<sup class="cite"><a href="#ref-11">11</a></sup></p>
+
+  <p>The indirection through line pointers is the quietly brilliant part. Everyone outside the page —
+  most importantly indexes — refers to a tuple by its <em>TID</em>: the pair (block number, line
+  pointer number).<sup class="cite"><a href="#ref-3">3</a></sup> Because the reference names a slot
+  rather than a byte offset, the page is free to shuffle tuple bytes around during compaction: it
+  updates the offsets stored inside its own slots and every external reference remains valid —
+  precisely the reason PostgreSQL gives for the <code>ItemIdData</code>
+  layer.<sup class="cite"><a href="#ref-7">7</a></sup> FerricDB's <code>RecordId { page_id, slot }</code>
+  is the same idea; Postgres calls it the <code>ctid</code>. One numbering quirk to remember:
+  PostgreSQL offset numbers count from 1,<sup class="cite"><a href="#ref-3">3</a></sup> while
+  FerricDB slots are ordinary Rust indices counting from 0 — a course choice you will thank us for
+  when you write <code>slots[rid.slot as usize]</code>.</p>
+
+  <div class="widget" id="widget-slotted">
+    <p class="widget-title">Interactive: life inside one 8 KB slotted page</p>
+    <p class="widget-sub">Insert tuples and watch the slot array grow forward while data stacks
+    backward; delete to leave tombstones; compact to reclaim dead bytes. Green = live data, red =
+    tombstoned, plain = free. Tiny regions are widened to stay visible — the printed byte offsets are
+    exact.</p>
+    <div class="controls">
+      <label for="sp-size">Tuple size</label>
+      <select id="sp-size">
+        <option value="48">48 B — one accounts row</option>
+        <option value="128">128 B</option>
+        <option value="256">256 B</option>
+        <option value="512" selected>512 B</option>
+        <option value="1024">1024 B</option>
+        <option value="2048">2048 B</option>
+      </select>
+      <button class="btn primary" type="button" id="sp-insert">Insert tuple</button>
+      <label for="sp-victim">Victim</label>
+      <select id="sp-victim"></select>
+      <button class="btn" type="button" id="sp-delete">Delete (tombstone)</button>
+      <button class="btn" type="button" id="sp-compact">Compact</button>
+      <button class="btn" type="button" id="sp-reset">↺ Reset</button>
+    </div>
+    <div class="stat-row" id="sp-stats"></div>
+    <div id="sp-canvas"></div>
+    <p class="muted" id="sp-msg" role="status">Try: insert until the page fills, delete a few tuples,
+    watch inserts still fail, then compact.</p>
+  </div>
+
+  <p>Play with the failure mode: fill the page, tombstone two tuples, and try to insert again. The
+  insert still fails — deleting only marks slots dead; the bytes sit where they were, and the hole
+  between <code>lower</code> and <code>upper</code> has not grown. Only compaction slides the survivors
+  back against the end of the page and turns dead slots into reusable ones. PostgreSQL behaves the same
+  way: space from deleted tuples is reclaimed lazily (by pruning and vacuum, guided by header fields
+  like <code>pd_prune_xid</code>), not at <code>DELETE</code> time.<sup class="cite"><a href="#ref-7">7</a></sup></p>
+
+  <h2 id="sec-tuples">Inside a tuple</h2>
+
+  <p>A tuple on a page is not just the row's values; it carries a header that the engine uses for
+  versioning and decoding. PostgreSQL's <code>HeapTupleHeaderData</code> occupies a fixed 23 bytes on
+  most machines:<sup class="cite"><a href="#ref-7">7</a></sup> <code>t_xmin</code> (4&nbsp;B) records
+  the ID of the inserting transaction, <code>t_xmax</code> (4&nbsp;B) the deleting one,
+  <code>t_cid</code> (4&nbsp;B) a command counter within the transaction (sharing its bytes with
+  <code>t_xvac</code>), <code>t_ctid</code> (6&nbsp;B) the TID of this or a newer version of the row,
+  two 2-byte flag words <code>t_infomask2</code> (which also holds the attribute count) and
+  <code>t_infomask</code>, and the 1-byte <code>t_hoff</code> giving the offset where user data
+  begins.<sup class="cite"><a href="#ref-7">7</a></sup> If any column is NULL, a <em>null bitmap</em>
+  follows the fixed header, one bit per column, with 1 meaning not-null; if the
+  <code>HEAP_HASNULL</code> flag is clear, there is no bitmap and every column is
+  present.<sup class="cite"><a href="#ref-7">7</a></sup> Finally, padding aligns <code>t_hoff</code>
+  to a multiple of the platform's <code>MAXALIGN</code>, because Postgres reads fields in place
+  through C pointers.<sup class="cite"><a href="#ref-7">7</a></sup></p>
+
+  <p>FerricDB keeps the ideas and drops the ballast. A stored tuple is
+  <code>TupleMeta</code> — <code>xmin: u64</code>, <code>xmax: u64</code>, 16 bytes — followed by the
+  serialized payload: a null bitmap (one bit per column, rounded up to whole bytes), then the values
+  in schema order, with <code>TEXT</code> encoded as a <code>u32</code> length prefix plus UTF-8
+  bytes. Three simplifications, all course choices: 64-bit transaction IDs sidestep the wraparound
+  machinery that 4-byte XIDs force on Postgres;<sup class="cite"><a href="#ref-7">7</a></sup> there is
+  no alignment padding because FerricDB decodes bytes into <code>Value</code>s rather than casting
+  pointers at them; and there is no <code>ctid</code> chain or command ID until you need them. The
+  <code>xmin</code>/<code>xmax</code> fields are written as 0 from Milestone 1 onward and simply ride
+  along — they come alive in <a href="../m09-transactions-mvcc/index.html">M09</a>, when Milestone 8
+  starts stamping them to decide which transactions can see which tuple versions.</p>
+
+  <figure>
+    <svg viewBox="0 0 940 310" role="img">
+      <title>Byte layout of a FerricDB stored tuple for a three-column accounts row, 48 bytes total, above the PostgreSQL HeapTupleHeaderData that inspired it.</title>
+      <text x="30" y="24" class="d-text">FerricDB stored tuple (course format) — accounts row, 48 B total</text>
+      <rect x="30" y="38" width="147" height="52" class="d-box-warn"/>
+      <text x="103" y="60" text-anchor="middle" class="d-mono-sm">xmin: u64</text>
+      <text x="103" y="78" text-anchor="middle" class="d-text-sm">0 until M09</text>
+      <rect x="177" y="38" width="147" height="52" class="d-box-warn"/>
+      <text x="250" y="60" text-anchor="middle" class="d-mono-sm">xmax: u64</text>
+      <text x="250" y="78" text-anchor="middle" class="d-text-sm">0 = live</text>
+      <rect x="324" y="38" width="18" height="52" class="d-box-hl"/>
+      <rect x="342" y="38" width="147" height="52" class="d-box"/>
+      <text x="415" y="60" text-anchor="middle" class="d-mono-sm">id: i64</text>
+      <rect x="489" y="38" width="73" height="52" class="d-box"/>
+      <text x="525" y="60" text-anchor="middle" class="d-mono-sm">len: u32</text>
+      <text x="525" y="78" text-anchor="middle" class="d-mono-sm">= 11</text>
+      <rect x="562" y="38" width="202" height="52" class="d-box"/>
+      <text x="663" y="60" text-anchor="middle" class="d-mono-sm">owner · 11 B UTF-8</text>
+      <rect x="764" y="38" width="147" height="52" class="d-box"/>
+      <text x="837" y="60" text-anchor="middle" class="d-mono-sm">balance: i64</text>
+      <line x1="333" y1="38" x2="300" y2="16" class="d-line"/>
+      <text x="296" y="12" text-anchor="end" class="d-text-sm">null bitmap: 1 bit per column, 1 byte here</text>
+      <text x="30" y="110" class="d-mono-sm">0</text>
+      <text x="177" y="110" text-anchor="middle" class="d-mono-sm">8</text>
+      <text x="324" y="110" text-anchor="middle" class="d-mono-sm">16</text>
+      <text x="342" y="110" text-anchor="middle" class="d-mono-sm">17</text>
+      <text x="489" y="110" text-anchor="middle" class="d-mono-sm">25</text>
+      <text x="562" y="110" text-anchor="middle" class="d-mono-sm">29</text>
+      <text x="764" y="110" text-anchor="middle" class="d-mono-sm">40</text>
+      <text x="911" y="110" text-anchor="end" class="d-mono-sm">48</text>
+      <text x="30" y="160" class="d-text">PostgreSQL HeapTupleHeaderData — the cited inspiration (23 B fixed header)</text>
+      <rect x="30" y="174" width="108" height="52" class="d-box-warn"/>
+      <text x="84" y="196" text-anchor="middle" class="d-mono-sm">t_xmin</text>
+      <text x="84" y="214" text-anchor="middle" class="d-mono-sm">4 B</text>
+      <rect x="138" y="174" width="108" height="52" class="d-box-warn"/>
+      <text x="192" y="196" text-anchor="middle" class="d-mono-sm">t_xmax</text>
+      <text x="192" y="214" text-anchor="middle" class="d-mono-sm">4 B</text>
+      <rect x="246" y="174" width="108" height="52" class="d-box"/>
+      <text x="300" y="196" text-anchor="middle" class="d-mono-sm">t_cid</text>
+      <text x="300" y="214" text-anchor="middle" class="d-mono-sm">4 B</text>
+      <rect x="354" y="174" width="162" height="52" class="d-box"/>
+      <text x="435" y="196" text-anchor="middle" class="d-mono-sm">t_ctid</text>
+      <text x="435" y="214" text-anchor="middle" class="d-mono-sm">6 B (block, offset)</text>
+      <rect x="516" y="174" width="54" height="52" class="d-box"/>
+      <text x="543" y="196" text-anchor="middle" class="d-mono-sm">mask2</text>
+      <text x="543" y="214" text-anchor="middle" class="d-mono-sm">2 B</text>
+      <rect x="570" y="174" width="54" height="52" class="d-box"/>
+      <text x="597" y="196" text-anchor="middle" class="d-mono-sm">mask</text>
+      <text x="597" y="214" text-anchor="middle" class="d-mono-sm">2 B</text>
+      <rect x="624" y="174" width="27" height="52" class="d-box-hl"/>
+      <rect x="651" y="174" width="80" height="52" class="d-box-hl"/>
+      <text x="691" y="196" text-anchor="middle" class="d-mono-sm">null</text>
+      <text x="691" y="214" text-anchor="middle" class="d-mono-sm">bitmap</text>
+      <rect x="731" y="174" width="60" height="52" class="d-box"/>
+      <text x="761" y="196" text-anchor="middle" class="d-mono-sm">pad</text>
+      <rect x="791" y="174" width="120" height="52" class="d-box-good"/>
+      <text x="851" y="196" text-anchor="middle" class="d-mono-sm">user data</text>
+      <text x="851" y="214" text-anchor="middle" class="d-mono-sm">@ t_hoff</text>
+      <line x1="637" y1="226" x2="620" y2="252" class="d-line"/>
+      <text x="616" y="268" class="d-mono-sm">t_hoff: 1 B</text>
+      <text x="30" y="246" class="d-mono-sm">0</text>
+      <text x="138" y="246" text-anchor="middle" class="d-mono-sm">4</text>
+      <text x="246" y="246" text-anchor="middle" class="d-mono-sm">8</text>
+      <text x="354" y="246" text-anchor="middle" class="d-mono-sm">12</text>
+      <text x="516" y="246" text-anchor="middle" class="d-mono-sm">18</text>
+      <text x="570" y="246" text-anchor="middle" class="d-mono-sm">20</text>
+      <text x="624" y="246" text-anchor="middle" class="d-mono-sm">22</text>
+      <text x="651" y="246" text-anchor="middle" class="d-mono-sm">23</text>
+      <text x="30" y="300" class="d-text-sm">pad aligns t_hoff to MAXALIGN; the bitmap exists only when the HEAP_HASNULL flag is set.</text>
+    </svg>
+    <figcaption>Figure 3 — Top: the FerricDB tuple format for
+    <code>accounts(id INTEGER, owner TEXT, balance INTEGER)</code> with an 11-byte owner string.
+    Bottom: PostgreSQL's <code>HeapTupleHeaderData</code>, whose <code>t_xmin</code>/<code>t_xmax</code>
+    stamps, null bitmap, and <code>t_hoff</code> data offset are the direct inspiration.<sup class="cite"><a href="#ref-7">7</a></sup></figcaption>
+  </figure>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall: pointers inside pages</span>
+    <p>Nothing stored <em>in</em> a page may be a memory address — pages get written out, read back at
+    a different address, and shipped between machines. Everything internal is a byte offset relative to
+    the page start; everything external is a (page, slot) pair. If you find yourself serializing a Rust
+    reference in Milestone 1, stop.</p>
+  </div>
+
+  <h2 id="sec-heap">Heap tables: writing and reading</h2>
+
+  <p>A <em>heap table</em> is the simplest file organization: pages hold tuples in no particular
+  order, and neither pages nor the records within them are sorted.<sup class="cite"><a href="#ref-11">11</a></sup>
+  Insertion is append-where-there's-room; any ordering the query needs is imposed later by indexes
+  (<a href="../m04-data-structures-indexes/index.html">M04</a>) or by sorting at execution time.
+  How do you find a page with room? CS186's notes give two classic wirings: a <em>linked list</em> of
+  pages hanging off a header page (optionally split into full and free lists), or a <em>page
+  directory</em> — header pages holding entries of (data-page pointer, free bytes remaining) — which
+  makes insertion cheaper because you scan compact directory entries instead of touching every data
+  page.<sup class="cite"><a href="#ref-11">11</a></sup> FerricDB's Milestone-1 <code>HeapFile</code>
+  is the linked design: a chain of heap pages starting at <code>first_page</code>, walked in order —
+  simple, and good enough until M03 gives you cheap page access.</p>
+
+  <p>The write path, following PostgreSQL's own description:<sup class="cite"><a href="#ref-4">4</a></sup>
+  to insert a tuple into a page, the engine appends a new line pointer (moving <code>pd_lower</code> up
+  by 4 bytes), copies the tuple's bytes into the hole ending where the previous newest tuple began
+  (moving <code>pd_upper</code> down by the tuple's size), and points the new line pointer at them.
+  The second tuple on a page sits <em>below</em> the first — stacked from the bottom — and so
+  on.<sup class="cite"><a href="#ref-4">4</a></sup> Reads come in two flavors: a <em>sequential
+  scan</em> visits every page and follows every line pointer on each,<sup class="cite"><a href="#ref-4">4</a></sup>
+  while an <em>index scan</em> finds, in the index, an entry pairing a key with a TID — say
+  (block&nbsp;=&nbsp;7, offset&nbsp;=&nbsp;2) — reads just that block, and follows just that line
+  pointer.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+
+  <h3 id="sec-worked">Worked example: one million account rows</h3>
+
+  <p>Concrete numbers, using the FerricDB formats above. Table:
+  <code>accounts(id INTEGER, owner TEXT, balance INTEGER)</code>, with owner strings averaging 11
+  bytes. Per tuple:</p>
+
+  <ul>
+    <li>payload = null bitmap (⌈3/8⌉ = 1&nbsp;B) + <code>id</code> (8&nbsp;B) + owner
+    (4&nbsp;B length + 11&nbsp;B) + <code>balance</code> (8&nbsp;B) = <strong>32&nbsp;B</strong>;</li>
+    <li>stored tuple = 16&nbsp;B <code>TupleMeta</code> + 32&nbsp;B payload = <strong>48&nbsp;B</strong>;</li>
+    <li>page cost per row = 48&nbsp;B + one 4&nbsp;B slot = <strong>52&nbsp;B</strong>.</li>
+  </ul>
+
+  <p>A page offers 8192 − 24 = 8168 usable bytes, so ⌊8168 / 52⌋ = <strong>157 rows per page</strong>
+  (157 × 52 = 8164, leaving a 4-byte hole — too small for anything, and that's fine). One million rows
+  need ⌈1,000,000 / 157⌉ = <strong>6,370 pages ≈ 49.8&nbsp;MiB</strong>. Now price a full scan with
+  CS186's ballpark disk numbers:<sup class="cite"><a href="#ref-11">11</a></sup> read sequentially,
+  you pay one arm movement (≈ 4.5&nbsp;ms) plus transfer: 49.8&nbsp;MiB at 0.25&nbsp;ms per 64&nbsp;KB
+  ≈ <strong>0.2&nbsp;s</strong>. Read the same 6,370 pages in random order and every page costs a
+  seek plus rotation plus its transfer, ≈ 4.5&nbsp;ms each: about <strong>29&nbsp;s</strong> — the
+  identical bytes, roughly 140× slower. That two-orders-of-magnitude gap is why heap files keep a
+  table's pages together, why scans stream pages in order, and why the planner you build in M08 will
+  treat "how many random pages does this plan touch?" as the dominant cost question.</p>
+
+  <h2 id="sec-fsm">Free space management</h2>
+
+  <p>When a tuple arrives, which page takes it? Scanning the whole heap for a gap would make inserts
+  O(table size). PostgreSQL answers with the <em>Free Space Map</em>: nearly every heap and index
+  relation (hash indexes excepted) has an FSM stored in its <code>_fsm</code>
+  fork.<sup class="cite"><a href="#ref-8">8</a></sup> The FSM is a tree of FSM pages: at the bottom
+  level, one byte per heap page records how much free space that page has; each upper level stores,
+  per node, the larger of its two children's values, so the maximum available anywhere in the relation
+  bubbles up to the root.<sup class="cite"><a href="#ref-8">8</a></sup> To place a tuple, descend from
+  the root toward any leaf whose byte promises enough room — a logarithmic search instead of a heap
+  scan. The one-byte-per-page resolution is deliberately coarse: the FSM is a hint, cheap to maintain,
+  not an exact ledger.<sup class="cite"><a href="#ref-8">8</a></sup></p>
+
+  <p>FerricDB in Milestone 1 does the honest simple thing instead: <code>HeapFile::insert</code> walks
+  the page chain asking each page's <code>free_space()</code> until one fits, appending a fresh page at
+  the end of the chain if none does. That is O(pages) per insert and clearly worse — which is the
+  point: when your inserts crawl on a big table, you will know exactly why Postgres bothers with an
+  FSM fork, and building a small page-directory or FSM-style summary is a natural stretch goal.</p>
+
+  <h2 id="sec-large">Large values: overflow and TOAST</h2>
+
+  <p>Fixed-size pages have an obvious blind spot: a 100&nbsp;KB <code>TEXT</code> value does not fit
+  in an 8&nbsp;KB page, and PostgreSQL does not allow a tuple to span multiple
+  pages.<sup class="cite"><a href="#ref-9">9</a></sup> Every page-based engine needs an escape hatch,
+  and the two systems we track solve it differently:</p>
+
+  <div class="tabs">
+    <div class="tab-list" role="tablist">
+      <button type="button" role="tab" aria-selected="true">PostgreSQL: TOAST</button>
+      <button type="button" role="tab" aria-selected="false">SQLite: overflow pages</button>
+    </div>
+    <div class="tab-panel">
+      <p>TOAST — "The Oversized-Attribute Storage Technique" — kicks in when a row exceeds
+      <code>TOAST_TUPLE_THRESHOLD</code> (normally 2&nbsp;kB). The engine then compresses and/or moves
+      the widest values out of line until the row drops below <code>TOAST_TUPLE_TARGET</code> (also
+      2&nbsp;kB by default).<sup class="cite"><a href="#ref-9">9</a></sup> Only variable-length
+      (<em>varlena</em>) types participate: their first 4-byte word holds the value's total length, and
+      TOAST borrows two bits of it, capping any TOASTable value at 1&nbsp;GB
+      (2<sup>30</sup>&nbsp;−&nbsp;1 bytes).<sup class="cite"><a href="#ref-9">9</a></sup></p>
+      <p>An out-of-line value is chopped into chunks of at most <code>TOAST_MAX_CHUNK_SIZE</code>
+      (about 2,000&nbsp;B, sized so four chunk rows fill a page) and the chunks become rows —
+      (<code>chunk_id</code>, <code>chunk_seq</code>, <code>chunk_data</code>) — in a companion TOAST
+      table with a unique index on (<code>chunk_id</code>, <code>chunk_seq</code>).<sup class="cite"><a href="#ref-9">9</a></sup>
+      The main tuple keeps only an 18-byte TOAST pointer recording where the value went and its
+      sizes.<sup class="cite"><a href="#ref-9">9</a></sup> Per-column strategies tune the behavior:
+      <code>PLAIN</code> (no compression, no out-of-line), <code>EXTENDED</code> (both — the default
+      for most TOASTable types), <code>EXTERNAL</code> (out-of-line only, which speeds substring
+      operations on wide <code>text</code>/<code>bytea</code>), and <code>MAIN</code> (compression
+      only, out-of-line as a last resort).<sup class="cite"><a href="#ref-9">9</a></sup> The elegance:
+      the 100&nbsp;KB value is stored <em>as ordinary rows in an ordinary table</em>, reusing the very
+      heap machinery this module describes.</p>
+    </div>
+    <div class="tab-panel" hidden>
+      <p>SQLite spills instead of relocating. When a b-tree cell's payload exceeds a threshold computed
+      from the page's usable size, a prefix stays on the b-tree page and the surplus moves to a chain
+      of <em>overflow pages</em>: the first 4 bytes of each overflow page hold the page number of the
+      next page in the chain (zero marks the last), and the rest is
+      content.<sup class="cite"><a href="#ref-10">10</a></sup> The thresholds are tuned so that a
+      b-tree page keeps a minimum fanout of 4 and enough of the payload stays local that the record
+      header can usually be parsed without visiting the chain at
+      all.<sup class="cite"><a href="#ref-10">10</a></sup></p>
+      <p>Reading the tail of a large value means walking the linked list page by page — sequential
+      pointer-chasing, exactly the random-I/O pattern the first section priced out. Compare TOAST's
+      chunk table: with an index on (<code>chunk_id</code>, <code>chunk_seq</code>), Postgres can jump
+      straight to the middle chunk of a value.<sup class="cite"><a href="#ref-9">9</a></sup></p>
+    </div>
+  </div>
+
+  <p>FerricDB's Milestone-1 course choice is stricter than either: a tuple must fit in one page, and
+  <code>HeapPage::insert</code> simply refuses oversized rows (<code>Error::PageFull</code>). You will
+  feel the ceiling the first time you store a long string — a TOAST-style companion table is a lovely
+  stretch project once the heap works.</p>
+
+  <h2 id="sec-sqlite">Contrast: SQLite's single-file world</h2>
+
+  <p>SQLite is the sharpest available contrast to the Postgres storage story, because it makes
+  different choices at almost every layer while still being a page-based relational engine. The whole
+  database — schema, every table, every index — normally lives in one file, divided into equal-size
+  pages numbered from 1; the page size is a power of two between 512 and 65,536, read from a 2-byte
+  field at offset 16 of the file's 100-byte header, which begins with the magic string
+  <code>"SQLite format 3\0"</code>.<sup class="cite"><a href="#ref-10">10</a></sup></p>
+
+  <div class="tabs">
+    <div class="tab-list" role="tablist">
+      <button type="button" role="tab" aria-selected="true">PostgreSQL / FerricDB: heap rows</button>
+      <button type="button" role="tab" aria-selected="false">SQLite: rows in a table b-tree</button>
+    </div>
+    <div class="tab-panel">
+      <p>A table is an unordered heap; rows go wherever there is room, and the row's address — the TID
+      (block, offset number) — is stable enough for indexes to point at.<sup class="cite"><a href="#ref-3">3</a></sup>
+      Indexes are physically separate structures (separate files in Postgres,<sup class="cite"><a href="#ref-6">6</a></sup>
+      separate page chains in FerricDB) whose entries map keys to TIDs.<sup class="cite"><a href="#ref-4">4</a></sup>
+      Finding a row by primary key therefore always means: search the index for a TID, then fetch the
+      heap page it names.</p>
+    </div>
+    <div class="tab-panel" hidden>
+      <p>There is no heap. Each table <em>is</em> a b-tree keyed by the 64-bit signed integer rowid;
+      the row's column values, encoded in SQLite's record format, are the payload of a leaf cell, and
+      interior pages hold only keys and child pointers.<sup class="cite"><a href="#ref-10">10</a></sup>
+      A rowid lookup walks one tree and arrives at the data itself. Within each b-tree page you will
+      recognize our slotted layout in mirror finish: after the 8-byte (leaf) or 12-byte (interior) page
+      header comes an array of 2-byte cell pointers kept in key order, while the cells themselves are
+      packed toward the end of the page, unallocated space between them; freed cells go on a freeblock
+      chain, and 1–3-byte scraps too small for a freeblock are counted as fragmented
+      bytes in the page header.<sup class="cite"><a href="#ref-10">10</a></sup></p>
+      <p>Values are self-describing: each record starts with a varint header of "serial type" codes —
+      NULL costs zero bytes of payload, integers come in 1/2/3/4/6/8-byte flavors, and odd codes
+      ≥ 13 mean a string of (N−13)/2 bytes.<sup class="cite"><a href="#ref-10">10</a></sup> FerricDB
+      instead trusts the catalog's schema to drive decoding — which is why
+      <code>tuple::deserialize</code> takes a <code>&amp;Schema</code>.</p>
+    </div>
+  </div>
+
+  <p>Neither design dominates. Clustering rows in a rowid b-tree makes primary-key range scans
+  naturally sequential, but every insert must find its sorted position, and secondary indexes must
+  reference rowids through a second tree descent. The heap makes inserts trivially cheap and gives
+  every row a direct physical address, at the price of a heap fetch after every index lookup. You are
+  building the heap design; by <a href="../m04-data-structures-indexes/index.html">M04</a>, when
+  B+Trees arrive, you will be equipped to argue both sides.</p>
+
+  <div class="callout source">
+    <span class="callout-title">Attribution</span>
+    <p>The heap-page and tuple walkthrough in this module follows chapter&nbsp;1 of Hironobu Suzuki's
+    <em>The Internals of PostgreSQL</em> and the PostgreSQL "Database Physical Storage" chapter; the
+    SQLite material follows the sqlite.org file-format specification. All figures on this page are
+    original redrawings.</p>
+  </div>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="Fixed-size pages give random access by arithmetic: page N lives at byte N × PAGE_SIZE, so one multiplication locates any page, and a freed page can be recycled for any future page without fragmentation between pages. They also let the M03 buffer pool manage memory as identical frames. Compression is unrelated, and the OS reads whatever size you ask — it just costs more when access is scattered.">
+    <legend class="quiz-q">Why do FerricDB, PostgreSQL, and SQLite all carve their files into fixed-size pages?</legend>
+    <label><input type="radio" name="q-pages"> Fixed-size chunks compress better than variable-size ones</label>
+    <label><input type="radio" name="q-pages" data-correct> Page N sits at byte N × page size, so any page is one computed offset away, and freed pages are interchangeable for reuse</label>
+    <label><input type="radio" name="q-pages"> Operating systems are unable to read variable amounts from a file</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="The slot array grows forward — appending one 4-byte line pointer moves lower up by 4 — while tuple bytes stack backward from the end, moving upper down by the tuple's size (48 here). The hole shrinks by 52 bytes total. Nothing waits for commit: visibility is xmin/xmax's job (M09), not the page geometry's.">
+    <legend class="quiz-q">A fresh 48-byte tuple is inserted into a FerricDB heap page, using a brand-new slot. What happens to <code>lower</code> and <code>upper</code>?</legend>
+    <label><input type="radio" name="q-lowup"> <code>lower</code> += 48, <code>upper</code> −= 4</label>
+    <label><input type="radio" name="q-lowup" data-correct> <code>lower</code> += 4, <code>upper</code> −= 48</label>
+    <label><input type="radio" name="q-lowup"> Neither moves until the transaction commits</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="The line-pointer layer is indirection: outside references name a slot, and the slot holds the current byte offset. During compaction the page rewrites its own slots' offsets and every external TID stays valid — PostgreSQL cites exactly this as the reason ItemIdData exists. Slot size and offset width are red herrings.">
+    <legend class="quiz-q">Why does a TID / <code>RecordId</code> name a <em>slot number</em> instead of the tuple's byte offset within the page?</legend>
+    <label><input type="radio" name="q-tid"> Because byte offsets up to 8192 don't fit in the available bits</label>
+    <label><input type="radio" name="q-tid" data-correct> So the page can move tuple bytes during compaction without invalidating index entries and other external references</label>
+    <label><input type="radio" name="q-tid"> Because slot numbers compress better in index pages</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Delete is a tombstone: the slot is marked dead (in MVCC terms, xmax is stamped) and the bytes stay put, because concurrent transactions may still be entitled to see the old version — the M09 story. Space returns later, when pruning/vacuum (Postgres) or compaction (your widget, your Milestone 1 code) defragments the page.">
+    <legend class="quiz-q">Immediately after <code>DELETE</code> removes one row, what has changed on its heap page?</legend>
+    <label><input type="radio" name="q-del"> The tuple's bytes are zeroed and the hole grows by the tuple's size</label>
+    <label><input type="radio" name="q-del"> The page is rewritten without the tuple, and all later tuples shift</label>
+    <label><input type="radio" name="q-del" data-correct> The tuple is only marked dead; its bytes remain until a later prune/vacuum/compaction reclaims them</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Tuples cannot span pages in PostgreSQL, and inserts of big values are not rejected. TOAST compresses the value and/or slices it into ~2,000-byte chunks stored as rows of the table's TOAST relation, keyed by (chunk_id, chunk_seq); the main tuple keeps an 18-byte pointer. The 1 GB cap comes from TOAST using two bits of the 4-byte varlena length word.">
+    <legend class="quiz-q">You insert a row with a 100 KB <code>text</code> value into PostgreSQL (8 kB pages). What actually happens?</legend>
+    <label><input type="radio" name="q-toast"> The tuple is written across 13 consecutive heap pages</label>
+    <label><input type="radio" name="q-toast" data-correct> The value is compressed and/or split into ~2 kB chunks stored in the table's TOAST relation, leaving an 18-byte pointer in the main tuple</label>
+    <label><input type="radio" name="q-toast"> The insert fails: values larger than one page are not allowed</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="In SQLite each table is itself a b-tree: rows are leaf-cell payloads keyed by the 64-bit rowid, all inside the single main database file. PostgreSQL stores rows in unordered heap pages, one file per relation, with separate index files pointing at TIDs. And SQLite does not create one file per table — the whole database shares a single file, while PostgreSQL is the engine with per-relation files.">
+    <legend class="quiz-q">Which statement correctly contrasts where a table's rows live?</legend>
+    <label><input type="radio" name="q-sqlite" data-correct> SQLite rows are payloads in the leaves of a table b-tree keyed by rowid, inside one database file; PostgreSQL rows sit unordered in per-relation heap files</label>
+    <label><input type="radio" name="q-sqlite"> Both systems store rows in unordered heaps and differ only in page size</label>
+    <label><input type="radio" name="q-sqlite"> SQLite creates one file per table, while PostgreSQL keeps every database in a single file</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Hironobu Suzuki, “The Internals of PostgreSQL”, §1.1 Logical Structure of a Database Cluster. <a href="https://www.interdb.jp/pg/pgsql01/01.html" rel="external">https://www.interdb.jp/pg/pgsql01/01.html</a></li>
+        <li id="ref-2">Hironobu Suzuki, “The Internals of PostgreSQL”, §1.2 Physical Structure of a Database Cluster. <a href="https://www.interdb.jp/pg/pgsql01/02.html" rel="external">https://www.interdb.jp/pg/pgsql01/02.html</a></li>
+        <li id="ref-3">Hironobu Suzuki, “The Internals of PostgreSQL”, §1.3 Internal Layout of a Heap Table File. <a href="https://www.interdb.jp/pg/pgsql01/03.html" rel="external">https://www.interdb.jp/pg/pgsql01/03.html</a></li>
+        <li id="ref-4">Hironobu Suzuki, “The Internals of PostgreSQL”, §1.4 Writing and Reading Tuples. <a href="https://www.interdb.jp/pg/pgsql01/04.html" rel="external">https://www.interdb.jp/pg/pgsql01/04.html</a></li>
+        <li id="ref-5">PostgreSQL Documentation, “Database Physical Storage” (chapter overview). <a href="https://www.postgresql.org/docs/current/storage.html" rel="external">https://www.postgresql.org/docs/current/storage.html</a></li>
+        <li id="ref-6">PostgreSQL Documentation, “Database File Layout”. <a href="https://www.postgresql.org/docs/current/storage-file-layout.html" rel="external">https://www.postgresql.org/docs/current/storage-file-layout.html</a></li>
+        <li id="ref-7">PostgreSQL Documentation, “Database Page Layout”. <a href="https://www.postgresql.org/docs/current/storage-page-layout.html" rel="external">https://www.postgresql.org/docs/current/storage-page-layout.html</a></li>
+        <li id="ref-8">PostgreSQL Documentation, “Free Space Map”. <a href="https://www.postgresql.org/docs/current/storage-fsm.html" rel="external">https://www.postgresql.org/docs/current/storage-fsm.html</a></li>
+        <li id="ref-9">PostgreSQL Documentation, “TOAST”. <a href="https://www.postgresql.org/docs/current/storage-toast.html" rel="external">https://www.postgresql.org/docs/current/storage-toast.html</a></li>
+        <li id="ref-10">SQLite Documentation, “Database File Format”. <a href="https://www.sqlite.org/fileformat.html" rel="external">https://www.sqlite.org/fileformat.html</a></li>
+        <li id="ref-11">Berkeley CS186 Course Notes, “Disks and Files”. <a href="https://cs186berkeley.net/notes/note3/" rel="external">https://cs186berkeley.net/notes/note3/</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>PostgreSQL “Heap-Only Tuples (HOT)” — how updates dodge index churn; read it after M09. <a href="https://www.postgresql.org/docs/current/storage-hot.html" rel="external">storage-hot</a></li>
+      <li>PostgreSQL “Visibility Map” — the other fork next to <code>_fsm</code>, and why vacuum loves it. <a href="https://www.postgresql.org/docs/current/storage-vm.html" rel="external">storage-vm</a></li>
+      <li>CS186 “Buffer Management” notes — the next layer up, previewing M03. <a href="https://cs186berkeley.net/notes/note5/" rel="external">note5</a></li>
+      <li>The full interdb.jp chapter 1, including tablespaces and the vacuum-shaped foreshadowing. <a href="https://www.interdb.jp/pg/pgsql01.html" rel="external">pgsql01</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>What to build now: <a href="../../project/milestone-01/index.html">Milestone 1 — Pages, Tuples, Heap Storage</a> —
+    the <code>Page</code> / <code>HeapPage</code> slotted layout, tuple (de)serialization, the
+    <code>DiskManager</code>, and a scannable <code>HeapFile</code>, exactly the structures on this page.</p>
+
+    <nav class="prevnext">
+      <a href="../m01-relational-model-sql/index.html"><span class="dir">← Previous</span> M01 · The Relational Model &amp; SQL Semantics</a>
+      <a class="next" href="../../project/milestone-01/index.html"><span class="dir">Next →</span> Milestone 1 · Pages, Tuples, Heap Storage</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+/* Page-specific widget code. Wrapped in DOMContentLoaded so shared deferred
+   scripts (site.js) have run; everything lives inside an IIFE; vanilla JS. */
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  (function () {
+    var root = document.getElementById("widget-slotted");
+    if (!root || !window.Course) return;
+
+    var PAGE = 8192, HDR = 24, SLOTB = 4;
+    var M = 28, PLOT = 904, SX = PLOT / PAGE;
+
+    var canvas = document.getElementById("sp-canvas");
+    var stats = document.getElementById("sp-stats");
+    var msg = document.getElementById("sp-msg");
+    var sizeSel = document.getElementById("sp-size");
+    var victimSel = document.getElementById("sp-victim");
+
+    /* state */
+    var slots, upper, nextName;
+
+    function lowerOff() { return HDR + SLOTB * slots.length; }
+    function holeBytes() { return upper - lowerOff(); }
+    function deadBytes() {
+      var d = 0;
+      for (var i = 0; i < slots.length; i++) if (slots[i].state === "dead") d += slots[i].len;
+      return d;
+    }
+
+    function initState() {
+      slots = [];
+      upper = PAGE;
+      nextName = 1;
+      doInsert(512, true);
+      doInsert(320, true);
+      doInsert(192, true);
+    }
+
+    function doInsert(size, quiet) {
+      var reuse = -1;
+      for (var i = 0; i < slots.length; i++) {
+        if (slots[i].state === "unused") { reuse = i; break; }
+      }
+      var slotCost = reuse === -1 ? SLOTB : 0;
+      if (upper - (lowerOff() + slotCost) < size) {
+        var hole = upper - (lowerOff() + slotCost);
+        var hint = deadBytes() > 0
+          ? " Tombstones hold " + deadBytes() + " B — try Compact."
+          : " The page is genuinely full: start a new page (HeapFile does).";
+        if (!quiet) say("Insert failed: need " + (size + slotCost) + " B (" +
+          slotCost + " B slot + " + size + " B tuple) but the hole is only " +
+          Math.max(hole + slotCost, 0) + " B." + hint);
+        return false;
+      }
+      upper -= size;
+      var rec = { state: "live", off: upper, len: size, name: "T" + nextName };
+      nextName += 1;
+      if (reuse === -1) {
+        slots.push(rec);
+        if (!quiet) say(rec.name + " (" + size + " B) → new slot " + (slots.length - 1) +
+          " · data at [" + rec.off + ", " + (rec.off + size) + ") · lower is now " + lowerOff() + ".");
+      } else {
+        slots[reuse] = rec;
+        if (!quiet) say(rec.name + " (" + size + " B) → reused slot " + reuse +
+          " · data at [" + rec.off + ", " + (rec.off + size) + ") · slot array did not grow.");
+      }
+      return true;
+    }
+
+    function doDelete(idx) {
+      var s = slots[idx];
+      if (!s || s.state !== "live") return;
+      s.state = "dead";
+      say(s.name + " deleted: slot " + idx + " is a tombstone (think: xmax stamped). Its " +
+        s.len + " B stay on the page — the hole did not grow.");
+    }
+
+    function doCompact() {
+      var reclaimed = deadBytes(), moved = 0, cur = PAGE, i;
+      for (i = 0; i < slots.length; i++) {
+        if (slots[i].state === "live") {
+          cur -= slots[i].len;
+          if (slots[i].off !== cur) moved += 1;
+          slots[i].off = cur;
+        } else if (slots[i].state === "dead") {
+          slots[i] = { state: "unused", off: 0, len: 0, name: "" };
+        }
+      }
+      upper = cur;
+      say("Compacted: moved " + moved + " live tuple(s), reclaimed " + reclaimed +
+        " B, dead slots are now reusable. External RecordIds still valid — slots kept their numbers.");
+    }
+
+    function say(t) { msg.textContent = t; }
+
+    /* rendering */
+    function render() {
+      var svgEl = Course.svgEl, el = Course.el;
+      canvas.textContent = "";
+      var svg = svgEl("svg", { viewBox: "0 0 960 215", role: "img" });
+      svg.appendChild(svgEl("title", null,
+        "One 8 KB slotted page: header, slot array, free space and tuple data, with a zoomed slot directory strip."));
+
+      var lower = lowerOff();
+      var barY = 30, barH = 56;
+
+      /* free-space fences above the bar */
+      var hw = Math.max(HDR * SX, 8);
+      var ws = slots.length ? Math.max(SLOTB * slots.length * SX, 6) : 0;
+      var xLow = M + hw + ws;
+      var xUp = M + upper * SX;
+      svg.appendChild(svgEl("line", { x1: xLow, y1: 18, x2: xLow, y2: barY, "class": "d-line-hl" }));
+      svg.appendChild(svgEl("text", { x: xLow - 3, y: 14, "text-anchor": "end", "class": "d-mono-sm" }, "lower=" + lower));
+      svg.appendChild(svgEl("line", { x1: xUp, y1: 18, x2: xUp, y2: barY, "class": "d-line-hl" }));
+      svg.appendChild(svgEl("text", { x: xUp + 3, y: 14, "class": "d-mono-sm" }, "upper=" + upper));
+
+      /* page header */
+      svg.appendChild(svgEl("rect", { x: M, y: barY, width: hw, height: barH, "class": "d-box-hl" }));
+      /* slot array band */
+      if (slots.length) {
+        svg.appendChild(svgEl("rect", { x: M + hw, y: barY, width: ws, height: barH, "class": "d-box-hl" }));
+      }
+      /* hole */
+      var holeW = Math.max(xUp - xLow, 0);
+      if (holeW > 0.5) {
+        svg.appendChild(svgEl("rect", { x: xLow, y: barY, width: holeW, height: barH, "class": "d-box" }));
+        if (holeW >= 88) {
+          svg.appendChild(svgEl("text", {
+            x: xLow + holeW / 2, y: barY + barH / 2 + 4, "text-anchor": "middle", "class": "d-text-sm"
+          }, "free: " + holeBytes() + " B"));
+        }
+      }
+      /* tuples */
+      var i, s;
+      for (i = 0; i < slots.length; i++) {
+        s = slots[i];
+        if (s.state === "unused" || s.len === 0) continue;
+        var tx = M + s.off * SX;
+        var tw = Math.max(s.len * SX, 2.5);
+        var r = svgEl("rect", {
+          x: tx, y: barY, width: tw, height: barH,
+          "class": s.state === "live" ? "d-box-good" : "d-box-bad"
+        });
+        r.appendChild(svgEl("title", null, s.name + " · slot " + i + " · " + s.state +
+          " · offset " + s.off + " · " + s.len + " B"));
+        svg.appendChild(r);
+        if (tw >= 70) {
+          svg.appendChild(svgEl("text", {
+            x: tx + tw / 2, y: barY + barH / 2 + 4, "text-anchor": "middle", "class": "d-mono-sm"
+          }, s.name + " · " + s.len + " B"));
+        } else if (tw >= 26) {
+          svg.appendChild(svgEl("text", {
+            x: tx + tw / 2, y: barY + barH / 2 + 4, "text-anchor": "middle", "class": "d-mono-sm"
+          }, s.name));
+        }
+      }
+      /* byte axis */
+      var ticks = [0, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192];
+      for (i = 0; i < ticks.length; i++) {
+        var bx = M + ticks[i] * SX;
+        svg.appendChild(svgEl("line", { x1: bx, y1: barY + barH, x2: bx, y2: barY + barH + 6, "class": "d-line" }));
+        svg.appendChild(svgEl("text", {
+          x: bx, y: barY + barH + 20,
+          "text-anchor": ticks[i] === 0 ? "start" : (ticks[i] === PAGE ? "end" : "middle"),
+          "class": "d-mono-sm"
+        }, String(ticks[i])));
+      }
+
+      /* slot directory strip */
+      svg.appendChild(svgEl("text", { x: M, y: 138, "class": "d-text-sm" },
+        "slot directory (4 B per slot; numbers are slot indices):"));
+      var maxCells = 44;
+      var shown = Math.min(slots.length, maxCells);
+      for (i = 0; i < shown; i++) {
+        s = slots[i];
+        var cx = M + i * 20;
+        var cls = s.state === "live" ? "d-box-good" : (s.state === "dead" ? "d-box-bad" : "d-box");
+        var c = svgEl("rect", { x: cx, y: 146, width: 16, height: 16, rx: 3, "class": cls });
+        c.appendChild(svgEl("title", null, "slot " + i + ": " + s.state +
+          (s.len ? " (off " + s.off + ", len " + s.len + ")" : "")));
+        svg.appendChild(c);
+        svg.appendChild(svgEl("text", {
+          x: cx + 8, y: 158, "text-anchor": "middle", "class": "d-mono-sm"
+        }, String(i)));
+      }
+      if (slots.length > maxCells) {
+        svg.appendChild(svgEl("text", { x: M + shown * 20 + 4, y: 158, "class": "d-text-sm" },
+          "+" + (slots.length - maxCells) + " more"));
+      }
+      if (!slots.length) {
+        svg.appendChild(svgEl("text", { x: M, y: 158, "class": "d-text-sm" }, "(empty — no slots yet)"));
+      }
+      svg.appendChild(svgEl("text", { x: M, y: 196, "class": "d-text-sm" },
+        "green = live · red = dead (tombstone) · plain = unused/free"));
+      canvas.appendChild(svg);
+
+      /* stats — free-space counter always visible */
+      stats.textContent = "";
+      var live = 0, dead = 0, unused = 0;
+      for (i = 0; i < slots.length; i++) {
+        if (slots[i].state === "live") live += 1;
+        else if (slots[i].state === "dead") dead += 1;
+        else unused += 1;
+      }
+      function stat(label, val) {
+        var sp = el("span", { "class": "stat" }, label + " ");
+        sp.appendChild(el("b", null, val));
+        stats.appendChild(sp);
+      }
+      stat("free (hole):", holeBytes() + " B");
+      stat("dead (reclaimable):", deadBytes() + " B");
+      stat("lower:", String(lower));
+      stat("upper:", String(upper));
+      stat("slots:", live + " live · " + dead + " dead · " + unused + " unused");
+
+      /* victim dropdown */
+      var prev = victimSel.value;
+      victimSel.textContent = "";
+      for (i = 0; i < slots.length; i++) {
+        if (slots[i].state === "live") {
+          victimSel.appendChild(el("option", { value: String(i) },
+            slots[i].name + " (slot " + i + ", " + slots[i].len + " B)"));
+        }
+      }
+      if (!victimSel.options.length) {
+        victimSel.appendChild(el("option", { value: "" }, "no live tuples"));
+        victimSel.disabled = true;
+      } else {
+        victimSel.disabled = false;
+        for (i = 0; i < victimSel.options.length; i++) {
+          if (victimSel.options[i].value === prev) { victimSel.value = prev; break; }
+        }
+      }
+    }
+
+    document.getElementById("sp-insert").addEventListener("click", function () {
+      doInsert(parseInt(sizeSel.value, 10), false);
+      render();
+    });
+    document.getElementById("sp-delete").addEventListener("click", function () {
+      var v = victimSel.value;
+      if (v === "") { say("Nothing live to delete."); return; }
+      doDelete(parseInt(v, 10));
+      render();
+    });
+    document.getElementById("sp-compact").addEventListener("click", function () {
+      doCompact();
+      render();
+    });
+    document.getElementById("sp-reset").addEventListener("click", function () {
+      initState();
+      say("Reset: three fresh tuples (512, 320, 192 B) as on first load.");
+      render();
+    });
+
+    initState();
+    render();
+  })();
+});
+</script>
+</body>
+</html>

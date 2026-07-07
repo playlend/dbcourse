@@ -1,0 +1,103 @@
+# Milestone 6 suite: joins, GROUP BY aggregation, multi-key ORDER BY —
+# TPC-H-inspired mini customer/orders schema. All expected results are
+# hand-computed; see the comments.
+
+statement ok
+CREATE TABLE customer (c_id INTEGER PRIMARY KEY, c_name TEXT NOT NULL, c_nation TEXT NOT NULL)
+
+statement ok
+INSERT INTO customer (c_id, c_name, c_nation) VALUES (1, 'Alice', 'DE'), (2, 'Bob', 'US'), (3, 'Carol', 'DE'), (4, 'Dave', 'FR'), (5, 'Erin', 'US'), (6, 'Frank', 'DE'), (7, 'Grace', 'JP'), (8, 'Heidi', 'FR')
+
+statement ok
+CREATE TABLE orders (o_id INTEGER PRIMARY KEY, o_cust INTEGER, o_total FLOAT, o_status TEXT NOT NULL)
+
+# order 112 references customer 9, who does not exist: an inner join must
+# drop it. Frank (6) and Heidi (8) have no orders: inner join drops them too.
+statement ok
+INSERT INTO orders (o_id, o_cust, o_total, o_status) VALUES (101, 1, 120.5, 'shipped'), (102, 1, 80, 'open'), (103, 2, 45.25, 'shipped'), (104, 3, 300, 'open'), (105, 3, 20, 'shipped'), (106, 3, 55, 'shipped'), (107, 4, 10, 'cancelled'), (108, 5, 99.99, 'open'), (109, 5, 0.01, 'shipped'), (110, 7, 500, 'open'), (111, 7, 1.25, 'shipped'), (112, 9, 42, 'open')
+
+# 12 orders, one orphaned: the inner join matches 11
+query I
+SELECT COUNT(*) FROM customer JOIN orders ON c_id = o_cust
+----
+11
+
+# cross product: 8 customers x 12 orders
+query I
+SELECT COUNT(*) FROM customer, orders
+----
+96
+
+# join + filter: orders over 100 are 101 (Alice), 104 (Carol), 110 (Grace)
+query TR rowsort
+SELECT c_name, o_total FROM customer JOIN orders ON c_id = o_cust WHERE o_total > 100
+----
+Alice 120.5
+Carol 300
+Grace 500
+
+# group the join by nation:
+#   DE = Alice(120.5, 80) + Carol(300, 20, 55)      -> 5 orders, 575.5
+#   FR = Dave(10)                                    -> 1 order,  10
+#   JP = Grace(500, 1.25)                            -> 2 orders, 501.25
+#   US = Bob(45.25) + Erin(99.99, 0.01)              -> 3 orders, 145.25
+query TIR rowsort
+SELECT c_nation, COUNT(*), SUM(o_total) FROM customer JOIN orders ON c_id = o_cust GROUP BY c_nation
+----
+DE 5 575.5
+FR 1 10
+JP 2 501.25
+US 3 145.25
+
+# aggregates over zero rows: COUNT is 0, the rest are NULL
+query IRRRR
+SELECT COUNT(*), SUM(o_total), MIN(o_total), MAX(o_total), AVG(o_total) FROM orders WHERE o_total < 0
+----
+0 NULL NULL NULL NULL
+
+# AVG: Carol's orders (300 + 20 + 55) / 3
+query R
+SELECT AVG(o_total) FROM orders WHERE o_cust = 3
+----
+125
+
+# multi-key ORDER BY: nation asc, then name asc within each nation
+query T
+SELECT c_name FROM customer ORDER BY c_nation, c_name
+----
+Alice
+Carol
+Frank
+Dave
+Heidi
+Grace
+Bob
+Erin
+
+# top-3 order totals: 500 (110), 300 (104), 120.5 (101)
+query I
+SELECT o_id FROM orders ORDER BY o_total DESC LIMIT 3
+----
+110
+104
+101
+
+# NULL handling inside aggregates: an order with unknown total
+statement ok
+INSERT INTO orders (o_id, o_cust, o_total, o_status) VALUES (113, 8, NULL, 'open')
+
+query I
+SELECT COUNT(*) FROM orders WHERE o_cust = 8
+----
+1
+
+# COUNT(col) skips NULLs; COUNT(*) does not
+query I
+SELECT COUNT(o_total) FROM orders WHERE o_cust = 8
+----
+0
+
+query R
+SELECT SUM(o_total) FROM orders WHERE o_cust = 8
+----
+NULL

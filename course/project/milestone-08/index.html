@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 8 · Transactions and MVCC Snapshot Isolation — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 8</span>
+  </nav>
+  <span class="badge milestone">Milestone 8</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 8 · Transactions and MVCC Snapshot Isolation</h1>
+  <p class="subtitle">Bring the xmin/xmax fields to life: transaction ids, snapshots, the ten
+  visibility rules, first-committer-wins conflicts, COMMIT/ROLLBACK, and VACUUM.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <p>Since Milestone 1, every tuple you have written carried two silent u64s: <code>xmin</code>
+  and <code>xmax</code>, faithfully stored as zero. Today they wake up. The remarkable thing
+  about this milestone is how little machinery it takes — a transaction manager, a snapshot
+  struct, one pure visibility function threaded through your scans — to turn a single-user
+  engine into one where concurrent sessions each see a consistent world. The design is
+  PostgreSQL's, simplified; the honesty requirement (write skew!) is
+  toyDB's.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li><strong>Implement</strong> transaction lifecycle: BEGIN / COMMIT / ROLLBACK plus
+      autocommit for bare statements.</li>
+    <li><strong>Implement</strong> snapshots (xmin, xmax, active set) captured at BEGIN.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Implement</strong> the interdb Ch. 5 visibility rules as a pure function and
+      apply them in every scan.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Implement</strong> MVCC writes: insert stamps xmin; delete stamps xmax; update =
+      delete + insert.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Implement</strong> first-committer-wins conflict detection returning
+      <code>Error::Serialization</code> (SQLSTATE 40001 spirit).<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Implement</strong> VACUUM against the oldest-active-snapshot horizon.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong>Demonstrate</strong> — with tests — which anomalies snapshot isolation prevents
+      and that write skew survives.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m09-transactions-mvcc/index.html">M09 · Transactions &amp;
+      MVCC</a> — the concept module. Its visibility checker implements the exact rule set you
+      are about to write; keep it open while coding.</li>
+    <li>The Internals of PostgreSQL, §5.5–5.6 — snapshots and the ten visibility rules; your
+      <code>is_visible</code> must mirror them.
+      <a href="https://www.interdb.jp/pg/pgsql05/06.html" rel="external">interdb.jp/pg/pgsql05/06.html</a></li>
+    <li>toyDB's MVCC design walkthrough — a complete Rust reference for the shape of the
+      transaction manager.
+      <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md" rel="external">github.com/erikgrinaker/toydb/docs/architecture/mvcc.md</a></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — the transaction manager lights up, cross-cutting the executor and
+    access methods: every scan consults it, every write stamps its ids.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+  <p>You implement <code>crates/txn</code> and thread it through <code>exec</code> and the
+  storage write paths:</p>
+
+  <pre><code>#[derive(Clone, Debug)]
+pub struct Snapshot { pub xmin: TxnId, pub xmax: TxnId,
+                      pub active: std::collections::BTreeSet&lt;TxnId&gt; }
+impl Snapshot {
+    /// MVCC visibility of a tuple version to this snapshot, given the
+    /// commit state oracle. Mirrors the interdb Ch.5 rules.
+    pub fn is_visible(&amp;self, meta: &amp;TupleMeta,
+                      committed: &amp;dyn Fn(TxnId) -&gt; bool) -&gt; bool;
+}
+
+pub enum TxnState { Active, Committed, Aborted }
+pub struct Transaction { /* id, snapshot, write set */ }
+impl Transaction {
+    pub fn id(&amp;self) -&gt; TxnId;
+    pub fn snapshot(&amp;self) -&gt; &amp;Snapshot;
+}
+
+pub struct TransactionManager { /* next txid, states, active set */ }
+impl TransactionManager {
+    pub fn new() -&gt; Self;
+    pub fn begin(&amp;self) -&gt; std::sync::Arc&lt;Transaction&gt;;
+    /// First-committer-wins: Err(Error::Serialization) if the write set
+    /// intersects a concurrently-committed transaction's writes.
+    pub fn commit(&amp;self, txn: &amp;Transaction) -&gt; Result&lt;()&gt;;
+    pub fn abort(&amp;self, txn: &amp;Transaction);
+    pub fn is_committed(&amp;self, id: TxnId) -&gt; bool;
+    pub fn record_write(&amp;self, txn: &amp;Transaction, rid: RecordId);
+    /// Oldest xmin any active snapshot can still see (VACUUM horizon).
+    pub fn oldest_visible_xid(&amp;self) -&gt; TxnId;
+}</code></pre>
+
+  <p>Semantics contract:</p>
+  <ul>
+    <li><strong>Snapshot capture is atomic</strong> with txid assignment: <code>begin()</code>
+      assigns the next id and captures {xmin = oldest active, xmax = next unassigned,
+      active = in-flight ids} under one lock, so no transaction is ever missing from a snapshot
+      that should contain it.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Visibility</strong> follows the module's rules 1–10 exactly, including the
+      own-transaction cases (my insert visible; my delete invisible to me) and the
+      active-in-snapshot exceptions (rules 5 and 9). "Active in snapshot" = in the active set
+      or ≥ snapshot xmax.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Writes:</strong> INSERT stamps <code>xmin = my id</code>; DELETE stamps
+      <code>xmax = my id</code> via <code>HeapFile::set_meta</code> (tuple body untouched);
+      UPDATE writes a new version and stamps the old one's xmax — never in-place. Index entries
+      are added for new versions; old entries stay until VACUUM.</li>
+    <li><strong>Conflicts:</strong> every write also calls <code>record_write</code>; at
+      <code>commit()</code>, if any rid in my write set was written by a transaction that
+      committed after my snapshot, I abort with <code>Error::Serialization</code> — the
+      first committer wins. ROLLBACK marks aborted; rule 1 instantly hides everything the
+      transaction wrote (no undo needed — that elegance is MVCC's gift; contrast Milestone 9).</li>
+    <li><strong>REPL / execute():</strong> BEGIN opens a transaction bound to the session;
+      COMMIT/ROLLBACK close it; bare statements run in a one-statement autocommit transaction.
+      Scans without any explicit transaction still see committed-only data.</li>
+    <li><strong>VACUUM</strong> scans heaps and removes versions whose deleter is committed and
+      &lt; <code>oldest_visible_xid()</code> (and aborted-insert corpses), compacting slots via
+      your Milestone 1 tombstone machinery.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+  </ul>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <ol>
+    <li><strong><code>is_visible</code> first, as a pure function.</strong> No manager, no
+      storage — just (meta, snapshot, oracle) → bool, structured as the module's three cases by
+      creator status. The provided table-driven test enumerates all ten rules; make it green
+      before touching anything stateful. This function is 40 lines and the heart of the
+      milestone.</li>
+    <li><strong>TransactionManager next.</strong> One mutex over {next_id, states map, active
+      set, write sets}. <code>begin</code>/<code>commit</code>/<code>abort</code> are small
+      critical sections; keep the commit-time conflict check inside the same lock that flips
+      the state to Committed, or two racing commits can both pass the check.</li>
+    <li><strong>Thread the snapshot through ExecContext.</strong> The context gains a current
+      transaction slot; SeqScan and IndexScan filter every tuple through
+      <code>snapshot.is_visible(meta, oracle)</code> before anything else sees it. The oracle
+      is a closure over <code>TransactionManager::is_committed</code>.</li>
+    <li><strong>Stamp the write paths.</strong> Insert/Delete/Update executors take the current
+      txid from the context. Update is delete-then-insert on the same heap — resist any "small
+      update optimization"; version history is the feature.</li>
+    <li><strong>Wire BEGIN/COMMIT/ROLLBACK.</strong> They have parsed since Milestone 3;
+      execution is a session-state change plus manager calls. Autocommit wraps everything else.</li>
+    <li><strong>Conflict detection.</strong> Record writes as you stamp them; implement the
+      commit check; surface <code>Error::Serialization</code> through the REPL as a clean
+      retryable message, the way Postgres tells applications to treat
+      40001.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Anomaly scripts.</strong> Now run the provided ms8_ scenario tests: they script
+      two interleaved transactions through the manager exactly like the module's anomaly zoo —
+      lost update prevented, fuzzy read prevented, phantom prevented, and
+      <code>ms8_write_skew_is_documented</code> asserting the skew <em>succeeds</em>. When that
+      last one passes, read its doc comment out loud; it is the course's honesty pledge.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>VACUUM last.</strong> Compute the horizon, sweep the heaps, drop dead index
+      entries. Verify with the before/after page-count assertions and re-run the whole
+      <code>slt_all</code> suite — vacuum must be invisible to correctness.</li>
+  </ol>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <pre><code>cargo test -p ferricdb-txn  -- --include-ignored ms8_
+
+# end-to-end regressions — MVCC must not change single-session results
+cargo test -p ferricdb -- --include-ignored slt_all
+cargo test -p ferricdb-exec -- --include-ignored ms4_</code></pre>
+  <p>The ms8_ group: the ten-rule visibility table; snapshot-capture atomicity under concurrent
+  begins; the first-committer-wins pair; the four anomaly scripts; write skew documented;
+  <code>oldest_visible_xid</code> with overlapping snapshots; vacuum horizon safety (a version
+  still visible to an old snapshot survives vacuum).</p>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">A transaction that can't see its own writes</span>
+    <p><em>Symptom:</em> INSERT then SELECT in the same transaction returns nothing.
+    <em>Cause:</em> treating in-progress creators as invisible unconditionally — rule 4 without
+    rule 2's own-transaction exception. The symmetric bug (rule 7) makes your own deletes
+    visible to you. Both are single branches in <code>is_visible</code>; the table test names
+    them.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Snapshot race at begin</span>
+    <p><em>Symptom:</em> rare test flakes where a transaction sees a "future" commit.
+    <em>Cause:</em> assigning the txid and reading the active set in separate critical sections
+    — a transaction that starts between them is missing from your active list, so its later
+    commit looks like the past (rule 5 never fires). One lock, one capture.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Conflict check outside the commit lock</span>
+    <p><em>Symptom:</em> two transactions updating the same row both commit under stress.
+    <em>Cause:</em> check-then-commit as two steps. The check and the state flip must be atomic;
+    otherwise both pass the check against the same "nobody committed yet" world.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Vacuum eats a row someone can still see</span>
+    <p><em>Symptom:</em> a long-running transaction's second read of the same row returns
+    nothing. <em>Cause:</em> using "deleter committed" as the reclaim condition instead of
+    "deleter committed AND below every active snapshot's horizon". The watermark exists
+    precisely for this.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li>All <code>ms8_</code> tests pass, including the write-skew documentation test;
+      <code>slt_all</code> and earlier groups still pass.</li>
+    <li>Two REPL sessions demonstrate live: session A begins and reads a row; session B updates
+      it and commits; A re-reads the <em>old</em> value; after A commits and re-reads, the new
+      value appears.</li>
+    <li>Two sessions updating the same row: the second committer gets a serialization error and
+      succeeds on retry.</li>
+    <li>After a bulk UPDATE, <code>VACUUM</code> reclaims space (visible via a page-count or
+      free-space report) and nothing changes semantically.</li>
+    <li>You can state from memory which anomalies your database now prevents and the one it
+      documents instead of preventing.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="ROLLBACK just marks the transaction aborted — rule 1 makes every version it created invisible instantly, and its xmax stamps on other rows are ignored (deleter aborted, rule 6). The versions physically remain until VACUUM. Undo-by-bookkeeping is MVCC's structural gift; Milestone 9 shows what systems without it must do.">
+    <legend class="quiz-q">What work does ROLLBACK do to the heap pages?</legend>
+    <label><input type="radio" name="q1"> Restores before-images of every modified tuple</label>
+    <label><input type="radio" name="q1" data-correct> None — marking the transaction aborted makes its versions invisible by rule; VACUUM reclaims them later</label>
+    <label><input type="radio" name="q1"> Deletes the transaction's tuples immediately</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+  <fieldset class="quiz" data-explain="First-committer-wins compares write sets against transactions that committed AFTER my snapshot — concurrent ones. A transaction that committed before I began is simply part of my snapshot's world; conflicting with it is impossible by construction.">
+    <legend class="quiz-q">Against which transactions does the commit-time conflict check compare write sets?</legend>
+    <label><input type="radio" name="q2"> All transactions that ever wrote the same rows</label>
+    <label><input type="radio" name="q2" data-correct> Those that committed after my snapshot was taken — my concurrent peers</label>
+    <label><input type="radio" name="q2"> Only transactions still in progress at my commit</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Hironobu Suzuki, The Internals of PostgreSQL, §5.5–5.6 — snapshots
+          (xmin:xmax:xip) and the ten visibility rules this milestone implements.
+          <a href="https://www.interdb.jp/pg/pgsql05/06.html" rel="external">https://www.interdb.jp/pg/pgsql05/06.html</a></li>
+        <li id="ref-2">PostgreSQL Documentation, "Transaction Isolation" — Repeatable Read as
+          snapshot isolation, serialization failures, and the 40001 retry discipline.
+          <a href="https://www.postgresql.org/docs/current/transaction-iso.html" rel="external">https://www.postgresql.org/docs/current/transaction-iso.html</a></li>
+        <li id="ref-3">erikgrinaker/toydb — the MVCC design walkthrough and the documented
+          anomaly coverage (write skew possible without SSI) this milestone reproduces
+          honestly.
+          <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md</a>
+          and <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/sql.md" rel="external">docs/sql.md</a></li>
+        <li id="ref-4">CMU 15-445/645 (Fall 2025), Project #4 — the watermark (lowest read
+          timestamp among unfinished transactions) as the version-GC horizon.
+          <a href="https://15445.courses.cs.cmu.edu/fall2025/project4/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project4/</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>The Internals of PostgreSQL, §5.7 — the worked visibility example across Read
+        Committed and Repeatable Read, with hint bits (a clog-lookup cache your oracle closure
+        approximates). <a href="https://www.interdb.jp/pg/pgsql05/07.html" rel="external">interdb.jp/pg/pgsql05/07.html</a></li>
+      <li>PostgreSQL docs, "Routine Vacuuming" — what production vacuum juggles beyond your
+        horizon sweep. <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html" rel="external">postgresql.org/docs/current/routine-vacuuming.html</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>Next on the path: <a href="../../modules/m10-logging-recovery/index.html">M10 · Logging
+    &amp; Recovery</a>, then <a href="../milestone-09/index.html">Milestone 9</a> — surviving
+    the crash.</p>
+
+    <nav class="prevnext">
+      <a href="../../modules/m09-transactions-mvcc/index.html"><span class="dir">← Previous</span> M09 · Transactions &amp; MVCC</a>
+      <a class="next" href="../../modules/m10-logging-recovery/index.html"><span class="dir">Next →</span> M10 · Logging &amp; Recovery</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor", "index"],
+    current: ["txn"],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

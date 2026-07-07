@@ -1,0 +1,24 @@
+[package]
+name = "ferricdb"
+description = "The FerricDB binary: REPL, flags, and the end-to-end sqllogictest harness (Milestone 0 onward)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferricdb-common = { workspace = true }
+ferricdb-storage = { workspace = true }
+ferricdb-buffer = { workspace = true }
+ferricdb-index = { workspace = true }
+ferricdb-sql = { workspace = true }
+ferricdb-catalog = { workspace = true }
+ferricdb-exec = { workspace = true }
+ferricdb-txn = { workspace = true }
+ferricdb-wal = { workspace = true }
+ferricdb-server = { workspace = true }
+rustyline = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+sqllogictest = { workspace = true }
+tempfile = { workspace = true }

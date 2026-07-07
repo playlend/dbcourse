@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stretch S3 · Swap the Heap for an LSM Engine — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Stretch S3</span>
+  </nav>
+  <span class="badge stretch">Stretch S3</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Stretch S3 · Swap the Heap for an LSM Engine</h1>
+  <p class="subtitle">Follow Mini-LSM to build a log-structured engine in Rust, then teach
+  FerricDB to run tables on it — a guided reading and integration plan.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quiz need JavaScript;
+  the plan reads fine without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-goal">The goal</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-map">The Mini-LSM map</a></li>
+      <li><a href="#sec-integration">Integration plan</a></li>
+      <li><a href="#sec-pitfalls">Pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <p class="muted">Stretch pages are deliberately lower-detail: this one maps an existing
+  excellent course onto FerricDB rather than re-teaching it.</p>
+
+  <h2 id="sec-goal">The goal</h2>
+  <p>Module 12 surveyed the LSM design: writes buffered in a memtable, flushed as immutable SST
+  files, merged by background compaction.<sup class="cite"><a href="#ref-1">1</a></sup> This
+  stretch builds one — by following <em>Mini-LSM</em>, a structured Rust course of week-long
+  parts (seven ~2–3 hour chapters each, with starter code, tests, and solution
+  checkpoints)<sup class="cite"><a href="#ref-1">1</a></sup> — and then integrates it: FerricDB
+  tables gain a storage option, <code>CREATE TABLE t (…) WITH (storage = lsm)</code>, running
+  CRUD through the LSM engine while heap tables continue unchanged. Mini-LSM is Apache-2.0:
+  attribute anything you adapt.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — S3 replaces the storage spine (heap + disk manager) for opted-in
+    tables; everything above the access-method boundary is untouched. That the swap is even
+    possible is the payoff of the layering you built.</figcaption>
+  </figure>
+
+  <h2 id="sec-map">The Mini-LSM map</h2>
+  <p>Do Mini-LSM on its own terms first — its tests are good and its pacing is deliberate. The
+  FerricDB-relevant milestones inside it:<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Mini-LSM stage</th><th>What you get</th><th>FerricDB relevance</th></tr></thead>
+      <tbody>
+        <tr><td>Memtables + WAL</td><td>in-memory sorted writes, crash safety</td>
+          <td>compare with your MS9 WAL — decide who owns durability (pitfall below)</td></tr>
+        <tr><td>SSTs + block format</td><td>immutable sorted files, block index</td>
+          <td>the on-disk format replacing slotted heap pages</td></tr>
+        <tr><td>Read path + bloom filters</td><td>merged iterators over memtable + SSTs</td>
+          <td>maps onto your SeqScan; bloom filters bound read amplification</td></tr>
+        <tr><td>Compaction (leveled/tiered)</td><td>applying updates/deletes physically</td>
+          <td>the background task FerricDB must schedule and crash-tolerate</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="sec-integration">Integration plan</h2>
+  <ol>
+    <li><strong>Extract the storage-engine boundary.</strong> Write down what the executor
+      actually needs from <code>HeapFile</code>: insert → address, get by address, set_meta,
+      delete, full scan. Define a <code>TableStorage</code> trait with exactly that surface — no
+      more — and implement it for the existing heap first (a pure refactor; every test stays
+      green).</li>
+    <li><strong>Key design.</strong> An LSM table is a sorted map, so it needs a key: use the
+      primary key (encode with an order-preserving format) rather than RecordId. Tuples become
+      (encoded PK → serialized row + TupleMeta).</li>
+    <li><strong>Implement <code>LsmTable: TableStorage</code></strong> over your Mini-LSM
+      engine: insert/update = put, delete = tombstone put, scan = range iterator, MVCC metas
+      travel inside the value bytes.</li>
+    <li><strong>Catalog + DDL.</strong> A storage flag on <code>TableInfo</code>, parsed from
+      the WITH clause; the planner picks the scan implementation by table storage.</li>
+    <li><strong>Reuse the behavioral suites.</strong> Run the ms1_ heap-semantics tests (where
+      they apply) and the full <code>slt_all</code> suite against LSM-backed tables — same
+      queries, different engine, same answers.</li>
+  </ol>
+
+  <h2 id="sec-pitfalls">Pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">RecordId stability</span>
+    <p>Compaction moves data; there is no stable (page, slot) address. Secondary indexes over
+    LSM tables must store <em>keys</em>, not RecordIds — a real design fork from your B+Tree,
+    worth a paragraph in your notes even if you skip secondary indexes here.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Two WALs, one truth</span>
+    <p>Mini-LSM has its own WAL; FerricDB has Milestone 9's. Running both means double writes
+    and ambiguous recovery ownership. Pick one owner per table type and document the recovery
+    story for LSM tables explicitly (simplest: LSM tables trust the LSM WAL; FerricDB's ARIES
+    machinery covers heap tables and the catalog).</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">MVCC versions vs LSM tombstones</span>
+    <p>An LSM tombstone means "key deleted"; your MVCC xmax means "deleted for snapshots after
+    T". Naively writing LSM tombstones on DELETE breaks snapshot reads. Keep MVCC metadata in
+    the value and let VACUUM (not DELETE) emit the real tombstones.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li>Mini-LSM's own tests pass through its compaction weeks.</li>
+    <li>An LSM-backed FerricDB table round-trips the full CRUD sqllogictest suite and survives
+      restart.</li>
+    <li>Under sustained writes, compaction demonstrably reduces SST count while queries keep
+      answering correctly.</li>
+    <li>A short design note records the key encoding, the WAL ownership decision, and the
+      MVCC/tombstone interaction.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="SSTs are immutable and compaction relocates live data constantly, so a physical (page, slot) address dies with every merge. Sorted-key addressing is stable across compaction — which is why LSM secondary indexes point at keys and why step 2 makes the primary key the table's identity.">
+    <legend class="quiz-q">Why can't LSM-backed tables use RecordId addressing?</legend>
+    <label><input type="radio" name="q1"> RecordIds are too large for SST blocks</label>
+    <label><input type="radio" name="q1" data-correct> Compaction moves data between files — no physical address survives; only keys are stable</label>
+    <label><input type="radio" name="q1"> They can, with a lookup table maintained by compaction</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">skyzh, "Mini-LSM: LSM in a Week" — the course this stretch follows:
+          memtables, SSTs, compaction, structure and licensing.
+          <a href="https://skyzh.github.io/mini-lsm/" rel="external">https://skyzh.github.io/mini-lsm/</a>
+          (starter code and tests: <a href="https://github.com/skyzh/mini-lsm" rel="external">github.com/skyzh/mini-lsm</a>)</li>
+      </ol>
+    </div>
+
+    <nav class="prevnext">
+      <a href="../stretch-s2/index.html"><span class="dir">← Previous</span> Stretch S2 · Serializable Isolation (SSI)</a>
+      <a class="next" href="../stretch-s4/index.html"><span class="dir">Next →</span> Stretch S4 · Raft Replication</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor", "index", "txn", "wal", "protocol", "client"],
+    current: [],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

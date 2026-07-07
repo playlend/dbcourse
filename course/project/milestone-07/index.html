@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 7 · Query Optimization — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 7</span>
+  </nav>
+  <span class="badge milestone">Milestone 7</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 7 · Query Optimization</h1>
+  <p class="subtitle">Give FerricDB judgment: rewrite rules, ANALYZE statistics, a Postgres-style
+  cost model, cost-based access paths, join ordering, and EXPLAIN to show its work.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <p>Until now your planner has been a stenographer: it transcribes the bound statement into the
+  one plan shape it knows. This milestone makes it opinionated. The work divides into three
+  independent layers — rewrites (no statistics needed), statistics (ANALYZE), and cost-based
+  choice (access paths, join order) — and each layer is testable on its own before the next
+  exists. Build them in that order and the milestone stays calm.</p>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li><strong>Implement</strong> plan rewrites as tree-to-tree transformations: predicate
+      pushdown, projection pruning, constant folding.</li>
+    <li><strong>Implement</strong> ANALYZE: row counts, per-column min/max, distinct and null
+      estimates, persisted through the catalog.</li>
+    <li><strong>Implement</strong> a cost model in the spirit of Postgres's — page I/O plus
+      per-tuple CPU, with the documented default constants.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Implement</strong> Selinger-style selectivity estimation and cost-based
+      seq-vs-index access path selection.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Implement</strong> join ordering — greedy or subset-DP — for up to ~6 tables,
+      left-deep.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Implement</strong> EXPLAIN and EXPLAIN ANALYZE.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m08-query-optimization/index.html">M08 · Query Optimization</a> —
+      the concept module; its cost calculator and DP explorer are executable versions of what
+      you build here.</li>
+    <li>Selinger et al. 1979 — the cost model and DP sections; your join ordering follows this
+      paper. <a href="https://web.stanford.edu/class/cs345d-01/rl/selinger.pdf" rel="external">web.stanford.edu/class/cs345d-01/rl/selinger.pdf</a></li>
+    <li>The Internals of PostgreSQL, §3.2 — worked cost arithmetic to sanity-check your model
+      against. <a href="https://www.interdb.jp/pg/pgsql03/02.html" rel="external">interdb.jp/pg/pgsql03/02.html</a></li>
+    <li>Red Book Ch. 7 commentary — perspective before you start.
+      <a href="http://www.redbook.io/ch7-queryoptimization.html" rel="external">redbook.io/ch7-queryoptimization.html</a></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — the planner is re-lit: same box as Milestone 4, new brain. Every
+    component it needs — catalog statistics, both scan operators, all three join algorithms —
+    already exists.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+  <p>New surface in <code>crates/exec</code> and <code>crates/catalog</code>:</p>
+
+  <pre><code>// crates/exec
+impl&lt;'a&gt; Planner&lt;'a&gt; {
+    /// MS7: rewrite rules (predicate pushdown, projection pruning,
+    /// constant folding) then cost-based access path + join order.
+    pub fn optimize(&amp;self, plan: plan::LogicalPlan) -&gt; Result&lt;plan::LogicalPlan&gt;;
+}
+
+pub mod cost {
+    pub const SEQ_PAGE_COST: f64 = 1.0;      // matches Postgres defaults
+    pub const RANDOM_PAGE_COST: f64 = 4.0;
+    pub const CPU_TUPLE_COST: f64 = 0.01;
+    pub struct CostModel&lt;'a&gt; { /* &amp;'a Catalog */ }
+    impl&lt;'a&gt; CostModel&lt;'a&gt; {
+        pub fn plan_cost(&amp;self, plan: &amp;LogicalPlan) -&gt; f64;
+        pub fn selectivity(&amp;self, table: &amp;TableInfo, pred: &amp;BoundExpr) -&gt; f64;
+    }
+}
+
+// crates/catalog
+pub struct ColumnStats { pub min: Option&lt;Value&gt;, pub max: Option&lt;Value&gt;,
+                         pub distinct_estimate: u64, pub null_count: u64 }
+pub struct TableStats { pub row_count: u64, pub page_count: u32,
+                        pub columns: Vec&lt;ColumnStats&gt; }
+impl Catalog {
+    pub fn stats(&amp;self, table: &amp;str) -&gt; Result&lt;Option&lt;TableStats&gt;&gt;;         // MS7
+    pub fn set_stats(&amp;self, table: &amp;str, stats: TableStats) -&gt; Result&lt;()&gt;;  // MS7
+}
+
+// crates/sql — already parsed since MS3/MS6 grammar growth:
+//   Analyze { table: Option&lt;String&gt; }
+//   Explain { analyze: bool, inner: Box&lt;Statement&gt; }</code></pre>
+
+  <p>Behavioral contract:</p>
+  <ul>
+    <li><strong>Rewrites are semantics-preserving</strong> and run before costing. Pushdown may
+      move a predicate below an operator only if every column it references is available there.</li>
+    <li><strong>Selectivity</strong> follows the Selinger defaults where statistics exist:
+      equality ⇒ 1/distinct; range ⇒ linear interpolation between min and max; fall back to the
+      paper's honest guesses (1/10, 1/3) where they don't.<sup class="cite"><a href="#ref-1">1</a></sup>
+      Document the uniformity and independence assumptions in the rustdoc.</li>
+    <li><strong>Access path:</strong> for each base table with a usable index predicate, cost
+      both scans and keep the cheaper — replacing the Milestone 5 always-index rule.</li>
+    <li><strong>Join order:</strong> left-deep; either greedy (smallest estimated intermediate
+      result first) or the Selinger subset-DP. The DP earns you the crossed-out cross products
+      in the M08 explorer; greedy passes the tests with a documented caveat.</li>
+    <li><strong>EXPLAIN</strong> prints the optimized plan tree, one node per line with
+      estimated cost and rows; <strong>EXPLAIN ANALYZE</strong> executes it and adds actual rows
+      and wall time per node — and, like the real one, performs the statement's side effects, so
+      the REPL warns on data-modifying statements.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+  </ul>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <ol>
+    <li><strong>Rewrites first — they need no statistics.</strong> Write each rule as a function
+      <code>LogicalPlan -&gt; LogicalPlan</code> and a driver that applies rules bottom-up until
+      a fixpoint. Constant folding is a good warm-up (fold inside <code>BoundExpr</code>);
+      pushdown is the one with the correctness rule — test it on a predicate referencing both
+      join sides (must NOT push) and one side (must push).</li>
+    <li><strong>ANALYZE next.</strong> One pass per table through your own SeqScan: count rows
+      and pages, track min/max per column, estimate distincts. For distinct estimation a
+      HashSet is fine at course scale; note in the rustdoc that real systems sample and use
+      sketches (HyperLogLog) instead. Persist with <code>set_stats</code>; verify with the
+      catalog round-trip test.</li>
+    <li><strong>Selectivity, then cost.</strong> Implement <code>selectivity()</code> as a match
+      over the predicate shape, then <code>plan_cost()</code> recursively: SeqScan =
+      <code>SEQ_PAGE_COST·pages + CPU_TUPLE_COST·rows</code>; IndexScan =
+      <code>RANDOM_PAGE_COST·(height + matching leaves + matching heap fetches) + cpu</code>
+      (state your clustering assumption — all-random is honest and simple); joins from the M07
+      formulas over estimated input cardinalities. Check your arithmetic against interdb §3.2's
+      worked examples with the same constants.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Access path selection.</strong> Where a filter predicate hits an indexed column
+      with <code>=</code> or a range, build both candidate scans, cost them, keep the winner.
+      This is ten lines once the cost model exists — the leverage is all in step 3.</li>
+    <li><strong>Join ordering.</strong> Greedy: start from the pair with the smallest estimated
+      output, attach the table producing the smallest next output, repeat. DP: memo from
+      table-bitmask to best (plan, cost, rows) per subset, built by subset size, exactly the M08
+      explorer.<sup class="cite"><a href="#ref-1">1</a></sup> Either way, join <em>inputs</em>
+      keep their chosen access paths from step 4.</li>
+    <li><strong>EXPLAIN last.</strong> A pretty-printer over the optimized plan plus per-node
+      estimates you already computed; ANALYZE mode wraps each executor with counters and a
+      timer. Keep the format line-oriented and stable — the tests match structural markers
+      (operator names, indentation), not exact costs.</li>
+  </ol>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <pre><code>cargo test -p ferricdb-exec    -- --include-ignored ms7_
+cargo test -p ferricdb-catalog -- --include-ignored ms7_</code></pre>
+  <p>The exec group: rewrite unit tests on plan trees (pushdown legality both ways, folding);
+  the crossover test — after ANALYZE, EXPLAIN must choose IndexScan for a selective predicate
+  and SeqScan for a non-selective one on the same table; join-order tests asserting the chosen
+  order's estimated cost, not its text. The catalog group: stats round-trip and the
+  never-analyzed <code>None</code> case. Regressions: the whole <code>slt_all</code> suite must
+  still pass — an optimizer that changes results has a bug worth finding today, not in
+  Milestone 8.</p>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Pushdown across the wrong boundary</span>
+    <p><em>Symptom:</em> "column not found" panics at execution, or silently wrong join results.
+    <em>Cause:</em> pushing a predicate below the operator that produces one of its columns
+    (classically: below the join whose output it references from both sides). The legality check
+    is column-set containment — compute each node's output columns once and consult it.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Selectivity of an empty or constant column</span>
+    <p><em>Symptom:</em> NaN costs, or division by zero on <code>min == max</code>.
+    <em>Cause:</em> interpolation over a zero-width range or stats from an empty table. Clamp
+    selectivity to [0, 1] at the end of <code>selectivity()</code> and special-case empty
+    tables — the ms7_ suite includes an ANALYZE-on-empty test for exactly this.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Enumerating permutations instead of subsets</span>
+    <p><em>Symptom:</em> planning time explodes at 6 tables. <em>Cause:</em> memoizing on
+    ordered sequences. The Selinger insight is that the memo key is the <em>set</em> — for any
+    order of the same set, the ways to extend it are identical.<sup class="cite"><a href="#ref-1">1</a></sup>
+    Use a bitmask key and the space is 2⁶, not 6!.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Brittle EXPLAIN tests</span>
+    <p><em>Symptom:</em> every cost-model tweak breaks a dozen tests. <em>Cause:</em> asserting
+    exact EXPLAIN text. Assert structure (which scan, which join, nesting) and let numbers
+    float — the provided tests model this; keep your own tests to the same discipline.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li><code>ms7_</code> groups pass in both crates; <code>slt_all</code> and all earlier
+      groups still pass.</li>
+    <li>In the REPL, on a 10k-row table with an index: <code>EXPLAIN SELECT … WHERE id = k</code>
+      shows IndexScan; <code>WHERE id &gt; tiny_value</code> (matching ~everything) shows
+      SeqScan; dropping the index flips the first to SeqScan; running ANALYZE after bulk
+      changes updates the choice.</li>
+    <li><code>EXPLAIN ANALYZE</code> shows estimated vs actual rows, and you can point at a
+      query where they diverge and say why (skew or correlation).</li>
+    <li>A 4-table join query's EXPLAIN shows an order that starts from the most selective join
+      — and you can defend it with the estimated cardinalities.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="Rewrites are cost-independent — always-wins transformations that need no statistics — so they run first and simplify the tree the cost-based phases then price. Costing un-rewritten plans wastes the search on shapes pushdown would have eliminated.">
+    <legend class="quiz-q">Why do rewrites run before cost-based optimization rather than inside it?</legend>
+    <label><input type="radio" name="q1" data-correct> They are always-beneficial and statistics-free; running them first shrinks what the costed search must consider</label>
+    <label><input type="radio" name="q1"> Because the cost model cannot price filtered plans</label>
+    <label><input type="radio" name="q1"> Tradition from System R, with no technical reason</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+  <fieldset class="quiz" data-explain="ANALYZE writes fresh statistics; without re-running it, the planner still sees the old row counts and min/max, so its selectivity estimates — and therefore plan choices — reflect the table as it was. Stale stats are the number-one real-world cause of plan regressions.">
+    <legend class="quiz-q">You bulk-load 1M rows into a table analyzed when it had 100. What does the planner see?</legend>
+    <label><input type="radio" name="q2"> The new size — statistics update on every insert</label>
+    <label><input type="radio" name="q2" data-correct> The old statistics: 100 rows — until ANALYZE runs again</label>
+    <label><input type="radio" name="q2"> An error, because statistics are invalidated by writes</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">Selinger et al., "Access Path Selection in a Relational Database
+          Management System", SIGMOD 1979 — selectivity factors, the cost formula, and DP over
+          subsets with interesting orders.
+          <a href="https://web.stanford.edu/class/cs345d-01/rl/selinger.pdf" rel="external">https://web.stanford.edu/class/cs345d-01/rl/selinger.pdf</a></li>
+        <li id="ref-2">Hironobu Suzuki, The Internals of PostgreSQL, §3.2 — the seq/index scan
+          cost formulas and the default constants your model adopts.
+          <a href="https://www.interdb.jp/pg/pgsql03/02.html" rel="external">https://www.interdb.jp/pg/pgsql03/02.html</a></li>
+        <li id="ref-3">PostgreSQL Documentation, "Planner/Optimizer" — near-exhaustive search
+          below geqo_threshold and join-clause-driven pair selection.
+          <a href="https://www.postgresql.org/docs/current/planner-optimizer.html" rel="external">https://www.postgresql.org/docs/current/planner-optimizer.html</a></li>
+        <li id="ref-4">PostgreSQL Documentation, "Using EXPLAIN" — the output fields and
+          EXPLAIN ANALYZE's real execution semantics.
+          <a href="https://www.postgresql.org/docs/current/using-explain.html" rel="external">https://www.postgresql.org/docs/current/using-explain.html</a></li>
+        <li id="ref-5">Readings in Database Systems, 5th ed., Ch. 7 commentary.
+          <a href="http://www.redbook.io/ch7-queryoptimization.html" rel="external">http://www.redbook.io/ch7-queryoptimization.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>PostgreSQL docs, "Statistics Used by the Planner" — histograms and most-common-value
+        lists: what fixes the uniformity assumption your model documents.
+        <a href="https://www.postgresql.org/docs/current/planner-stats.html" rel="external">postgresql.org/docs/current/planner-stats.html</a></li>
+      <li>The Internals of PostgreSQL, §3.5–3.6 — how Postgres costs the three join methods and
+        plans multi-table queries.
+        <a href="https://www.interdb.jp/pg/pgsql03/05.html" rel="external">interdb.jp/pg/pgsql03/05.html</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>Next on the path: <a href="../../modules/m09-transactions-mvcc/index.html">M09 ·
+    Transactions &amp; MVCC</a>, then <a href="../milestone-08/index.html">Milestone 8</a> —
+    FerricDB learns to share.</p>
+
+    <nav class="prevnext">
+      <a href="../../modules/m08-query-optimization/index.html"><span class="dir">← Previous</span> M08 · Query Optimization</a>
+      <a class="next" href="../../modules/m09-transactions-mvcc/index.html"><span class="dir">Next →</span> M09 · Transactions &amp; MVCC</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "executor", "index"],
+    current: ["planner"],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

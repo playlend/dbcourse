@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 3 · SQL Front-End: Lexer, Parser, AST, Catalog, Binder — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 3</span>
+  </nav>
+  <span class="badge milestone">Milestone 3</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 3 · SQL Front-End: Lexer, Parser, AST, Catalog, Binder</h1>
+  <p class="subtitle">Teach FerricDB to read: a hand-written lexer and parser, a system catalog
+  stored inside the database itself, and a binder that turns names into checked references.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <p>This is the widest milestone in the course — three crates get real code — but none of it
+  touches concurrency or subtle byte layouts, so it moves faster than its size suggests. At the
+  end, the REPL stops echoing: <code>.ast SELECT 1 + 2 * 3;</code> prints a real parse tree,
+  <code>CREATE TABLE</code> writes real catalog rows into real heap pages through your buffer
+  pool, and <code>.tables</code> finally has something to say.</p>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li><strong>Implement</strong> a hand-written SQL lexer: case-insensitive keywords, maximal
+      munch, SQL string escapes, positions for errors.</li>
+    <li><strong>Implement</strong> a recursive-descent statement parser with a Pratt expression
+      parser — the sqlparser-rs architecture in miniature.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Design</strong> a catalog that stores table and column metadata in the database
+      itself, bootstrap pages included.</li>
+    <li><strong>Implement</strong> a binder that resolves names and types against the catalog and
+      rejects nonsense with useful errors.</li>
+    <li><strong>Wire</strong> the REPL: <code>.ast</code>, <code>.tables</code>,
+      <code>.schema</code>, and executable <code>CREATE TABLE</code>/<code>DROP TABLE</code>.</li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m05-sql-parsing/index.html">M05 · SQL Front-End</a> — the concept
+      module: Pratt parsing with a worked trace, AST design, the binder's contract. The live
+      demo there is a reference implementation of a subset of your parser.</li>
+    <li>sqlparser-rs design notes — Pratt/TDOP expressions inside recursive-descent statements;
+      the architecture you are reproducing.
+      <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">github.com/apache/datafusion-sqlparser-rs</a></li>
+    <li>SQLite, "Architecture of SQLite" — the contrasting front-end (Lemon-generated parser,
+      bytecode output). <a href="https://sqlite.org/arch.html" rel="external">sqlite.org/arch.html</a></li>
+    <li>cstack, Part 2 — the smallest possible front-end/engine split, worth 10 minutes before
+      you build the real one.
+      <a href="https://cstack.github.io/db_tutorial/parts/part2.html" rel="external">cstack.github.io/db_tutorial/parts/part2.html</a></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — the SQL front-end and the catalog light up. Storage and the buffer
+    pool below are finished; the planner above arrives in Milestone 4.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+
+  <h3>Grammar scope</h3>
+  <p>Exactly these statements (execution of the transaction statements waits for Milestone 8;
+  parsing them costs you five lines now and saves a grammar migration later):</p>
+  <pre><code>CREATE TABLE name (col type [NOT NULL] [PRIMARY KEY], …)
+DROP TABLE name
+INSERT INTO name [(cols…)] VALUES (exprs…) [, (exprs…)…]
+SELECT exprs… FROM name [WHERE expr] [ORDER BY expr [ASC|DESC], …] [LIMIT n]
+UPDATE name SET col = expr [, …] [WHERE expr]
+DELETE FROM name [WHERE expr]
+BEGIN | COMMIT | ROLLBACK</code></pre>
+  <p>Types: <code>BOOLEAN</code>, <code>INTEGER</code>, <code>FLOAT</code>, <code>TEXT</code>.
+  Expressions: literals, column references (optionally qualified), unary <code>-</code>/<code>NOT</code>,
+  binary arithmetic/comparison/<code>AND</code>/<code>OR</code>, <code>IS [NOT] NULL</code>,
+  <code>CAST(expr AS type)</code>, parentheses.</p>
+
+  <h3>Public API (crates/sql)</h3>
+  <pre><code>pub enum Token { /* keywords, idents, literals, operators, punctuation */ }
+pub struct Lexer;
+impl Lexer { pub fn tokenize(input: &amp;str) -&gt; Result&lt;Vec&lt;Token&gt;&gt;; }
+
+pub mod ast { /* Statement, ColumnDef, Select, TableRef, Expr, UnaryOp, BinaryOp —
+                 the full definitions live in the stubs and match the module page */ }
+
+/// Recursive-descent statement parser + Pratt expression parser.
+pub struct Parser;
+impl Parser {
+    pub fn parse(sql: &amp;str) -&gt; Result&lt;Vec&lt;ast::Statement&gt;&gt;;
+    pub fn parse_expr(sql: &amp;str) -&gt; Result&lt;ast::Expr&gt;;   // test convenience
+}</code></pre>
+
+  <h3>Public API (crates/catalog)</h3>
+  <pre><code>pub struct TableInfo { pub oid: Oid, pub name: String, pub schema: Schema,
+                       pub first_page: PageId, pub indexes: Vec&lt;IndexInfo&gt; }
+
+/// System catalog, itself stored in heap pages (bootstrap: fixed page ids
+/// for __tables / __columns; the catalog reads itself at open).
+pub struct Catalog { /* Arc&lt;dyn PageStore&gt;, cached maps */ }
+impl Catalog {
+    pub fn bootstrap(store: std::sync::Arc&lt;dyn PageStore&gt;) -&gt; Result&lt;Self&gt;; // create-or-open
+    pub fn create_table(&amp;self, name: &amp;str, schema: Schema) -&gt; Result&lt;Oid&gt;;
+    pub fn drop_table(&amp;self, name: &amp;str) -&gt; Result&lt;()&gt;;
+    pub fn table(&amp;self, name: &amp;str) -&gt; Result&lt;TableInfo&gt;;
+    pub fn tables(&amp;self) -&gt; Result&lt;Vec&lt;TableInfo&gt;&gt;;
+}</code></pre>
+
+  <h3>Public API (crates/exec, binder module)</h3>
+  <pre><code>/// Name/type resolution against the catalog; produces bound statements
+/// whose column references are (table index, column index) pairs.
+pub struct Binder&lt;'a&gt; { /* &amp;'a Catalog */ }
+impl&lt;'a&gt; Binder&lt;'a&gt; {
+    pub fn new(catalog: &amp;'a Catalog) -&gt; Self;
+    pub fn bind(&amp;self, stmt: ast::Statement) -&gt; Result&lt;BoundStatement&gt;;
+}</code></pre>
+
+  <p>Behavioral contract: the parser never touches the catalog (grammatical nonsense about
+  nonexistent tables must parse); the binder rejects unknown tables/columns, ambiguous or
+  type-mismatched expressions, and INSERT arity errors, each with a message naming the
+  offender.<sup class="cite"><a href="#ref-2">2</a></sup> Escape hatch: you may swap your parser
+  for the sqlparser-rs crate and translate its AST into <code>ast::Statement</code> — the rest of
+  the milestone is unchanged — but the hand-written path is the recommended one; the module
+  teaches everything you need.</p>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <ol>
+    <li><strong>Lexer first, tests continuously.</strong> It is pure string processing —
+      <code>ms3_</code> lexer tests can be green within the hour. Get keyword case-insensitivity,
+      <code>&gt;=</code> maximal munch, and <code>''</code> string escaping right here so the
+      parser never sees the mess.</li>
+    <li><strong>Parser skeleton: peek/expect.</strong> Build the token cursor with
+      <code>peek()</code>/<code>next()</code>/<code>expect(tok)</code> helpers, then
+      <code>parse_statement</code> dispatching on the first keyword. Do <code>CREATE TABLE</code>
+      first — flat clause structure, no expressions — and run <code>.ast</code> against it early
+      for morale.</li>
+    <li><strong>Pratt core next.</strong> Implement <code>parse_expr(min_bp)</code> exactly as
+      the module traces it: prefix position, then the infix loop with the binding-power table
+      (OR 1, AND 2, NOT 3, comparisons 4, additive 5, multiplicative 6, unary minus 7),
+      recursing with <code>bp + 1</code> for left-associativity. The precedence tests encode the
+      module's traces — <code>1 + 2 * 3</code>, <code>a OR b AND c</code>, chains of minus.</li>
+    <li><strong>Finish the statement grammar.</strong> SELECT is the largest; take its clauses
+      one at a time (projection with <code>AS</code> aliases, FROM, WHERE, ORDER BY, LIMIT).
+      INSERT with multi-row VALUES, UPDATE with the SET list, DELETE, DROP, and the three
+      one-keyword transaction statements follow quickly.</li>
+    <li><strong>Catalog: constants before code.</strong> Write down the fixed schemas of
+      <code>__tables</code> (oid, name, first_page) and <code>__columns</code> (table_oid,
+      ordinal, name, type, nullable) as Rust constants, and pin their page ids (this course:
+      page 1 and page 2; page 0 is the database header). <code>bootstrap</code> then has two
+      branches: fresh store → format both heaps and insert the rows describing the catalog
+      tables themselves; existing store → scan both heaps and build the in-memory maps. That
+      self-description is the chicken-and-egg — solved by the constants, exactly as Postgres
+      solves it with compiled-in bootstrap schemas for <code>pg_class</code> and
+      <code>pg_attribute</code>.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Everything through the pool.</strong> The catalog's heaps are ordinary
+      <code>HeapFile</code>s over <code>Arc&lt;dyn PageStore&gt;</code> — your Milestone 2 buffer
+      pool. No direct <code>DiskManager</code> access from here to the end of the course.</li>
+    <li><strong>Binder last.</strong> Walk each statement: resolve the table via
+      <code>catalog.table()</code>, build a scope of (index, name, type) for its columns, resolve
+      every <code>Expr::Column</code> against the scope, type expressions bottom-up, and emit
+      <code>BoundStatement</code>. Boring by design — every interesting decision was made when
+      you defined the AST and the catalog.</li>
+    <li><strong>Wire the REPL.</strong> <code>.ast</code> pretty-prints
+      <code>Parser::parse</code> output (write a small indent-per-level <code>Debug</code>-style
+      formatter — the M05 demo shows the shape). <code>CREATE TABLE</code>/<code>DROP TABLE</code>
+      execute directly against the catalog: your first statements that <em>do</em> something.
+      <code>.tables</code> and <code>.schema</code> read it back.</li>
+  </ol>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <pre><code>cargo test -p ferricdb-sql     -- --include-ignored ms3_
+cargo test -p ferricdb-catalog -- --include-ignored ms3_
+
+# regressions
+cargo test -p ferricdb-storage -- --include-ignored ms1_
+cargo test -p ferricdb-buffer  -- --include-ignored ms2_</code></pre>
+  <p>The sql group covers the lexer cases, a valid corpus asserting exact ASTs across the whole
+  grammar scope, the precedence suite, and an invalid corpus (about ten broken statements) that
+  must produce <code>Err</code> — a panicking parser fails the milestone even if everything else
+  passes. The catalog group covers bootstrap-fresh vs bootstrap-reopen, create/list/drop
+  round-trips, duplicate-name rejection, and schema fidelity across reopen (types and
+  nullability intact). A handful of parses for Milestone 6 grammar (JOIN, GROUP BY, aggregate
+  calls) sit in the same files marked <code>#[ignore = "milestone 6"]</code> — leave them; they
+  are tomorrow's shopping list, not today's.</p>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Precedence-table typos</span>
+    <p><em>Symptom:</em> <code>a OR b AND c</code> groups the wrong way, or comparisons swallow
+    arithmetic (<code>a + 1 &gt; b</code> parsing as <code>a + (1 &gt; b)</code>). One wrong
+    integer in the table produces trees that look plausible in <code>.ast</code> and fail
+    quietly at execution time in Milestone 4. Trust the precedence tests — they exist because
+    everyone makes exactly this mistake once.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Consuming tokens on the error path</span>
+    <p><em>Symptom:</em> error messages that point one token too far, or cascading bogus errors
+    after the first. <em>Cause:</em> a helper called <code>next()</code> to inspect and then
+    errored without backing up. Decide with <code>peek()</code>, consume with
+    <code>expect()</code> — if every consumption is one of those two, this bug cannot exist.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Bootstrap reads the catalog to learn the catalog's schema</span>
+    <p><em>Symptom:</em> <code>bootstrap</code> works on a fresh database and panics on reopen
+    (or vice versa). <em>Cause:</em> using catalog lookups for <code>__tables</code>/<code>__columns</code>
+    themselves. Their schemas and page ids are compile-time constants; only <em>user</em> tables
+    are discovered by scanning. Write the reopen test first if you are unsure — it is the one
+    that catches this.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Forgetting that catalog writes must persist</span>
+    <p><em>Symptom:</em> <code>.tables</code> shows your table until the process restarts.
+    <em>Cause:</em> catalog rows inserted through the buffer pool but never flushed —
+    <code>flush_all</code> on clean shutdown (and after DDL, until the WAL exists) is part of
+    this milestone's REPL wiring.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li><code>ms3_</code> groups pass in both crates; <code>ms1_</code>/<code>ms2_</code> still
+      pass.</li>
+    <li>In the REPL: <code>.ast SELECT 1 + 2 * 3;</code> shows multiplication nested under
+      addition; <code>CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);</code>
+      succeeds; <code>.tables</code> lists it; <code>.schema users</code> shows both columns
+      with types; all of it survives restart.</li>
+    <li>Binding <code>SELECT ghost FROM users</code> and <code>SELECT name FROM nowhere</code>
+      both fail with errors that name the missing thing.</li>
+    <li>Invalid SQL never panics the REPL.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="The parser owns grammar only — Postgres's parser likewise never consults the catalog; semantic checks live in the analyzer. Keeping the parser schema-free means it is testable with no database and its behavior never changes when tables are created or dropped.">
+    <legend class="quiz-q">Where is SELECT ghost FROM nowhere rejected?</legend>
+    <label><input type="radio" name="q1"> In the lexer — unknown identifiers</label>
+    <label><input type="radio" name="q1"> In the parser — the table doesn't exist</label>
+    <label><input type="radio" name="q1" data-correct> In the binder — it parses fine, then name resolution fails against the catalog</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+  <fieldset class="quiz" data-explain="The catalog tables describe themselves, so their schemas cannot be discovered — they must be known before any lookup is possible. Compile-time constants (with fixed page ids) break the circularity; Postgres ships compiled-in bootstrap schemas the same way.">
+    <legend class="quiz-q">Why are the __tables/__columns schemas Rust constants instead of catalog lookups?</legend>
+    <label><input type="radio" name="q2"> Performance — constants avoid page reads</label>
+    <label><input type="radio" name="q2" data-correct> Circularity — you cannot read a table's schema out of a table whose schema you don't know yet</label>
+    <label><input type="radio" name="q2"> Safety — user statements could otherwise modify them</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">apache/datafusion-sqlparser-rs, README — Pratt/TDOP expression parsing
+          inside hand-written recursive descent; the design this milestone follows.
+          <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">https://github.com/apache/datafusion-sqlparser-rs</a></li>
+        <li id="ref-2">Hironobu Suzuki, The Internals of PostgreSQL, §3.1 — parser vs analyzer
+          responsibilities; the catalog-backed semantic analysis this milestone's binder
+          mirrors.
+          <a href="https://www.interdb.jp/pg/pgsql03/01.html" rel="external">https://www.interdb.jp/pg/pgsql03/01.html</a></li>
+        <li id="ref-3">SQLite, "Architecture of SQLite" — the alternative front-end design
+          (generated parser, bytecode target) contrasted throughout Module 5.
+          <a href="https://sqlite.org/arch.html" rel="external">https://sqlite.org/arch.html</a></li>
+        <li id="ref-4">cstack, "Let's Build a Simple Database", Part 2 — the minimal front-end
+          and engine split.
+          <a href="https://cstack.github.io/db_tutorial/parts/part2.html" rel="external">https://cstack.github.io/db_tutorial/parts/part2.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>PostgreSQL docs, "System Catalogs" — pg_class and pg_attribute, the production versions
+        of your __tables and __columns.
+        <a href="https://www.postgresql.org/docs/current/catalogs.html" rel="external">postgresql.org/docs/current/catalogs.html</a></li>
+      <li>sqlparser-rs source — compare your Pratt loop with theirs after you finish; the
+        similarity is the point.
+        <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">github.com/apache/datafusion-sqlparser-rs</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>Next on the path: <a href="../../modules/m06-query-execution/index.html">M06 · Query
+    Execution</a>, then <a href="../milestone-04/index.html">Milestone 4</a> — where the
+    statements you can now parse finally run.</p>
+
+    <nav class="prevnext">
+      <a href="../../modules/m05-sql-parsing/index.html"><span class="dir">← Previous</span> M05 · SQL Front-End</a>
+      <a class="next" href="../../modules/m06-query-execution/index.html"><span class="dir">Next →</span> M06 · Query Execution</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer"],
+    current: ["frontend", "catalog"],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stretch S2 · Serializable Isolation via SSI — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Stretch S2</span>
+  </nav>
+  <span class="badge stretch">Stretch S2</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Stretch S2 · Serializable Isolation via SSI</h1>
+  <p class="subtitle">Close the one hole your Milestone 8 tests documented: make write skew
+  impossible, the way Postgres's Serializable level does — without blocking anyone.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quiz need JavaScript;
+  the specification reads fine without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-goal">The goal</a></li>
+      <li><a href="#sec-theory">Why SI admits write skew — and how SSI catches it</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Suggested design</a></li>
+      <li><a href="#sec-plan">Build plan</a></li>
+      <li><a href="#sec-pitfalls">Pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <p class="muted">Stretch pages are deliberately lower-detail than core milestones: a spec, a
+  design sketch, and pointers — the details are yours to engineer.</p>
+
+  <h2 id="sec-goal">The goal</h2>
+  <p>Milestone 8 shipped with the course's most honest test:
+  <code>ms8_write_skew_is_documented</code> asserts that the write-skew anomaly
+  <em>succeeds</em> under your snapshot isolation, exactly as toyDB documents for its own
+  MVCC.<sup class="cite"><a href="#ref-2">2</a></sup> This stretch flips that test: add a
+  <code>SERIALIZABLE</code> isolation mode under which the same scenario aborts one transaction
+  with a serialization error, while plain snapshot isolation mode keeps its current behavior.</p>
+
+  <h2 id="sec-theory">Why SI admits write skew — and how SSI catches it</h2>
+  <p>First-committer-wins compares <em>write sets</em>; write skew's transactions write disjoint
+  rows, so it sails through. What the anomaly does leave behind is a distinctive dependency
+  shape: each transaction <em>reads</em> data the other <em>writes</em> — a pair of
+  read-write (rw) antidependencies between concurrent transactions. Serializable Snapshot
+  Isolation detects this pattern instead of preventing it with blocking: PostgreSQL's
+  Serializable level keeps non-blocking <em>predicate locks</em> that record which reads a
+  concurrent write would have affected, and aborts a transaction (SQLSTATE 40001, retry) when a
+  dangerous structure completes — with the documented cost that monitoring dependencies and
+  restarting transactions isn't free.<sup class="cite"><a href="#ref-1">1</a></sup> Your
+  simplified version follows the same philosophy with cruder bookkeeping: track read sets,
+  detect rw-antidependencies at commit, and abort conservatively — more false positives than
+  real SSI is an acceptable trade at course scale, and you should state it in your rustdoc the
+  way toyDB states its own limitations.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — the whole system is built; S2 deepens the transaction manager.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Suggested design</h2>
+  <p>Extensions to <code>crates/txn</code> — a suggested shape, not a provided stub:</p>
+  <pre><code>pub enum IsolationLevel { Snapshot, Serializable }
+
+impl TransactionManager {
+    pub fn begin_with(&amp;self, level: IsolationLevel) -&gt; Arc&lt;Transaction&gt;;
+    /// Called by scans under Serializable: remember what this txn read.
+    pub fn record_read(&amp;self, txn: &amp;Transaction, rid: RecordId);
+}
+// commit(): in addition to first-committer-wins, under Serializable abort if
+//   my read set ∩ writes of concurrent committed txns ≠ ∅   (rw into the past)
+//   or my write set ∩ reads of concurrent committed txns ≠ ∅ (rw into me)</code></pre>
+  <p>That commit rule is deliberately stronger than true SSI (which aborts only when <em>two</em>
+  rw-antidependencies form a dangerous structure); the stronger rule is simpler, still correct
+  (never admits a non-serializable history), and only costs extra aborts.</p>
+
+  <h2 id="sec-plan">Build plan</h2>
+  <ol>
+    <li>Add the isolation level to <code>begin</code>, the REPL (<code>BEGIN SERIALIZABLE</code>),
+      and the session default.</li>
+    <li>Thread <code>record_read</code> through SeqScan and IndexScan — only for rows actually
+      returned to the transaction, only under Serializable.</li>
+    <li>Keep read sets alongside the write sets you already store; extend the commit-time check
+      under the same lock.</li>
+    <li>Write the flip test: the M09 doctors scenario aborts one transaction under
+      Serializable and completes under Snapshot — both asserted.</li>
+    <li>Add a no-false-positive guard: two serializable transactions touching disjoint data must
+      both commit.</li>
+  </ol>
+
+  <h2 id="sec-pitfalls">Pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Conflating write-write with read-write conflicts</span>
+    <p>First-committer-wins already handles write-write. If your new check only compares write
+    sets harder, write skew still escapes — the whole point is the <em>read</em> sets.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Predicate reads</span>
+    <p>Tracking read <em>rows</em> misses phantom-flavored skew: a transaction that read "no row
+    matched WHERE x &gt; 10" read a predicate, not a row, and a concurrent insert into that range
+    escapes row-granularity tracking. Real SSI predicate-locks the range;<sup class="cite"><a href="#ref-1">1</a></sup>
+    acknowledge the gap in your rustdoc, or coarsen to table-granularity reads for DDL-free
+    honesty.</p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Unbounded read sets</span>
+    <p>A serializable full-table scan records every row. Fine at course scale — but note the
+    production answer (granularity promotion: row → page → table locks) so the design reads as
+    a choice, not an oversight.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li>The write-skew scenario aborts one transaction with a serialization error under
+      <code>SERIALIZABLE</code> and still succeeds under plain snapshot isolation — both tested.</li>
+    <li>Disjoint serializable transactions commit without false aborts (simple cases).</li>
+    <li>All ms8_ tests still pass in Snapshot mode; the documented-anomaly test is updated to
+      run under Snapshot explicitly.</li>
+    <li>Your rustdoc states the simplifications (row-granularity reads, conservative aborts) and
+      cites what real SSI adds.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="SSI is optimistic: reads and writes never block; the system watches dependency patterns and aborts a participant when a dangerous structure completes. Postgres's docs emphasize its predicate locks 'do not cause any blocking' — the concurrency of SI, the guarantees of serializability, paid for in retries.">
+    <legend class="quiz-q">How does SSI differ from two-phase locking as a road to serializability?</legend>
+    <label><input type="radio" name="q1"> It takes the same locks but releases them earlier</label>
+    <label><input type="radio" name="q1" data-correct> Nothing blocks — dependencies are recorded and a transaction is aborted when a dangerous pattern forms</label>
+    <label><input type="radio" name="q1"> It serializes all writers through a single queue</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">PostgreSQL Documentation, "Transaction Isolation" — the Serializable
+          level: non-blocking predicate locks, dependency monitoring, 40001 retry discipline,
+          and its costs.
+          <a href="https://www.postgresql.org/docs/current/transaction-iso.html" rel="external">https://www.postgresql.org/docs/current/transaction-iso.html</a></li>
+        <li id="ref-2">erikgrinaker/toydb, SQL docs "Transactions" — the documented anomaly
+          coverage this stretch improves on, and the honest-limitations style to copy.
+          <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/sql.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/sql.md</a></li>
+        <li id="ref-3">Hironobu Suzuki, The Internals of PostgreSQL, Ch. 5 — the SI mechanics
+          underneath, from Module 9 / Milestone 8.
+          <a href="https://www.interdb.jp/pg/pgsql05.html" rel="external">https://www.interdb.jp/pg/pgsql05.html</a></li>
+      </ol>
+    </div>
+
+    <nav class="prevnext">
+      <a href="../stretch-s1/index.html"><span class="dir">← Previous</span> Stretch S1 · Lock Manager &amp; Row Locks</a>
+      <a class="next" href="../stretch-s3/index.html"><span class="dir">Next →</span> Stretch S3 · LSM Storage Engine</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor", "index", "txn", "wal", "protocol", "client"],
+    current: [],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

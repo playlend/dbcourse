@@ -1,0 +1,782 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M00 · Orientation: What a DBMS Is and How This Course Works — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+/* set theme before first paint to avoid flashing */
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M00 Orientation</span>
+  </nav>
+  <span class="badge">Module 00</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M00 · Orientation: What a DBMS Is and How This Course Works</h1>
+  <p class="subtitle">A map of the whole machine — every subsystem of a relational database, how
+  PostgreSQL and SQLite arrange those subsystems differently, and how this course's modules and
+  project milestones interleave to build one.</p>
+
+  <noscript><p class="noscript-warn">Interactive demos and self-check quizzes on this page need JavaScript;
+  all explanatory content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-dbms">What a DBMS is — and why you should build one</a></li>
+      <li><a href="#sec-map">The course map: modules interleaved with milestones</a></li>
+      <li><a href="#sec-anatomy">Anatomy of a relational DBMS</a></li>
+      <li><a href="#sec-select">One SELECT, end to end</a></li>
+      <li><a href="#sec-disk-memory">Disk-oriented vs in-memory architectures</a></li>
+      <li><a href="#sec-pg-sqlite">Two role models: PostgreSQL and SQLite</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-dbms">What a DBMS is — and why you should build one</h2>
+
+  <p>A database management system is the software that keeps structured data correct while many
+  programs read and write it at once, and keeps that data alive across crashes, power failures, and
+  decades of schema changes. Relational DBMSs sit at the core of most of the world's application
+  infrastructure — commerce, billing, medical records, payroll — and serve as the repository of
+  record behind nearly all online transactions.<sup class="cite"><a href="#ref-1">1</a></sup>
+  They were also among the earliest widely deployed multi-user server systems, which means they
+  pioneered many of the design techniques for scalability and reliability that other server software
+  later copied.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>Here is the odd part: despite that influence, the <em>architecture</em> of these systems is
+  under-documented. Hellerstein, Stonebraker, and Hamilton open their survey by observing that
+  textbook treatments of databases focus on algorithms and theory — the things that are natural to
+  teach and test — while the holistic system design that makes a real DBMS work lives mostly in
+  product manuals and the community's oral tradition.<sup class="cite"><a href="#ref-1">1</a></sup>
+  The most reliable cure for that gap is the one used by the university courses this curriculum is
+  modeled on: implement the system yourself. CMU's 15-445/645, for example, pairs its lecture
+  sequence with a strictly ordered chain of programming projects — a buffer pool manager, then a
+  database index, then query execution, then concurrency control — each built into the same teaching
+  system (BusTub), so every lecture's ideas land in code within a couple of
+  weeks.<sup class="cite"><a href="#ref-7">7</a></sup> The lectures themselves lean on case studies of
+  open-source and commercial systems to show how the trade-offs play out in
+  practice.<sup class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <p>This course follows the same recipe with a Rust accent. The concept modules (M00–M12) are the
+  lecture track; the project milestones (MS0–MS10) are the build track. Across them you will
+  implement <strong>FerricDB</strong>: a disk-oriented, transactional, SQL-speaking database that
+  models PostgreSQL's semantics closely enough that, by Milestone 10, a stock <code>psql</code>
+  client connects to your process and runs queries against your code. Nothing on these pages is
+  hand-waved: every factual claim about how real systems behave carries a superscript citation to a
+  primary source, and every number this course invents is labeled as a course choice.</p>
+
+  <h2 id="sec-map">The course map: modules interleaved with milestones</h2>
+
+  <p>Figure 1 is the recommended path. Blue-bordered boxes are concept modules, green boxes are
+  project milestones, and the amber box holds the optional stretch milestones. Each box in the
+  figure is a link — you can navigate the whole course from here.</p>
+
+  <figure>
+    <svg viewBox="0 0 940 326" role="img">
+      <title>The recommended course path: twenty-five stops alternating between concept modules and project milestones, ending with stretch goals.</title>
+      <defs>
+        <marker id="pm-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.65"/>
+        </marker>
+      </defs>
+      <!-- row transitions -->
+      <path class="d-line" d="M 864 68 V 101 H 48 V 134" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 864 178 V 211 H 48 V 244" marker-end="url(#pm-arrow)"/>
+      <!-- row 1 arrows -->
+      <path class="d-line" d="M 88 46 H 110" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 190 46 H 212" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 292 46 H 314" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 394 46 H 416" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 496 46 H 518" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 598 46 H 620" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 700 46 H 722" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 802 46 H 824" marker-end="url(#pm-arrow)"/>
+      <!-- row 2 arrows -->
+      <path class="d-line" d="M 88 156 H 110" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 190 156 H 212" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 292 156 H 314" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 394 156 H 416" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 496 156 H 518" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 598 156 H 620" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 700 156 H 722" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 802 156 H 824" marker-end="url(#pm-arrow)"/>
+      <!-- row 3 arrows -->
+      <path class="d-line" d="M 88 266 H 110" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 190 266 H 212" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 292 266 H 314" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 394 266 H 416" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 496 266 H 518" marker-end="url(#pm-arrow)"/>
+      <path class="d-line" d="M 598 266 H 620" marker-end="url(#pm-arrow)"/>
+      <!-- row 1 nodes -->
+      <rect x="8" y="24" width="80" height="44" rx="8" class="d-box-hl"/>
+      <text x="48" y="51" text-anchor="middle" class="d-mono">M00</text>
+      <a href="../../project/milestone-00/index.html"><rect x="110" y="24" width="80" height="44" rx="8" class="d-box-good"/><text x="150" y="51" text-anchor="middle" class="d-mono">MS0</text></a>
+      <a href="../m01-relational-model-sql/index.html"><rect x="212" y="24" width="80" height="44" rx="8" class="d-box"/><text x="252" y="51" text-anchor="middle" class="d-mono">M01</text></a>
+      <a href="../m02-storage/index.html"><rect x="314" y="24" width="80" height="44" rx="8" class="d-box"/><text x="354" y="51" text-anchor="middle" class="d-mono">M02</text></a>
+      <a href="../../project/milestone-01/index.html"><rect x="416" y="24" width="80" height="44" rx="8" class="d-box-good"/><text x="456" y="51" text-anchor="middle" class="d-mono">MS1</text></a>
+      <a href="../m03-buffer-pool/index.html"><rect x="518" y="24" width="80" height="44" rx="8" class="d-box"/><text x="558" y="51" text-anchor="middle" class="d-mono">M03</text></a>
+      <a href="../../project/milestone-02/index.html"><rect x="620" y="24" width="80" height="44" rx="8" class="d-box-good"/><text x="660" y="51" text-anchor="middle" class="d-mono">MS2</text></a>
+      <a href="../m05-sql-parsing/index.html"><rect x="722" y="24" width="80" height="44" rx="8" class="d-box"/><text x="762" y="51" text-anchor="middle" class="d-mono">M05</text></a>
+      <a href="../../project/milestone-03/index.html"><rect x="824" y="24" width="80" height="44" rx="8" class="d-box-good"/><text x="864" y="51" text-anchor="middle" class="d-mono">MS3</text></a>
+      <!-- row 2 nodes -->
+      <a href="../m06-query-execution/index.html"><rect x="8" y="134" width="80" height="44" rx="8" class="d-box"/><text x="48" y="161" text-anchor="middle" class="d-mono">M06</text></a>
+      <a href="../../project/milestone-04/index.html"><rect x="110" y="134" width="80" height="44" rx="8" class="d-box-good"/><text x="150" y="161" text-anchor="middle" class="d-mono">MS4</text></a>
+      <a href="../m04-data-structures-indexes/index.html"><rect x="212" y="134" width="80" height="44" rx="8" class="d-box"/><text x="252" y="161" text-anchor="middle" class="d-mono">M04</text></a>
+      <a href="../../project/milestone-05/index.html"><rect x="314" y="134" width="80" height="44" rx="8" class="d-box-good"/><text x="354" y="161" text-anchor="middle" class="d-mono">MS5</text></a>
+      <a href="../m07-joins-sorting-aggregation/index.html"><rect x="416" y="134" width="80" height="44" rx="8" class="d-box"/><text x="456" y="161" text-anchor="middle" class="d-mono">M07</text></a>
+      <a href="../../project/milestone-06/index.html"><rect x="518" y="134" width="80" height="44" rx="8" class="d-box-good"/><text x="558" y="161" text-anchor="middle" class="d-mono">MS6</text></a>
+      <a href="../m08-query-optimization/index.html"><rect x="620" y="134" width="80" height="44" rx="8" class="d-box"/><text x="660" y="161" text-anchor="middle" class="d-mono">M08</text></a>
+      <a href="../../project/milestone-07/index.html"><rect x="722" y="134" width="80" height="44" rx="8" class="d-box-good"/><text x="762" y="161" text-anchor="middle" class="d-mono">MS7</text></a>
+      <a href="../m09-transactions-mvcc/index.html"><rect x="824" y="134" width="80" height="44" rx="8" class="d-box"/><text x="864" y="161" text-anchor="middle" class="d-mono">M09</text></a>
+      <!-- row 3 nodes -->
+      <a href="../../project/milestone-08/index.html"><rect x="8" y="244" width="80" height="44" rx="8" class="d-box-good"/><text x="48" y="271" text-anchor="middle" class="d-mono">MS8</text></a>
+      <a href="../m10-logging-recovery/index.html"><rect x="110" y="244" width="80" height="44" rx="8" class="d-box"/><text x="150" y="271" text-anchor="middle" class="d-mono">M10</text></a>
+      <a href="../../project/milestone-09/index.html"><rect x="212" y="244" width="80" height="44" rx="8" class="d-box-good"/><text x="252" y="271" text-anchor="middle" class="d-mono">MS9</text></a>
+      <a href="../m11-wire-protocol-server/index.html"><rect x="314" y="244" width="80" height="44" rx="8" class="d-box"/><text x="354" y="271" text-anchor="middle" class="d-mono">M11</text></a>
+      <a href="../../project/milestone-10/index.html"><rect x="416" y="244" width="80" height="44" rx="8" class="d-box-good"/><text x="456" y="271" text-anchor="middle" class="d-mono">MS10</text></a>
+      <a href="../m12-advanced-topics/index.html"><rect x="518" y="244" width="80" height="44" rx="8" class="d-box"/><text x="558" y="271" text-anchor="middle" class="d-mono">M12</text></a>
+      <a href="../../project/index.html#sec-stretch"><rect x="620" y="244" width="80" height="44" rx="8" class="d-box-warn"/><text x="660" y="271" text-anchor="middle" class="d-mono">S1–S4</text></a>
+      <!-- legend -->
+      <rect x="8" y="302" width="18" height="14" rx="3" class="d-box"/>
+      <text x="32" y="314" class="d-text-sm">concept module</text>
+      <rect x="170" y="302" width="18" height="14" rx="3" class="d-box-good"/>
+      <text x="194" y="314" class="d-text-sm">project milestone</text>
+      <rect x="352" y="302" width="18" height="14" rx="3" class="d-box-warn"/>
+      <text x="376" y="314" class="d-text-sm">stretch</text>
+      <rect x="470" y="302" width="18" height="14" rx="3" class="d-box-hl"/>
+      <text x="494" y="314" class="d-text-sm">you are here</text>
+    </svg>
+    <figcaption>Figure 1 — the recommended path. Read a module, then build its milestone; every box
+    links to its page.</figcaption>
+  </figure>
+
+  <h3 id="sub-rhythm">The rhythm: read, then build</h3>
+
+  <p>Modules are numbered by <em>topic</em>, roughly mirroring the lecture order of the university
+  courses this curriculum draws on — CMU's schedule runs relational model, storage, memory
+  management, hash tables and B+Tree indexes, sorting and joins, execution, optimization,
+  concurrency control, and recovery in that order.<sup class="cite"><a href="#ref-6">6</a></sup>
+  Milestones are numbered by <em>build dependency</em> and must be done strictly in sequence, because
+  each one compiles and links against the last. The two numbering schemes disagree in one visible
+  place: the path visits M05 (SQL front-end) and M06 (execution) before M04 (B+Trees), because you
+  need a working scan-based executor in Milestone 4 before an index milestone is worth building. When
+  a module's ideas depend on another module, the text links there instead of re-teaching.</p>
+
+  <p>Each module page ends with a <em>Milestone link</em> section telling you exactly what to build
+  next; each milestone page opens with <em>Required reading</em> pointing back at its module(s). If
+  you only remember one navigation rule, remember Figure 1's arrow direction.</p>
+
+  <h3 id="sub-house-rules">House rules you will see on every page</h3>
+
+  <ul>
+    <li><strong>Citations everywhere.</strong> Superscript numbers resolve to the numbered
+    <em>Primary sources</em> list at the bottom of each page. They are not decoration; they are the
+    "go deeper" trail. When a sentence describes how PostgreSQL, SQLite, or any published algorithm
+    behaves, the superscript tells you where that knowledge comes from.</li>
+    <li><strong>Course choices are labeled.</strong> Some numbers are decisions, not facts. FerricDB
+    uses 8&nbsp;KB pages — a course choice matching PostgreSQL's usual 8&nbsp;kB block
+    size<sup class="cite"><a href="#ref-9">9</a></sup> — and its server will listen on port 5433, a
+    course choice made so your database never collides with a real PostgreSQL instance on its default
+    port 5432.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong>The workspace lives in <code>course/ferricdb/</code>.</strong> It is a Cargo
+    workspace whose crates sit under <code>course/ferricdb/crates/</code>; directory names are short
+    (<code>crates/storage</code>) and package names carry the prefix
+    (<code>ferricdb-storage</code>). Starter code stubs the public APIs and ships the tests for every
+    milestone marked <code>#[ignore]</code>; each milestone tells you which group to un-ignore, e.g.
+    <code>cargo test -p ferricdb-storage -- --include-ignored ms1_</code>.</li>
+    <li><strong>Both designs, side by side.</strong> Where PostgreSQL and SQLite genuinely diverge,
+    pages present both in labeled tabs rather than pretending there is one true design.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-title">Tip</span>
+    <p>Build Milestone 0 immediately after this page — before reading M01. It is deliberately light
+    (workspace, REPL, test harness), and having a running binary makes every later module concrete:
+    you will always have a place to type SQL at whatever layer currently exists.</p>
+  </div>
+
+  <h2 id="sec-anatomy">Anatomy of a relational DBMS</h2>
+
+  <p>Hellerstein, Stonebraker, and Hamilton describe a typical RDBMS as five main components: a
+  <em>client communications manager</em> that speaks connection protocols; a <em>process manager</em>
+  that assigns each query a thread of computation and applies admission control; a <em>relational
+  query processor</em> that checks authorization, compiles SQL into a query plan, and executes it
+  through a suite of operators; a <em>transactional storage manager</em> bundling access methods,
+  a buffer manager, a lock manager, and a log manager; and a set of <em>shared components and
+  utilities</em> — catalog, memory manager, replication and administration tools — used by everything
+  else.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>FerricDB refines those five components into the twelve boxes of Figure 2, because twelve boxes
+  map one-to-one onto crates you will write. This diagram is the course's master map: milestone pages
+  re-render it with finished components in green so you can watch the system light up as you build.
+  <strong>Every box below is clickable</strong> — each links to the module that teaches that
+  component, so treat the figure as a second table of contents.</p>
+
+  <figure>
+    <div id="arch-map"></div>
+    <figcaption>Figure 2 — the FerricDB architecture (rendered by shared script; enable JavaScript to
+    see it). Down the spine: client, wire protocol, SQL front-end, planner, executor, then the
+    storage layer — heap and B+Tree access methods over the buffer pool over the disk manager. On the
+    side: the catalog, the transaction manager, and the WAL. Click any box to jump to its module.</figcaption>
+  </figure>
+
+  <p>Reading the spine top-down, with the fntdb07 component each box came from:</p>
+
+  <ul>
+    <li><strong>Client &amp; wire protocol server</strong> (client communications manager). The
+    client — <code>psql</code>, a driver, an ORM — connects and ships SQL; the DBMS end of the wire
+    remembers connection state, receives commands, and returns data and control
+    messages.<sup class="cite"><a href="#ref-1">1</a></sup> PostgreSQL listens on TCP port 5432 by
+    default and dedicates a <em>backend process</em> to each
+    connection.<sup class="cite"><a href="#ref-4">4</a></sup> FerricDB will do the tokio-task
+    equivalent in M11/MS10.</li>
+    <li><strong>SQL front-end</strong> (query processor, first half). Lexing and parsing produce a
+    parse tree; in PostgreSQL the parser checks <em>syntax only</em>, and a separate analyzer pass
+    performs semantic analysis against the catalog to produce a typed query
+    tree.<sup class="cite"><a href="#ref-5">5</a></sup> A rewriter then applies stored rules — this is
+    the machinery views are implemented with.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li><strong>Catalog</strong> (shared components). The system's tables-about-tables: schemas,
+    column types, index definitions, statistics. The query processor consults it during
+    authorization, parsing, and optimization.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Planner / optimizer</strong> (query processor, second half). Turns the query tree
+    into the cheapest plan tree it can find; PostgreSQL's planner is purely cost-based rather than
+    rule-driven.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li><strong>Executor</strong>. A suite of operators — selection, projection, join, aggregation,
+    sorting — that implement relational algebra and call down into storage for
+    records.<sup class="cite"><a href="#ref-1">1</a></sup> PostgreSQL's executor processes tuples one
+    at a time, pulled upward through the plan tree.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li><strong>Access methods: heap and index</strong> (storage manager). The on-disk data
+    structures. A heap file is an unordered collection of pages holding tuples in no particular
+    order;<sup class="cite"><a href="#ref-8">8</a></sup> a B+Tree index maps key values to record
+    IDs — physical addresses of the form (page, slot).<sup class="cite"><a href="#ref-8">8</a></sup></li>
+    <li><strong>Buffer pool</strong> (storage manager). All persistent data is staged through it: a
+    big array of memory <em>frames</em>, each able to hold one disk
+    page.<sup class="cite"><a href="#ref-1">1</a></sup> The execution engine never reads a file
+    itself — it asks the buffer pool for a page and receives a pointer to that page in memory, with
+    the pool guaranteeing the page stays put while it is being
+    used.<sup class="cite"><a href="#ref-8">8</a></sup></li>
+    <li><strong>Disk manager</strong> (storage manager). Owns the files and the mapping from page
+    number to file offset; upper layers speak page IDs, and the storage manager translates them to
+    a file and offset.<sup class="cite"><a href="#ref-8">8</a></sup></li>
+    <li><strong>Transaction manager</strong> (storage manager). Enforces the ACID contract; before
+    touching shared data, queries coordinate through concurrency-control machinery — classically a
+    lock manager<sup class="cite"><a href="#ref-1">1</a></sup>, in PostgreSQL and FerricDB
+    primarily MVCC snapshots (M09).</li>
+    <li><strong>WAL / recovery</strong> (storage manager). The log manager makes committed work
+    durable and aborted work invisible; a transaction cannot be reported committed until its commit
+    log record has been flushed to the log device.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+  </ul>
+
+  <p>Two fntdb07 components have no box of their own. Admission control and dispatch (the process
+  manager) collapse into the wire-protocol server, which is a reasonable simplification for a
+  teaching system with tens of connections rather than tens of thousands.<sup class="cite"><a href="#ref-1">1</a></sup>
+  And of the shared utilities, FerricDB keeps only the catalog — no replication, no batch loaders.
+  The table maps boxes to the code you will write:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Component (Fig. 2)</th><th>Crate in <code>course/ferricdb/</code></th><th>Taught in</th><th>Built in</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Wire protocol server</td><td><code>crates/server</code></td><td>M11</td><td>MS10</td></tr>
+        <tr><td>SQL front-end</td><td><code>crates/sql</code></td><td>M05</td><td>MS3</td></tr>
+        <tr><td>Catalog</td><td><code>crates/catalog</code></td><td>M05</td><td>MS3 (stats: MS7)</td></tr>
+        <tr><td>Planner / optimizer</td><td><code>crates/exec</code></td><td>M06, M08</td><td>MS4, MS7</td></tr>
+        <tr><td>Executor</td><td><code>crates/exec</code></td><td>M06, M07</td><td>MS4, MS6</td></tr>
+        <tr><td>Heap storage + disk manager</td><td><code>crates/storage</code></td><td>M02</td><td>MS1</td></tr>
+        <tr><td>B+Tree index</td><td><code>crates/index</code></td><td>M04</td><td>MS5</td></tr>
+        <tr><td>Buffer pool</td><td><code>crates/buffer</code></td><td>M03</td><td>MS2</td></tr>
+        <tr><td>Transaction manager (MVCC)</td><td><code>crates/txn</code></td><td>M09</td><td>MS8</td></tr>
+        <tr><td>WAL / recovery</td><td><code>crates/wal</code></td><td>M10</td><td>MS9</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="sec-select">One SELECT, end to end</h2>
+
+  <p>The architecture diagram becomes much less abstract once you trace a single statement through
+  it. Hellerstein et al. structure their whole survey around exactly this exercise — the "life of a
+  query" at an airport gate, where one button click becomes a single-query
+  transaction<sup class="cite"><a href="#ref-1">1</a></sup> — and PostgreSQL's internals
+  documentation names the five subsystems every query passes through: parser, analyzer, rewriter,
+  planner, executor.<sup class="cite"><a href="#ref-5">5</a></sup> Here is the trip for a query
+  you will be able to run against your own code by Milestone 10:</p>
+
+  <pre><code>SELECT name, gpa FROM students WHERE gpa &gt; 3.5;</code></pre>
+
+  <ol>
+    <li><strong>Client.</strong> You type the statement into <code>psql</code>. The client encodes
+    it as a protocol message and sends it over the connection it established at startup; the DBMS
+    side of that conversation is responsible for connection state, receiving SQL, and later
+    returning both data and status messages.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Wire protocol server.</strong> The server decodes the message and routes the SQL
+    text to the worker owning this session. In PostgreSQL that worker is a dedicated backend process
+    serving all queries from this one client;<sup class="cite"><a href="#ref-4">4</a></sup> a
+    high-scale system would first pass through admission control to decide whether to run the query
+    now or defer it.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Parser.</strong> The text becomes a parse tree. Nothing is looked up yet: the
+    PostgreSQL parser validates only the syntax of the input query, so a misspelled table name
+    sails through this stage.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li><strong>Binder / analyzer + catalog.</strong> Semantic analysis resolves
+    <code>students</code>, <code>name</code>, and <code>gpa</code> against the catalog, checks
+    types, and produces a query tree.<sup class="cite"><a href="#ref-5">5</a></sup> This is where a
+    missing table finally raises an error. (PostgreSQL would additionally run the rewriter here to
+    expand views and rules.<sup class="cite"><a href="#ref-5">5</a></sup>)</li>
+    <li><strong>Planner / optimizer.</strong> The query tree becomes a plan tree — a dag of concrete
+    operators. The planner weighs alternatives by estimated cost;<sup class="cite"><a href="#ref-5">5</a></sup>
+    with no index on <code>gpa</code>, the only real option is a sequential scan with the filter
+    applied on top.</li>
+    <li><strong>Executor.</strong> The executor walks the plan tree, pulling tuples upward one at a
+    time<sup class="cite"><a href="#ref-5">5</a></sup> — the iterator ("Volcano") discipline you will
+    implement in MS4. Its operator suite is exactly the algebra toolbox: scans, selection,
+    projection, joins, aggregation, sorting.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Heap scan.</strong> At the base of the plan, a scan operator requests the table's
+    pages in order. The heap file is unordered, so the scan is a straightforward walk of page 0,
+    page 1, page 2, …<sup class="cite"><a href="#ref-8">8</a></sup></li>
+    <li><strong>Buffer pool.</strong> Each page request goes to the buffer pool, which either finds
+    the page already cached in a frame or evicts something to make room; either way the scan gets
+    back a pointer to the page in memory, valid until it releases
+    it.<sup class="cite"><a href="#ref-8">8</a></sup> All persistent data flows through this one
+    choke point.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Disk manager.</strong> On a miss, the page ID is translated to a file and byte
+    offset and one 8&nbsp;KB read fills the chosen frame.<sup class="cite"><a href="#ref-8">8</a></sup></li>
+    <li><strong>The unwind.</strong> Now the stack of calls pays off in reverse: the scan decodes
+    tuples from the page and hands matching ones up, operators transform them, and result rows are
+    buffered for the communications manager, which ships them back to the client — for large results
+    the client fetches incrementally, looping through executor and storage
+    again.<sup class="cite"><a href="#ref-1">1</a></sup> When the statement finishes, transaction
+    state and connection scratch space are cleaned up.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+  </ol>
+
+  <div class="widget" id="widget-select">
+    <p class="widget-title">Follow the SELECT through the engine</p>
+    <p class="widget-sub">Step through the ten stops of the query above. The highlighted box is where
+    the statement currently "is", and the amber pill shows what artifact it has become. (With
+    JavaScript off, the numbered list above tells the same story.)</p>
+    <div id="select-canvas"></div>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall</span>
+    <p>Learners often assume the parser rejects <code>SELECT * FROM no_such_table</code>. It does
+    not: syntax checking and name resolution are separate passes, and only the analyzer/binder
+    consults the catalog.<sup class="cite"><a href="#ref-5">5</a></sup> Keeping those passes separate
+    in MS3 will save you from tangling grammar code with catalog lookups.</p>
+  </div>
+
+  <div class="callout note">
+    <span class="callout-title">Worked example — how much does that scan actually read?</span>
+    <p>Give <code>students</code> 40,000 rows averaging 100 bytes each (tuple header included).
+    FerricDB's pages are 8,192 bytes — our course choice, matching PostgreSQL's usual 8&nbsp;kB block
+    size.<sup class="cite"><a href="#ref-9">9</a></sup> Following PostgreSQL's heap page layout, a
+    24-byte page header sits at the front, and each stored tuple also costs a 4-byte item identifier
+    in the page's line-pointer array.<sup class="cite"><a href="#ref-9">9</a></sup> So one page holds
+    ⌊(8192&nbsp;−&nbsp;24)&nbsp;/&nbsp;(100&nbsp;+&nbsp;4)⌋&nbsp;=&nbsp;78 rows, and the table needs
+    ⌈40,000&nbsp;/&nbsp;78⌉&nbsp;=&nbsp;513 pages ≈ 4.2&nbsp;MB. A cold sequential scan therefore
+    issues 513 page requests, every one a buffer-pool miss; with a 128-frame (1&nbsp;MiB) pool —
+    another course choice — the scan also forces at least 385 evictions along the way. Why we care so
+    much: the CMU storage notes put the latency gap in human terms — if an L1 cache reference took
+    one second, an SSD read would take about 4.4 hours and a spinning-disk read about 3.3
+    weeks.<sup class="cite"><a href="#ref-8">8</a></sup> Those 513 "weeks-long" trips are the cost
+    the buffer pool (M03) and indexes (M04) exist to avoid.</p>
+  </div>
+
+  <h2 id="sec-disk-memory">Disk-oriented vs in-memory architectures</h2>
+
+  <p>Everything above assumed a <em>disk-oriented</em> architecture: the primary home of the
+  database is non-volatile storage, and the DBMS's job is to shuttle pages between disk and memory
+  intelligently.<sup class="cite"><a href="#ref-8">8</a></sup> That assumption rests on the two ways
+  storage devices differ. Volatile memory (DRAM) loses its contents on power loss but supports fast,
+  byte-addressable random access — a program can jump to any address and read the value
+  there.<sup class="cite"><a href="#ref-8">8</a></sup> Non-volatile devices survive restarts but are
+  block-addressable: to read one value you must load the whole surrounding page into memory
+  first, and they historically favor sequential access over random
+  access.<sup class="cite"><a href="#ref-8">8</a></sup></p>
+
+  <p>A disk-oriented engine is built around the block interface. Data files are organized into
+  pages; the execution engine asks the buffer pool for a page and operates on it in memory through a
+  pointer the pool hands back.<sup class="cite"><a href="#ref-8">8</a></sup> The payoff is the design
+  goal stated outright in the CMU notes: the system can manage databases that <em>exceed</em> the
+  amount of memory available, as long as it manages the traffic carefully.<sup class="cite"><a href="#ref-8">8</a></sup>
+  The price is indirection on every access — page IDs instead of pointers, pins instead of plain
+  references.</p>
+
+  <p>An in-memory engine flips the assumption: the primary copy of records and indexes lives in
+  DRAM, so operators follow ordinary pointers with no page translation on the hot path. Because it
+  exploits byte-addressable random access,<sup class="cite"><a href="#ref-8">8</a></sup> the
+  buffer-pool machinery disappears — but two constraints replace it. Capacity is bounded by RAM,
+  and since DRAM is volatile,<sup class="cite"><a href="#ref-8">8</a></sup> durability still requires
+  writing a log and periodic checkpoints to non-volatile storage; the disk does not vanish, it just
+  stops being where queries read from.</p>
+
+  <figure>
+    <svg viewBox="0 0 940 400" role="img">
+      <title>Comparison of a disk-oriented database architecture, where queries reach disk through a buffer pool, and an in-memory architecture, where queries follow direct pointers in DRAM and disk holds only the log and checkpoints.</title>
+      <defs>
+        <marker id="dm-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.65"/>
+        </marker>
+        <marker id="dm-arrow-rev" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.65"/>
+        </marker>
+      </defs>
+      <path class="d-line" d="M 470 16 V 384" stroke-dasharray="6 5"/>
+
+      <text x="235" y="36" text-anchor="middle" class="d-text" font-weight="600">Disk-oriented engine</text>
+      <text x="235" y="54" text-anchor="middle" class="d-text-sm">FerricDB · PostgreSQL · SQLite</text>
+      <rect x="145" y="70" width="180" height="44" rx="8" class="d-box"/>
+      <text x="235" y="97" text-anchor="middle" class="d-text">Execution engine</text>
+      <path class="d-line" d="M 235 114 V 160" marker-end="url(#dm-arrow)" marker-start="url(#dm-arrow-rev)"/>
+      <text x="245" y="141" class="d-mono-sm">page id ⇄ frame ptr</text>
+      <rect x="125" y="160" width="220" height="44" rx="8" class="d-box-hl"/>
+      <text x="235" y="187" text-anchor="middle" class="d-text">Buffer pool (page cache)</text>
+      <path class="d-line" d="M 235 204 V 250" marker-end="url(#dm-arrow)" marker-start="url(#dm-arrow-rev)"/>
+      <text x="245" y="231" class="d-mono-sm">8 KB page I/O</text>
+      <rect x="115" y="250" width="240" height="52" rx="8" class="d-box-warn"/>
+      <text x="235" y="271" text-anchor="middle" class="d-text">Disk — primary copy</text>
+      <text x="235" y="288" text-anchor="middle" class="d-text-sm">heap files · indexes · WAL</text>
+      <text x="25" y="330" class="d-text-sm">• the primary copy of every page lives on disk</text>
+      <text x="25" y="350" class="d-text-sm">• database size may far exceed RAM</text>
+      <text x="25" y="370" class="d-text-sm">• every access pays the buffer-pool indirection</text>
+
+      <text x="705" y="36" text-anchor="middle" class="d-text" font-weight="600">In-memory engine</text>
+      <text x="705" y="54" text-anchor="middle" class="d-text-sm">primary copy in DRAM</text>
+      <rect x="615" y="70" width="180" height="44" rx="8" class="d-box"/>
+      <text x="705" y="97" text-anchor="middle" class="d-text">Execution engine</text>
+      <path class="d-line" d="M 705 114 V 160" marker-end="url(#dm-arrow)" marker-start="url(#dm-arrow-rev)"/>
+      <text x="715" y="141" class="d-mono-sm">direct pointers</text>
+      <rect x="585" y="160" width="240" height="44" rx="8" class="d-box-hl"/>
+      <text x="705" y="187" text-anchor="middle" class="d-text">Records + indexes in DRAM</text>
+      <path class="d-line" d="M 705 204 V 250" marker-end="url(#dm-arrow)" stroke-dasharray="5 4"/>
+      <text x="715" y="231" class="d-mono-sm">durability writes only</text>
+      <rect x="595" y="250" width="220" height="52" rx="8" class="d-box-warn"/>
+      <text x="705" y="271" text-anchor="middle" class="d-text">Disk — safety net</text>
+      <text x="705" y="288" text-anchor="middle" class="d-text-sm">log + checkpoints only</text>
+      <text x="495" y="330" class="d-text-sm">• the primary copy lives in byte-addressable DRAM</text>
+      <text x="495" y="350" class="d-text-sm">• capacity is bounded by memory</text>
+      <text x="495" y="370" class="d-text-sm">• DRAM is volatile — a log still protects commits</text>
+    </svg>
+    <figcaption>Figure 3 — disk-oriented vs in-memory architectures. Left: queries reach data through
+    the buffer pool's page indirection. Right: queries follow direct pointers in DRAM; disk remains
+    only for durability. Device properties (volatility, addressability) from the CMU storage
+    notes.<sup class="cite"><a href="#ref-8">8</a></sup></figcaption>
+  </figure>
+
+  <p>FerricDB is disk-oriented, for the same reasons the reference courses are: it is the
+  architecture of PostgreSQL and SQLite, and it forces you to build the two most instructive
+  subsystems — the buffer pool and disk-resident B+Trees — rather than letting DRAM make the hard
+  problems disappear. CMU's project sequence makes the same bet, spending its first big project on a
+  buffer pool manager.<sup class="cite"><a href="#ref-7">7</a></sup></p>
+
+  <div class="callout source">
+    <span class="callout-title">Why not just mmap?</span>
+    <p>A tempting shortcut is to <code>mmap</code> the database file and let the OS page data in and
+    out — virtual memory as a free buffer pool. The CMU notes advise against it for both correctness
+    and performance: a page fault blocks the faulting thread, the DBMS loses control over when dirty
+    pages reach disk (fatal for recovery ordering, as you will see in M10), and the OS simply knows
+    less about access patterns than the database does.<sup class="cite"><a href="#ref-8">8</a></sup>
+    FerricDB reads and writes its files explicitly through the disk manager.</p>
+  </div>
+
+  <h2 id="sec-pg-sqlite">Two role models: PostgreSQL and SQLite</h2>
+
+  <p>This course keeps two real systems on the desk at all times. <strong>PostgreSQL is the model
+  we imitate</strong>: FerricDB copies its semantics — the parse/analyze/rewrite/plan/execute
+  pipeline,<sup class="cite"><a href="#ref-5">5</a></sup> heap tables of 8&nbsp;kB slotted
+  pages,<sup class="cite"><a href="#ref-9">9</a></sup> MVCC transactions, a write-ahead log, and its
+  wire protocol — because those semantics are exhaustively documented (Suzuki's
+  <em>The Internals of PostgreSQL</em> devotes chapters to each subsystem, from process and memory
+  architecture through buffer manager, concurrency control, vacuum, and
+  WAL<sup class="cite"><a href="#ref-3">3</a></sup>), and because protocol compatibility gives the
+  project a spectacular finish line: real clients talking to your database.
+  <strong>SQLite is the contrast</strong> that proves these are choices, not laws of nature: the
+  world's most widely deployed SQL engine is not a server at all but a library compiled into the
+  application, storing the whole database in a single file.<sup class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-10">10</a></sup></p>
+
+  <div class="tabs">
+    <div class="tab-list" role="tablist">
+      <button role="tab" aria-selected="true" type="button">PostgreSQL (client–server)</button>
+      <button role="tab" aria-selected="false" type="button">SQLite (embedded)</button>
+    </div>
+    <div class="tab-panel">
+      <p><strong>Deployment.</strong> A standalone server: the postgres server process (historically
+      the <em>postmaster</em>) allocates a shared memory region, launches background processes, and
+      listens on TCP port 5432 by default.<sup class="cite"><a href="#ref-4">4</a></sup> Each client
+      connection gets its own backend process, which serves all queries for that one client and can
+      operate on only one database at a time; connections are capped by
+      <code>max_connections</code>, default 100.<sup class="cite"><a href="#ref-4">4</a></sup>
+      Because there is no built-in connection pooling, busy deployments put middleware such as
+      pgbouncer in front.<sup class="cite"><a href="#ref-4">4</a></sup> This is the classic
+      process-per-worker model, which the architecture survey notes is also used by DB2 and
+      Oracle.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+      <p><strong>Executing a query.</strong> Five stages transform the statement: parser (parse
+      tree, syntax only) → analyzer (query tree, names and types resolved) → rewriter (rule and view
+      expansion) → planner (cost-based choice of plan tree) → executor, which visits tables and
+      indexes in the order the plan dictates, pulling tuples one at a time and reading pages through
+      the buffer manager.<sup class="cite"><a href="#ref-5">5</a></sup> Housekeeping runs in
+      dedicated background processes: checkpointer, background writer, WAL writer, autovacuum
+      launcher.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+      <p><strong>What FerricDB copies:</strong> the pipeline shape, the storage stack, MVCC + WAL
+      semantics, and the wire protocol — swapping processes for async tasks in one process.</p>
+    </div>
+    <div class="tab-panel" hidden>
+      <p><strong>Deployment.</strong> A C library inside your application's process — serverless, no
+      sockets, no worker processes.<sup class="cite"><a href="#ref-10">10</a></sup> The entire
+      database (every table, every index) lives in one file,<sup class="cite"><a href="#ref-10">10</a></sup>
+      and the API is a pair of calls: <code>sqlite3_prepare_v2()</code> compiles SQL,
+      <code>sqlite3_step()</code> executes it.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+      <p><strong>Executing a query.</strong> The pipeline compiles rather than interprets: a
+      hand-coded tokenizer feeds a parser generated by SQLite's own Lemon parser generator (unusually,
+      the tokenizer calls the parser), a code generator turns the parse tree into a bytecode program,
+      and the Virtual Database Engine (VDBE) runs that bytecode; a prepared statement object is
+      literally a container for a single bytecode program.<sup class="cite"><a href="#ref-2">2</a></sup>
+      The query planner inside the code generator still chooses among algorithms, but the executor
+      artifact is instructions, not a tree of iterator nodes.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+      <p><strong>Storage.</strong> Below the VDBE, each table and each index is a separate B-tree in
+      the same file; a pager module provides caching, atomic commit and rollback, and locking over
+      fixed-size pages — 4,096 bytes by default, configurable from 512 to 65,536 — and an abstract
+      VFS layer isolates all OS-specific file I/O.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+      <p><strong>What FerricDB borrows:</strong> perspective. Same relational semantics, radically
+      different packaging — proof that "walk a plan tree" (M06) and "compile to bytecode" are both
+      legitimate executor designs, and that a storage engine is a stack of clean layers whichever way
+      you slice the top.</p>
+    </div>
+  </div>
+
+  <p>Note what the two systems <em>share</em>: both are disk-oriented row stores with pages, a page
+  cache, B-trees, and write-ahead logging.<sup class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-3">3</a></sup>
+  The storage stack you build in MS1–MS5 would be recognizable to an engineer from either project;
+  the fork in the road is everything above and around it.</p>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="The planner/optimizer compares candidate plans by estimated cost and picks the cheapest; PostgreSQL's planner is purely cost-based. The executor merely carries out whatever plan tree it is handed, and the parser has no idea whether an index even exists — it checks syntax only.">
+    <legend class="quiz-q">Your query could run as a sequential scan or as an index scan. Which component makes that decision?</legend>
+    <label><input type="radio" name="q1"> The executor, when it opens the plan</label>
+    <label><input type="radio" name="q1" data-correct> The planner/optimizer, by comparing estimated costs</label>
+    <label><input type="radio" name="q1"> The parser, while building the parse tree</label>
+    <label><input type="radio" name="q1"> The buffer pool, based on which pages are cached</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="PostgreSQL's documented order is parser (parse tree, syntax only) → analyzer (semantic analysis against the catalog, producing a query tree) → rewriter (rule/view expansion) → planner (cost-based plan tree) → executor. Analysis must follow parsing because it needs a tree to annotate, and planning must follow rewriting so views are already expanded into plain queries.">
+    <legend class="quiz-q">Which is the correct order of PostgreSQL's query-processing stages?</legend>
+    <label><input type="radio" name="q2"> parser → planner → analyzer → rewriter → executor</label>
+    <label><input type="radio" name="q2" data-correct> parser → analyzer → rewriter → planner → executor</label>
+    <label><input type="radio" name="q2"> analyzer → parser → rewriter → planner → executor</label>
+    <label><input type="radio" name="q2"> parser → rewriter → analyzer → executor → planner</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="SQLite compiles SQL: tokenizer → Lemon-generated parser → code generator → bytecode, and the VDBE virtual machine executes that bytecode. A prepared statement object is a container for a single bytecode program. Walking a tree of iterator operators is the PostgreSQL-style (and FerricDB) design — a deliberate contrast this course will keep pointing at.">
+    <legend class="quiz-q">In SQLite, what does <code>sqlite3_prepare_v2()</code> turn your SQL into?</legend>
+    <label><input type="radio" name="q3"> A plan tree of iterator operators that pull tuples from each other</label>
+    <label><input type="radio" name="q3" data-correct> A bytecode program that the VDBE virtual machine executes</label>
+    <label><input type="radio" name="q3"> Native machine code compiled at runtime</label>
+    <label><input type="radio" name="q3"> A new B-tree holding the query's result</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="The buffer pool exists so the DBMS controls page movement itself: it can support databases larger than memory, schedule evictions using knowledge of the workload, and — crucially for recovery — control exactly when dirty pages are written back. mmap surrenders that control to the OS, which the CMU notes flag as a correctness and performance problem, not just a style preference.">
+    <legend class="quiz-q">Why does a disk-oriented DBMS implement its own buffer pool instead of mmap-ing the data files and letting the OS handle paging?</legend>
+    <label><input type="radio" name="q4"> Because the OS page cache cannot hold files larger than a few gigabytes</label>
+    <label><input type="radio" name="q4"> Because mmap only works on files smaller than physical RAM</label>
+    <label><input type="radio" name="q4" data-correct> Because the DBMS needs control over what is evicted and when dirty pages are written, which the OS cannot provide</label>
+    <label><input type="radio" name="q4"> Because reading through mmap is always slower than read() system calls</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="PostgreSQL uses a process-per-connection model: the postgres server process accepts the connection and spawns a dedicated backend process that handles all queries from that client until it disconnects (bounded by max_connections, default 100). Threads-per-worker is a different documented model, used by systems like SQL Server and MySQL.">
+    <legend class="quiz-q">You open a second <code>psql</code> connection to a running PostgreSQL server. What serves its queries?</legend>
+    <label><input type="radio" name="q5"> A new thread inside the backend already serving your first connection</label>
+    <label><input type="radio" name="q5"> The same backend process, multiplexing both connections</label>
+    <label><input type="radio" name="q5" data-correct> A new dedicated backend process started by the server for this connection</label>
+    <label><input type="radio" name="q5"> A second server instance listening on the next port</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">J. M. Hellerstein, M. Stonebraker, J. Hamilton, “Architecture of a Database System”, <em>Foundations and Trends in Databases</em> 1(2), 2007 — §1 (main components, life of a query), §2 (process models, buffer pool and log staging). <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf" rel="external">https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf</a></li>
+        <li id="ref-2">“Architecture of SQLite”, SQLite project documentation. <a href="https://sqlite.org/arch.html" rel="external">https://sqlite.org/arch.html</a></li>
+        <li id="ref-3">H. Suzuki, <em>The Internals of PostgreSQL</em> — front page and chapter overview. <a href="https://www.interdb.jp/pg/" rel="external">https://www.interdb.jp/pg/</a></li>
+        <li id="ref-4">H. Suzuki, <em>The Internals of PostgreSQL</em>, Chapter 2 “Process and Memory Architecture”. <a href="https://www.interdb.jp/pg/pgsql02/01.html" rel="external">https://www.interdb.jp/pg/pgsql02/01.html</a></li>
+        <li id="ref-5">H. Suzuki, <em>The Internals of PostgreSQL</em>, Chapter 3 “Query Processing”. <a href="https://www.interdb.jp/pg/pgsql03/01.html" rel="external">https://www.interdb.jp/pg/pgsql03/01.html</a></li>
+        <li id="ref-6">CMU 15-445/645 Database Systems — course home (topics and course design). <a href="https://15445.courses.cs.cmu.edu/" rel="external">https://15445.courses.cs.cmu.edu/</a></li>
+        <li id="ref-7">CMU 15-445/645, Fall 2025 — programming projects (buffer pool → index → query execution → concurrency control, built in sequence). <a href="https://15445.courses.cs.cmu.edu/fall2025/assignments.html" rel="external">https://15445.courses.cs.cmu.edu/fall2025/assignments.html</a></li>
+        <li id="ref-8">A. Pavlo, CMU 15-445/645 Fall 2025, Lecture #03 notes “Database Storage (Part I)” — disk-oriented architecture, volatile vs non-volatile devices, latency analogy, mmap discussion, pages and heap files. <a href="https://15445.courses.cs.cmu.edu/fall2025/notes/03-storage1.pdf" rel="external">https://15445.courses.cs.cmu.edu/fall2025/notes/03-storage1.pdf</a></li>
+        <li id="ref-9">PostgreSQL documentation, “Database Page Layout” (8 kB default page, 24-byte header, 4-byte item identifiers). <a href="https://www.postgresql.org/docs/current/storage-page-layout.html" rel="external">https://www.postgresql.org/docs/current/storage-page-layout.html</a></li>
+        <li id="ref-10">“About SQLite”, SQLite project documentation — serverless in-process library, whole database in a single disk file, most widely deployed database. <a href="https://sqlite.org/about.html" rel="external">https://sqlite.org/about.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li><strong>Rust refresher</strong> — the four chapters of <em>The Rust Programming Language</em> this
+      project leans on hardest:
+      <a href="https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html">ownership</a> (buffer
+      pool frames and pins are ownership puzzles),
+      <a href="https://doc.rust-lang.org/book/ch10-02-traits.html">traits</a> (the executor is a tree of
+      trait objects),
+      <a href="https://doc.rust-lang.org/book/ch09-00-error-handling.html">error handling</a>
+      (<code>Result</code> everywhere — a database must never panic on bad input), and
+      <a href="https://doc.rust-lang.org/book/ch16-00-concurrency.html">concurrency</a> (shared buffer
+      pool, latches, and the MS10 server).</li>
+      <li>Hellerstein et al., sections 3–7 — parallelism, storage, transactions, and shared utilities
+      beyond this page's overview; the whole survey rewards a full read as you progress.
+      <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf">fntdb07-architecture.pdf</a></li>
+      <li>Suzuki's chapter list is a preview of this course: buffer manager (ch. 8) pairs with M03,
+      concurrency control (ch. 5) with M09, WAL (ch. 9) with M10.
+      <a href="https://www.interdb.jp/pg/">interdb.jp/pg</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>What to build now: <a href="../../project/milestone-00/index.html">Milestone 0 — Skeleton, REPL,
+    Test Harness</a>. Set up the Cargo workspace, the <code>rustyline</code> REPL, and the test harness
+    before diving into theory — every later milestone assumes this scaffolding exists.</p>
+
+    <nav class="prevnext">
+      <a href="../../index.html"><span class="dir">← Previous</span> Course home</a>
+      <a class="next" href="../../project/milestone-00/index.html"><span class="dir">Next →</span> Milestone 0 · Skeleton, REPL, Test Harness</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  (function () {
+    if (!window.Course) return;
+    var S = Course.svgEl;
+
+    /* ---- Figure 2: clickable full-system architecture map ---- */
+    var arch = document.getElementById("arch-map");
+    if (arch && Course.renderArchitecture) {
+      Course.renderArchitecture(arch, { links: true, root: "../.." });
+    }
+
+    /* ---- Widget: one SELECT travelling through the engine ---- */
+    var canvas = document.getElementById("select-canvas");
+    if (!canvas || !Course.stepper) return;
+
+    var STAGES = [
+      { label: "Client (psql)",          art: "SQL text" },
+      { label: "Wire protocol server",   art: "SQL text" },
+      { label: "Parser",                 art: "parse tree" },
+      { label: "Binder + catalog",       art: "query tree" },
+      { label: "Planner / optimizer",    art: "plan tree" },
+      { label: "Executor",               art: "next() calls" },
+      { label: "Heap scan operator",     art: "page requests" },
+      { label: "Buffer pool",            art: "frame pointer" },
+      { label: "Disk manager",           art: "8 KB page bytes" }
+    ];
+    var CAPTIONS = [
+      "You type SELECT name, gpa FROM students WHERE gpa > 3.5; in psql. The client encodes it as a protocol message and sends it over the connection.",
+      "The wire protocol server decodes the message and hands the raw SQL string to the worker that owns this session (in PostgreSQL: a dedicated backend process).",
+      "The parser checks syntax only and builds a parse tree. It has no idea yet whether a table named students exists.",
+      "The binder (PostgreSQL: analyzer) resolves students, name, and gpa against the catalog and type-checks the expression, producing a query tree. Missing tables error out here.",
+      "The planner compares candidate plans by estimated cost and emits a plan tree. With no index on gpa, that is a sequential scan feeding a filter.",
+      "The executor opens the plan tree and starts pulling: each next() call asks the operator below for one tuple — the Volcano iterator discipline you build in MS4.",
+      "The heap scan walks the table's pages in order, asking the buffer pool for page 0, 1, 2, ... 512 — never touching files directly.",
+      "The buffer pool checks its page table. Hit: hand back a pointer to the frame. Miss: choose a victim frame, evict it, and ask the disk manager to fill it.",
+      "The disk manager translates the page ID to a file offset (page 17 → byte 139,264) and reads the 8 KB page into the waiting frame.",
+      "The unwind: tuples decode out of pages, flow up through filter and projection, and the protocol layer streams each result row back to psql as it emerges."
+    ];
+
+    var holder = Course.el("div");
+    canvas.appendChild(holder);
+
+    function draw(step) {
+      holder.textContent = "";
+      var svg = S("svg", { viewBox: "0 0 620 516", role: "img" });
+      svg.appendChild(S("title", null,
+        "The path of one SELECT statement through the engine, highlighted stage by stage."));
+      var defs = S("defs");
+      var marker = S("marker", {
+        id: "sel-arrow", viewBox: "0 0 10 10", refX: 9, refY: 5,
+        markerWidth: 7, markerHeight: 7, orient: "auto"
+      });
+      var mp = S("path", { d: "M 0 0 L 10 5 L 0 10 z" });
+      mp.setAttribute("fill", "currentColor");
+      mp.setAttribute("opacity", "0.65");
+      marker.appendChild(mp);
+      defs.appendChild(marker);
+      svg.appendChild(defs);
+
+      var unwind = step === 9;
+      var i, y;
+
+      /* downward arrows between consecutive stages */
+      for (i = 0; i < 8; i++) {
+        var p = S("path", {
+          d: "M 175 " + (16 + i * 54 + 40) + " V " + (16 + (i + 1) * 54),
+          "class": (!unwind && step > 0 && i === step - 1) ? "d-line-hl" : "d-line"
+        });
+        p.setAttribute("marker-end", "url(#sel-arrow)");
+        svg.appendChild(p);
+      }
+
+      /* return path: results flowing back up to the client */
+      var ret = S("path", {
+        d: "M 290 468 H 330 V 36 H 302",
+        "class": unwind ? "d-line-hl" : "d-line"
+      });
+      if (!unwind) ret.setAttribute("stroke-dasharray", "5 4");
+      ret.setAttribute("marker-end", "url(#sel-arrow)");
+      svg.appendChild(ret);
+
+      /* stage boxes */
+      var activeIdx = unwind ? 0 : step;
+      for (i = 0; i < STAGES.length; i++) {
+        y = 16 + i * 54;
+        var cls = "d-box";
+        if (i === activeIdx) cls = "d-box-hl";
+        else if (unwind || i < step) cls = "d-box-good";
+        svg.appendChild(S("rect", { x: 60, y: y, width: 230, height: 40, rx: 8, "class": cls }));
+        svg.appendChild(S("text", {
+          x: 175, y: y + 25, "class": "d-text", "text-anchor": "middle"
+        }, STAGES[i].label));
+      }
+
+      /* artifact pill beside the active stage */
+      var py = 16 + activeIdx * 54 + 6;
+      svg.appendChild(S("rect", { x: 350, y: py, width: 244, height: 28, rx: 14, "class": "d-box-warn" }));
+      svg.appendChild(S("text", {
+        x: 472, y: py + 18, "class": "d-mono-sm", "text-anchor": "middle"
+      }, "carries: " + (unwind ? "DataRow messages" : STAGES[step].art)));
+
+      svg.appendChild(S("text", { x: 60, y: 508, "class": "d-text-sm" },
+        "dashed line: the route results take back to the client"));
+
+      holder.appendChild(svg);
+    }
+
+    Course.stepper(canvas, { total: 10, captions: CAPTIONS, render: draw });
+  })();
+});
+</script>
+</body>
+</html>

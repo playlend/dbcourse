@@ -9,6 +9,77 @@ carry an inline citation that links to one of those sources.
 
 ---
 
+## 0. Build Progress (updated as sections complete)
+
+- [x] **Section A — Scaffolding** (done 2026-07-05): `course/assets/`
+      (style.css design system with dark/light + print, site.js runtime:
+      theme/quizzes/tabs/stepper, arch.js parametric architecture diagram
+      shared by M00 + all milestone pages), `course/index.html` (syllabus,
+      interactive recommended-path map, module/project card maps),
+      `authoring/CONVENTIONS.md` (page contract + citation allowlist),
+      `authoring/templates/` (module + milestone page templates),
+      `authoring/api-spec.md` (FerricDB public API — single source of truth
+      for milestone pages and the Rust workspace; adds a `crates/common`
+      foundation crate to the Section 5 layout).
+- [x] **Section B — Concept modules M00–M12** (13/13 done 2026-07-05).
+      m00/m01/m02/m06/m07 by workflow agents (content unreviewed by a second
+      pass); m03/m04/m05/m08/m09/m10/m11/m12 inline, grounded in fetched
+      sources, with all interactive-widget algorithms behavior-tested in
+      node (B+Tree invariants, MVCC 10-rule visibility, ARIES 3-pass sim,
+      Selinger DP, Pratt parser, eviction policies). All 30 course pages
+      pass `authoring/qa_check.py` CLEAN (links, citations, structure,
+      offline rule).
+- [x] **Section C — Project track pages** (16/16 done 2026-07-05).
+      milestone-01/-05/-06/-09, stretch-s1 by workflow agents; the rest
+      inline against `authoring/api-spec.md`.
+- [x] **Section D — FerricDB Rust starter workspace** (done 2026-07-06).
+      All 11 crates real: `common` fully implemented (12/12 unit tests
+      green); storage/buffer/index/sql/catalog/exec/txn/wal/server all
+      stubbed to `authoring/api-spec.md` with rustdoc'd public APIs and
+      `todo!("Milestone N")` bodies; ferricdb bin (REPL stub, hand-rolled
+      flag parsing, lib+bin split); sqllogictest harness + 2 hand-verified
+      .slt files (ms4 CRUD, ms6 joins/agg); criterion bench skeleton; CI
+      (fmt/clippy/check/test), README, CONTRIBUTING. Status:
+      `cargo check --all-targets` green, `cargo clippy --all-targets`
+      ZERO warnings, `cargo test` 13 passed / 92 ignored milestone tests
+      (all compiling), `cargo fmt` clean. Required api-spec test names all
+      present (ms1_slotted_page_roundtrip, ms2_clock_evicts_unpinned,
+      ms5_btree_invariants_fuzz, ms8_write_skew_is_documented,
+      ms9_crash_injection_no_lost_commits). NOTE: api-spec `PageStore`
+      closures were changed to unit-returning (object safety); api-spec.md
+      + milestone-01 page updated to match.
+- [x] **Section E — QA pass** (done 2026-07-06). Mechanical:
+      `authoring/qa_check.py` CLEAN over all 30 pages (structure,
+      citations, offline rule, internal links, quizzes); `--net` all 130
+      external URLs live; prev/next chain matches the recommended path
+      exactly; widget JS syntax- and behavior-tested in node (B+Tree
+      invariants, MVCC 10-rule visibility, ARIES 3-pass sim, Selinger DP,
+      Pratt parser, eviction policies). Content: the 10 workflow-authored
+      pages (m00, m01, m02, m06, m07, milestone-01/-05/-06/-09,
+      stretch-s1) each got a dedicated verify agent (wf_63dfa478-91b) —
+      all 10 PASS, 20 fixes applied (citation re-anchoring, an anchor
+      fragment, one garbled sentence, api-spec alignment), ~40 factual
+      claims spot-checked against fetched primary sources, zero remaining
+      issues.
+
+**BUILD COMPLETE (2026-07-06).** All five sections done. Not yet committed
+to git (commit when asked). Known deliberate deviations from this plan:
+`crates/common` added to the §5 workspace layout (documented in
+api-spec.md and the project overview page); `PageStore` closures are
+unit-returning for object safety (api-spec + MS1 page match the code);
+CMU 15-445 links use fall2025 URLs (current-semester redirect noted in
+§7.6 still applies to the bare course-home link).
+
+**Publishing prep (2026-07-06):** the API spec moved into the workspace
+(`course/ferricdb/docs/api-spec.md`; `authoring/api-spec.md` is now a
+pointer) so the starter repo is self-contained. Publishing model: this
+monorepo stays the source of truth; the learner-facing starter repo is
+produced with `git subtree split --prefix=course/ferricdb` (publish as a
+GitHub *template* repo; solutions branch lives only there or private).
+The course site deploys to GitHub Pages via `.github/workflows/pages.yml`
+(uploads `course/` minus `ferricdb/`; repo setting: Pages → Source =
+GitHub Actions).
+
 ## 1. Goals and Design Principles
 
 1. Teach database internals the way top university courses do (CMU 15-445,

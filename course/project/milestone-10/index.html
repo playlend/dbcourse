@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Milestone 10 · PostgreSQL Wire Protocol Server — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+<script defer src="../../assets/arch.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../index.html">Project</a><span class="sep">/</span>
+    <span>Milestone 10</span>
+  </nav>
+  <span class="badge milestone">Milestone 10</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>Milestone 10 · PostgreSQL Wire Protocol Server</h1>
+  <p class="subtitle">The finale: a tokio TCP server speaking the PG protocol. When this
+  milestone is done, psql connects to your database and doesn't know the difference.</p>
+
+  <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
+  all specification content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-objectives">Learning objectives</a></li>
+      <li><a href="#sec-reading">Required reading</a></li>
+      <li><a href="#sec-arch">Where this fits</a></li>
+      <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-guidance">Step-by-step guidance</a></li>
+      <li><a href="#sec-tests">Test plan</a></li>
+      <li><a href="#sec-pitfalls">Common pitfalls</a></li>
+      <li><a href="#sec-done">Definition of done</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+      <li><a href="#sec-deeper">Go deeper</a></li>
+    </ol>
+  </div>
+
+  <p>Ten milestones of internals, and not one of them is visible from the outside. This one is
+  nothing <em>but</em> outside: a byte-exact implementation of somebody else's contract, judged
+  by the least forgiving integration test imaginable — real clients you didn't write. Two paths
+  are offered. Hand-rolling the message codec from the spec is the recommended one: it is a
+  weekend of exacting, satisfying work. The pgwire crate is the honorable escape hatch — it
+  implements the startup, simple-query, and extended-query sub-protocols and ships a complete
+  SQLite-backed example server.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <h2 id="sec-objectives">Learning objectives</h2>
+  <ul>
+    <li><strong>Implement</strong> the protocol codec: framing, StartupMessage's special case,
+      the frontend and backend message set.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>Implement</strong> the session state machine: startup → auth → query cycles →
+      termination, with correct ReadyForQuery discipline.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Build</strong> a tokio accept loop giving each connection its own session and
+      its own transaction state.</li>
+    <li><strong>Map</strong> FerricDB results and errors onto RowDescription/DataRow,
+      CommandComplete tags, and SQLSTATE codes.</li>
+    <li><strong>Prove it</strong> with psql and the full sqllogictest suite over the wire.</li>
+  </ul>
+
+  <h2 id="sec-reading">Required reading</h2>
+  <ul>
+    <li><a href="../../modules/m11-wire-protocol-server/index.html">M11 · The Postgres Wire
+      Protocol</a> — the concept module; its byte explorer and sequence diagrams are your codec's
+      reference behavior.</li>
+    <li>PostgreSQL "Message Formats" — keep it open in a tab the entire milestone; your codec
+      matches it byte for byte.
+      <a href="https://www.postgresql.org/docs/current/protocol-message-formats.html" rel="external">postgresql.org/docs/current/protocol-message-formats.html</a></li>
+    <li>PostgreSQL "Message Flow" — the state machine.
+      <a href="https://www.postgresql.org/docs/current/protocol-flow.html" rel="external">postgresql.org/docs/current/protocol-flow.html</a></li>
+  </ul>
+
+  <h2 id="sec-arch">Where this fits</h2>
+  <figure>
+    <div id="arch-diagram"></div>
+    <figcaption>Figure 1 — the last two boxes light up: the protocol server, and the client
+    that is finally not your REPL.</figcaption>
+  </figure>
+
+  <h2 id="sec-spec">Specification</h2>
+  <p>You implement <code>crates/server</code> and the <code>--serve</code> flag:</p>
+
+  <pre><code>pub mod protocol {
+    pub enum FrontendMessage { StartupMessage { params: Vec&lt;(String, String)&gt; },
+        Query { sql: String }, Parse {..}, Bind {..}, Execute {..},
+        Describe {..}, Sync, Terminate, PasswordMessage { password: String } }
+    pub enum BackendMessage { AuthenticationOk, AuthenticationCleartextPassword,
+        ParameterStatus { name: String, value: String }, BackendKeyData {..},
+        ReadyForQuery { txn_status: u8 }, RowDescription { fields: Vec&lt;FieldDescription&gt; },
+        DataRow { values: Vec&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt; }, CommandComplete { tag: String },
+        ErrorResponse { severity: String, code: String, message: String },
+        EmptyQueryResponse, ParseComplete, BindComplete }
+    pub struct FieldDescription { pub name: String, pub type_oid: u32,
+                                  pub type_len: i16 }
+    pub fn read_message(...) -&gt; Result&lt;FrontendMessage&gt;;
+    pub fn write_message(...) -&gt; Result&lt;()&gt;;
+}
+
+pub struct ServerConfig { pub addr: String /* default 127.0.0.1:5433 */,
+                          pub password: Option&lt;String&gt; }
+pub struct Server { /* ExecContext factory */ }
+impl Server {
+    pub fn new(config: ServerConfig, ctx: std::sync::Arc&lt;ExecContext&gt;) -&gt; Self;
+    pub async fn run(self) -&gt; Result&lt;()&gt;;   // tokio TCP accept loop
+}</code></pre>
+
+  <p>Behavioral contract:</p>
+  <ul>
+    <li><strong>Framing:</strong> type byte + self-inclusive Int32 length, big-endian, except
+      StartupMessage (length-only). Reject SSL requests politely (respond <code>'N'</code>) and
+      ignore CancelRequest connections gracefully.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>Startup:</strong> trust auth by default (AuthenticationOk immediately);
+      cleartext password when configured. Then at least two ParameterStatus messages
+      (<code>server_version</code> — report a Postgres-compatible string —,
+      <code>client_encoding</code> UTF8), BackendKeyData (any values), ReadyForQuery('I').<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Simple query:</strong> route the SQL through <code>execute()</code>; SELECTs
+      produce RowDescription (type OIDs: bool 16, int8 20, float8 701, text 25; values in text
+      format) then DataRows (NULL as length −1) then CommandComplete (<code>SELECT n</code>,
+      <code>INSERT 0 n</code>, <code>UPDATE n</code>, <code>DELETE n</code>); every cycle ends
+      with ReadyForQuery carrying the true transaction status
+      (I/T/E).<sup class="cite"><a href="#ref-3">3</a></sup> Empty query string →
+      EmptyQueryResponse. Errors → ErrorResponse with mapped SQLSTATE
+      (Serialization → 40001, parse → 42601, everything else → XX000-style fallback), then
+      ReadyForQuery — always.</li>
+    <li><strong>Sessions:</strong> one tokio task per connection, each with its own transaction
+      slot; BEGIN/COMMIT work per session exactly as in the REPL; a dropped connection with an
+      open transaction rolls it back.</li>
+    <li><strong>Extended protocol (optional):</strong> Parse/Bind/Execute/Describe/Sync for the
+      unnamed statement and portal is enough to satisfy most drivers' simple use.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+  </ul>
+
+  <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <ol>
+    <li><strong>Codec first, offline.</strong> Implement <code>read_message</code>/<code>write_message</code>
+      over byte buffers (the <code>bytes</code> crate earns its keep here) and drive them with
+      the ms10_ round-trip tests. Get the length arithmetic perfect now: the tests assert exact
+      byte sequences for Query("SELECT 1") among others, straight from the module's byte
+      explorer.</li>
+    <li><strong>The session state machine as plain code.</strong> A per-connection async
+      function: read startup, answer the auth dance, then loop { read message, dispatch }.
+      Keep it a function of (socket, ExecContext) with no shared mutable state beyond what
+      Milestone 8 already synchronizes.</li>
+    <li><strong>Wire execute().</strong> The result-mapping layer is mechanical: Schema →
+      RowDescription (name + OID per column), rows → text-encoded DataRows, affected counts →
+      tags. Reuse the REPL's value-formatting code — pull it into a shared helper rather than
+      duplicating it.</li>
+    <li><strong>First contact.</strong> <code>cargo run -- --serve</code> then
+      <code>psql -h 127.0.0.1 -p 5433 -U ferric</code>. Expect failure; enjoy it. psql's
+      <code>PGDEBUG</code>-style tracing and a packet capture (<code>tcpdump -X port 5433</code>)
+      are your microscopes. The classic first crash: psql immediately sends a parameterized
+      startup you didn't expect, or an SSLRequest you forgot to decline.</li>
+    <li><strong>Transaction status discipline.</strong> Thread the session's real state into
+      every ReadyForQuery. psql renders it in the prompt (<code>=&gt;</code>,
+      <code>*=&gt;</code>, <code>!=&gt;</code>) — free UI for your MVCC layer.</li>
+    <li><strong>The suite over the wire.</strong> Run the sqllogictest files through a real
+      session: simplest is a small runner mode that pipes each statement through psql
+      (<code>psql -At -c</code>) and compares; if you implemented the extended protocol, run the
+      harness through a Rust Postgres driver instead. Same files, fourth transport — the point
+      of the course's testing pyramid.</li>
+    <li><strong>Concurrency check.</strong> Two psql sessions: BEGIN in both, update the same
+      row, watch first-committer-wins deliver a real 40001 over the wire to the loser. Your
+      whole stack, end to end, standing on every milestone at once.</li>
+  </ol>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <pre><code>cargo test -p ferricdb-server -- --include-ignored ms10_   # codec round-trips
+cargo run -- --db /tmp/wire.db --serve &amp;
+psql -h 127.0.0.1 -p 5433 -U ferric -c "SELECT 1;"          # the handshake proof
+# then the full slt suite through a live session (see guidance step 6)</code></pre>
+  <p>The ms10_ group is pure codec: encode/decode round-trips for every message, exact-byte
+  assertions (length includes itself, excludes type byte; StartupMessage typeless; DataRow NULL
+  as −1), and malformed-length rejection. Everything beyond the codec is validated live — this
+  milestone's definition of done is unusually external.</p>
+
+  <h2 id="sec-pitfalls">Common pitfalls</h2>
+  <div class="callout pitfall">
+    <span class="callout-title">Length-field off-by-one</span>
+    <p><em>Symptom:</em> psql connects then hangs or reports garbled messages. <em>Cause:</em>
+    counting the type byte in the length, or not counting the length field itself. One wrong
+    constant desynchronizes every subsequent message on the stream. The exact-byte tests exist
+    to catch this before psql does.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Missing ReadyForQuery after an error</span>
+    <p><em>Symptom:</em> the first bad statement freezes the session. <em>Cause:</em> the error
+    path returns early. ErrorResponse tells the client what went wrong; ReadyForQuery tells it
+    that it may speak again. Both, every time.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Forgetting the SSLRequest and empty query</span>
+    <p><em>Symptom:</em> psql fails before authentication, or a bare semicolon kills the
+    session. Modern psql opens with an SSLRequest (answer <code>'N'</code> and it retries
+    plaintext) and really does send empty query strings (answer EmptyQueryResponse).<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  </div>
+  <div class="callout pitfall">
+    <span class="callout-title">Sharing one transaction across sessions</span>
+    <p><em>Symptom:</em> one client's BEGIN puts every client in a transaction. <em>Cause:</em>
+    the transaction slot living in the shared ExecContext instead of per-session state. The
+    two-psql concurrency check in the guidance catches it immediately.</p>
+  </div>
+
+  <h2 id="sec-done">Definition of done</h2>
+  <ul>
+    <li><code>ms10_</code> codec tests pass.</li>
+    <li><code>psql -h localhost -p 5433</code> connects, runs CREATE/INSERT/SELECT/UPDATE/DELETE
+      with correct output and tags, survives SQL errors, and shows transaction state in its
+      prompt.</li>
+    <li>The full sqllogictest suite passes through a real psql session.</li>
+    <li>Two concurrent psql sessions demonstrate snapshot isolation and a wire-delivered 40001
+      on write conflict.</li>
+    <li>Kill the server mid-transaction, restart with recovery (Milestone 9), reconnect:
+      committed data present, uncommitted gone — the whole course in one demo.</li>
+  </ul>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+  <fieldset class="quiz" data-explain="The StartupMessage is the one typeless message — Int32 length then Int32 version then parameters. There is nothing to disambiguate at stream start, and special version values (SSLRequest, CancelRequest) do the job a type byte would.">
+    <legend class="quiz-q">What is structurally unique about StartupMessage?</legend>
+    <label><input type="radio" name="q1"> It is the only message with a checksum</label>
+    <label><input type="radio" name="q1" data-correct> It has no type byte — just length, version, and parameters</label>
+    <label><input type="radio" name="q1"> It is sent by the server, not the client</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+  <fieldset class="quiz" data-explain="Mapping Error::Serialization to SQLSTATE 40001 means every Postgres client library's existing retry logic works against FerricDB unchanged — the entire point of speaking a shared protocol. Invent your own code and every client needs custom handling.">
+    <legend class="quiz-q">Why must a FerricDB write-conflict abort surface as SQLSTATE 40001 specifically?</legend>
+    <label><input type="radio" name="q2"> The protocol rejects unknown SQLSTATE values</label>
+    <label><input type="radio" name="q2" data-correct> Existing Postgres clients already retry on 40001 — compatibility is the product</label>
+    <label><input type="radio" name="q2"> psql crashes on other codes</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">PostgreSQL Documentation, "Frontend/Backend Protocol — Message Flow" —
+          startup/auth, simple and extended query cycles, error handling and ReadyForQuery
+          discipline.
+          <a href="https://www.postgresql.org/docs/current/protocol-flow.html" rel="external">https://www.postgresql.org/docs/current/protocol-flow.html</a></li>
+        <li id="ref-2">sunng87/pgwire — the escape-hatch crate: startup, simple query, and
+          extended query sub-protocols, with a SQLite-backed example server.
+          <a href="https://github.com/sunng87/pgwire" rel="external">https://github.com/sunng87/pgwire</a>
+          (docs: <a href="https://docs.rs/pgwire/latest/pgwire/" rel="external">docs.rs/pgwire</a>)</li>
+        <li id="ref-3">PostgreSQL Documentation, "Message Formats" — byte-exact layouts for the
+          codec: framing lengths, StartupMessage, RowDescription/DataRow, CommandComplete tags,
+          ErrorResponse fields, ReadyForQuery status byte.
+          <a href="https://www.postgresql.org/docs/current/protocol-message-formats.html" rel="external">https://www.postgresql.org/docs/current/protocol-message-formats.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>Protocol docs, "SASL Authentication" — what implementing SCRAM (the modern default)
+        would take beyond this milestone's trust/cleartext.
+        <a href="https://www.postgresql.org/docs/current/sasl-authentication.html" rel="external">postgresql.org/docs/current/sasl-authentication.html</a></li>
+      <li>pgwire examples — compare your hand-rolled server with the library-based one for the
+        same feature set. <a href="https://github.com/sunng87/pgwire" rel="external">github.com/sunng87/pgwire</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>Next on the path: <a href="../../modules/m12-advanced-topics/index.html">M12 · Advanced
+    Topics</a> — where to take FerricDB (and yourself) from here.</p>
+
+    <nav class="prevnext">
+      <a href="../../modules/m11-wire-protocol-server/index.html"><span class="dir">← Previous</span> M11 · The Postgres Wire Protocol</a>
+      <a class="next" href="../../modules/m12-advanced-topics/index.html"><span class="dir">Next →</span> M12 · Advanced Topics</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  Course.renderArchitecture(document.getElementById("arch-diagram"), {
+    done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor", "index", "txn", "wal"],
+    current: ["protocol", "client"],
+    root: "../.."
+  });
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,18 @@
+[package]
+name = "ferricdb-exec"
+description = "FerricDB query engine: binder, planner, optimizer, and Volcano executors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ferricdb-common = { workspace = true }
+ferricdb-storage = { workspace = true }
+ferricdb-buffer = { workspace = true }
+ferricdb-index = { workspace = true }
+ferricdb-sql = { workspace = true }
+ferricdb-catalog = { workspace = true }
+ferricdb-txn = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

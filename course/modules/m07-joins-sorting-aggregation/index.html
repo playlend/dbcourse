@@ -1,0 +1,1088 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M07 · Joins, Sorting, Aggregation — FerricDB Course</title>
+<link rel="stylesheet" href="../../assets/style.css">
+<script>
+/* set theme before first paint to avoid flashing */
+(function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
+</script>
+<script defer src="../../assets/site.js"></script>
+</head>
+<body>
+
+<header class="site-header">
+  <nav class="crumbs">
+    <a href="../../index.html">FerricDB Course</a><span class="sep">/</span>
+    <a href="../../index.html#modules">Modules</a><span class="sep">/</span>
+    <span>M07 Joins, Sorting, Aggregation</span>
+  </nav>
+  <span class="badge">Module 07</span>
+  <button id="theme-toggle" type="button" aria-label="Toggle color theme">☾ Dark</button>
+</header>
+
+<main>
+  <h1>M07 · Joins, Sorting, Aggregation</h1>
+  <p class="subtitle">The executor's heavy machinery: three ways to join tables, one way to sort data
+  that does not fit in memory, and two ways to compute <code>GROUP BY</code> — plus the trade-offs a
+  planner weighs when it picks among them.</p>
+
+  <noscript><p class="noscript-warn">Interactive demos and self-check quizzes on this page need JavaScript;
+  all explanatory content is readable without it.</p></noscript>
+
+  <div class="toc">
+    <strong>On this page</strong>
+    <ol>
+      <li><a href="#sec-toolbox">The executor's toolbox</a></li>
+      <li><a href="#sec-nlj">Nested loop joins</a></li>
+      <li><a href="#sec-merge">Merge join</a></li>
+      <li><a href="#sec-hash">Hash join</a></li>
+      <li><a href="#sec-race">The three joins, side by side</a></li>
+      <li><a href="#sec-sort">External merge sort</a></li>
+      <li><a href="#sec-agg">Aggregation: sort it or hash it</a></li>
+      <li><a href="#sec-planner">When the planner picks each algorithm</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
+      <li><a href="#sec-sources">Primary sources</a></li>
+    </ol>
+  </div>
+
+  <h2 id="sec-toolbox">The executor's toolbox</h2>
+
+  <p>In <a href="../m06-query-execution/index.html">M06</a> you built the skeleton of a query executor:
+  a tree of operators, each implementing the same iterator interface, pulling tuples from its children
+  one <code>next()</code> call at a time. That design — <em>init, get_next, close</em> — is the
+  iterator (Volcano) model that nearly all relational executors use, and the standard set of operator
+  subclasses in such a system includes file scan, index scan, sort, nested-loop join, merge join, hash
+  join, duplicate elimination, and grouped aggregation; because every operator speaks the same
+  interface, any of them can feed any other.<sup class="cite"><a href="#ref-1">1</a></sup>
+  So far your operators have been the easy ones: scans, filters, projections. This module is about the
+  hard ones — the operators that combine <em>two</em> inputs or need to see <em>all</em> of one input
+  before emitting anything.</p>
+
+  <p>Two habits from earlier modules carry over. First, we measure cost in <strong>page I/Os</strong>,
+  because reading and writing disk pages dominates everything else when data outgrows memory.<sup
+  class="cite"><a href="#ref-6">6</a></sup> Second, we use the CS186 notation: for a relation
+  <em>R</em>, <code>[R]</code> is its size in pages and <code>|R|</code> its size in tuples, and
+  <code>B</code> is the number of buffer pages the operator is allowed to use.<sup class="cite"><a
+  href="#ref-2">2</a></sup> The buffer pool from <a href="../m03-buffer-pool/index.html">M03</a> is
+  where those <code>B</code> pages live; in FerricDB the per-query budget is a field on
+  <code>ExecContext</code> in <code>course/ferricdb/crates/exec</code> — a course choice that mirrors
+  PostgreSQL's <code>work_mem</code> setting, the memory allowance PostgreSQL gives its sort and hash
+  operators before they spill to temporary files.<sup class="cite"><a href="#ref-3">3</a>,<a
+  href="#ref-5">5</a></sup></p>
+
+  <p>Our running example for cost arithmetic, used throughout this page:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Relation</th><th>Pages</th><th>Tuples</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>R</code> (e.g. <code>orders</code>)</td><td><code>[R]</code> = 1,000</td><td><code>|R|</code> = 100,000</td><td>100 tuples/page</td></tr>
+        <tr><td><code>S</code> (e.g. <code>customers</code>)</td><td><code>[S]</code> = 400</td><td><code>|S|</code> = 40,000</td><td>100 tuples/page</td></tr>
+        <tr><td>Memory</td><td colspan="3"><code>B</code> = 52 buffer pages for the operator</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="sec-nlj">Nested loop joins</h2>
+
+  <h3 id="sec-nlj-naive">The naive algorithm</h3>
+
+  <p>The simplest join is two nested loops: for each tuple <em>r</em> of the outer relation
+  <em>R</em>, scan the entire inner relation <em>S</em> and emit <em>(r, s)</em> for every <em>s</em>
+  that satisfies the join predicate.<sup class="cite"><a href="#ref-2">2</a></sup> Because it evaluates
+  the predicate against every pair, it works for <em>any</em> join condition — equality, inequality,
+  arbitrary expressions — which none of the other algorithms on this page can claim.<sup
+  class="cite"><a href="#ref-2">2</a>,<a href="#ref-4">4</a></sup> It also needs no setup: PostgreSQL
+  models the nested loop join with a start-up cost of zero, meaning it can emit its first row
+  almost immediately, and a run cost that grows as
+  <em>O(N<sub>outer</sub> × N<sub>inner</sub>)</em>.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <p>Counting I/Os exposes how brutal the naive version is. Reading the outer once costs
+  <code>[R]</code>; re-scanning the inner for every outer <em>tuple</em> costs
+  <code>|R|·[S]</code>, for a total of <code>[R] + |R|·[S]</code>.<sup class="cite"><a
+  href="#ref-2">2</a></sup> With our example tables that is
+  1,000 + 100,000 × 400 = <strong>40,001,000 I/Os</strong>. At even 10,000 page reads per second, that
+  is more than an hour for a join of two modest tables. Unsurprisingly, the tuple-at-a-time nested
+  loop is rarely what a real planner selects.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <h3 id="sec-nlj-block">Page and block nested loop</h3>
+
+  <p>The first fix is to respect the unit of I/O. Since we read whole pages anyway, loop over
+  <em>pages</em> of <em>R</em>, and for each page of <em>R</em> scan <em>S</em> once, joining all
+  tuple pairs between the two in-memory pages. This <em>page</em> nested loop join costs
+  <code>[R] + [R]·[S]</code>, and it pays to make the smaller relation the outer one.<sup
+  class="cite"><a href="#ref-2">2</a></sup> For our example (with <code>S</code> outer):
+  400 + 400 × 1,000 = <strong>400,400 I/Os</strong> — a 100× improvement for free.</p>
+
+  <p>The second fix is to use all the memory we were given, not just two pages. The <strong>block
+  nested loop join</strong> (BNLJ) reserves one buffer page as the output buffer, one as the input
+  page for the inner relation, and fills the remaining <code>B − 2</code> pages with a <em>chunk</em>
+  of the outer relation. The inner relation is then scanned once <em>per chunk</em> rather than once
+  per page, so the cost drops to <code>[R] + ⌈[R]/(B−2)⌉ · [S]</code>.<sup class="cite"><a
+  href="#ref-2">2</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 760 250" role="img">
+      <title>Block nested loop join buffer layout: B minus 2 pages hold a chunk of the outer relation, one page streams the inner relation, one page buffers output.</title>
+      <rect x="16" y="34" width="120" height="56" rx="8" class="d-box"/>
+      <text x="76" y="58" text-anchor="middle" class="d-text">R on disk</text>
+      <text x="76" y="76" text-anchor="middle" class="d-mono-sm">[R] pages</text>
+      <rect x="16" y="152" width="120" height="56" rx="8" class="d-box"/>
+      <text x="76" y="176" text-anchor="middle" class="d-text">S on disk</text>
+      <text x="76" y="194" text-anchor="middle" class="d-mono-sm">[S] pages</text>
+
+      <rect x="212" y="16" width="382" height="216" rx="10" class="d-box"/>
+      <text x="403" y="38" text-anchor="middle" class="d-text">buffer pool: B pages granted to the join</text>
+
+      <rect x="232" y="56" width="52" height="40" rx="5" class="d-box-hl"/>
+      <rect x="292" y="56" width="52" height="40" rx="5" class="d-box-hl"/>
+      <rect x="352" y="56" width="52" height="40" rx="5" class="d-box-hl"/>
+      <text x="428" y="82" text-anchor="middle" class="d-text">…</text>
+      <text x="342" y="120" text-anchor="middle" class="d-text-sm">chunk of R: B − 2 pages</text>
+
+      <rect x="480" y="56" width="94" height="40" rx="5" class="d-box-warn"/>
+      <text x="527" y="81" text-anchor="middle" class="d-mono-sm">S input (1)</text>
+      <rect x="480" y="152" width="94" height="40" rx="5" class="d-box-good"/>
+      <text x="527" y="177" text-anchor="middle" class="d-mono-sm">output (1)</text>
+
+      <line x1="136" y1="62" x2="232" y2="72" class="d-line"/>
+      <text x="182" y="52" text-anchor="middle" class="d-text-sm">read once</text>
+      <line x1="136" y1="180" x2="480" y2="82" class="d-line-hl"/>
+      <text x="300" y="166" text-anchor="middle" class="d-text-sm">rescanned ⌈[R]/(B−2)⌉ times</text>
+      <line x1="574" y1="172" x2="700" y2="172" class="d-line"/>
+      <text x="660" y="162" text-anchor="middle" class="d-text-sm">to parent</text>
+    </svg>
+    <figcaption>Figure 1 — Block nested loop join: the outer relation is consumed in chunks of
+    B−2 pages; each chunk triggers exactly one full scan of the inner relation.</figcaption>
+  </figure>
+
+  <p>With <code>B</code> = 52 and the smaller <code>S</code> as the outer:
+  400 + ⌈400 / 50⌉ × 1,000 = 400 + 8 × 1,000 = <strong>8,400 I/Os</strong>. Same answer as the naive
+  loop, roughly 4,700× cheaper. This is the single most important lesson of the module: <em>join cost
+  is mostly about how many times you re-read the inner input, and memory buys down that count</em>.</p>
+
+  <h3 id="sec-nlj-index">Index nested loop</h3>
+
+  <p>If the inner relation has an index on the join column (built in
+  <a href="../m04-data-structures-indexes/index.html">M04</a>), we do not need to scan <em>S</em> at
+  all: for each outer tuple, probe the index. Cost:
+  <code>[R] + |R| × (cost of one index lookup)</code>.<sup class="cite"><a href="#ref-2">2</a></sup>
+  PostgreSQL implements this as a <em>parameterized index path</em> — the inner index scan takes the
+  current outer tuple's join value as a parameter — and the total cost then grows only as
+  <em>O(N<sub>outer</sub>)</em>.<sup class="cite"><a href="#ref-3">3</a></sup> Beware the arithmetic,
+  though: with 100,000 outer tuples and ~2 I/Os per probe, our example costs about 201,000 I/Os —
+  <em>worse</em> than BNLJ. Index nested loop shines when the outer input is small or heavily
+  filtered, not when you join everything against everything.<sup class="cite"><a
+  href="#ref-2">2</a></sup></p>
+
+  <p>PostgreSQL adds one more twist worth copying: the <strong>materialized nested loop</strong>.
+  Rather than re-reading the inner table from the heap on every rescan, the executor scans it once and
+  writes the tuples into a temporary tuple store (<code>tuplestore.c</code>) that lives in
+  <code>work_mem</code> and overflows to a temporary file if the tuples outgrow it; every subsequent
+  rescan then reads this compact store instead of the base table, which the cost model treats as much
+  cheaper.<sup class="cite"><a href="#ref-3">3</a></sup> In FerricDB, Milestone&nbsp;6's
+  <code>NestedLoopJoin</code> executor takes the block-based approach within its
+  <code>memory_pages</code> budget — a course choice modeled directly on the CS186 formulation.<sup
+  class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall: rescanning an iterator</span>
+    <p>A nested loop join must restart its inner child once per outer tuple/chunk. In a Volcano
+    executor that means the inner subtree needs a cheap "rewind". If the inner child is itself an
+    expensive subquery, re-running it is a disaster — which is exactly why executors interpose a
+    materialize step that caches the inner tuples after the first pass.<sup class="cite"><a
+    href="#ref-3">3</a></sup> When you implement <code>open()</code>/<code>next()</code>, decide
+    explicitly what a second <code>open()</code> means.</p>
+  </div>
+
+  <h2 id="sec-merge">Merge join</h2>
+
+  <p>If both inputs happen to be <em>sorted on the join key</em>, joining them is nearly free: walk
+  the two sorted streams in tandem, the way you merge two sorted lists, and emit matches as the
+  cursors pass each other. This is the <strong>sort-merge join</strong> (PostgreSQL calls the operator
+  <em>merge join</em>), and it only works for equality predicates — PostgreSQL restricts it to natural
+  and equi-joins.<sup class="cite"><a href="#ref-2">2</a>,<a href="#ref-4">4</a></sup></p>
+
+  <h3 id="sec-merge-dup">The subtle part: duplicates</h3>
+
+  <p>With unique keys, one pointer per side and "advance the smaller" is the whole algorithm. Duplicate
+  keys break that: if <em>R</em> has two tuples with key 2 and <em>S</em> has two, the join must emit
+  all 2×2 = 4 combinations, so the <em>S</em> cursor has to re-visit its group of key-2 tuples once per
+  matching <em>R</em> tuple. The standard solution is a <strong>mark</strong>: when a match is first
+  found, remember (mark) the position in <em>S</em> where the matching run starts; advance <em>S</em>
+  through the run emitting pairs; when <em>S</em> leaves the run, advance <em>R</em> and reset
+  <em>S</em> back to the mark.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 700 320" role="img">
+      <title>Merge join duplicate handling: two sorted columns of keys; a mark remembers the start of the matching run in S so each duplicate key in R can rescan it.</title>
+      <text x="165" y="40" text-anchor="middle" class="d-text">R (sorted)</text>
+      <text x="505" y="40" text-anchor="middle" class="d-text">S (sorted)</text>
+
+      <rect x="120" y="56" width="90" height="34" rx="5" class="d-box"/>
+      <text x="165" y="78" text-anchor="middle" class="d-mono">k = 1</text>
+      <rect x="120" y="100" width="90" height="34" rx="5" class="d-box-hl"/>
+      <text x="165" y="122" text-anchor="middle" class="d-mono">k = 2</text>
+      <rect x="120" y="144" width="90" height="34" rx="5" class="d-box-hl"/>
+      <text x="165" y="166" text-anchor="middle" class="d-mono">k = 2</text>
+      <rect x="120" y="188" width="90" height="34" rx="5" class="d-box"/>
+      <text x="165" y="210" text-anchor="middle" class="d-mono">k = 4</text>
+
+      <rect x="460" y="56" width="90" height="34" rx="5" class="d-box"/>
+      <text x="505" y="78" text-anchor="middle" class="d-mono">k = 1</text>
+      <rect x="460" y="100" width="90" height="34" rx="5" class="d-box-hl"/>
+      <text x="505" y="122" text-anchor="middle" class="d-mono">k = 2</text>
+      <rect x="460" y="144" width="90" height="34" rx="5" class="d-box-hl"/>
+      <text x="505" y="166" text-anchor="middle" class="d-mono">k = 2</text>
+      <rect x="460" y="188" width="90" height="34" rx="5" class="d-box"/>
+      <text x="505" y="210" text-anchor="middle" class="d-mono">k = 5</text>
+
+      <text x="620" y="122" class="d-text-sm">◀ mark: start of</text>
+      <text x="620" y="138" class="d-text-sm">the k=2 run in S</text>
+
+      <line x1="210" y1="112" x2="460" y2="112" class="d-line-hl"/>
+      <line x1="210" y1="118" x2="460" y2="158" class="d-line-hl"/>
+      <line x1="210" y1="158" x2="460" y2="120" class="d-line-hl" stroke-dasharray="6 4"/>
+      <line x1="210" y1="164" x2="460" y2="164" class="d-line-hl" stroke-dasharray="6 4"/>
+
+      <text x="335" y="256" text-anchor="middle" class="d-text-sm">solid: matches for the first R tuple with k=2</text>
+      <text x="335" y="274" text-anchor="middle" class="d-text-sm">dashed: the second R tuple with k=2 rewinds S to the mark and rescans the run</text>
+      <text x="335" y="300" text-anchor="middle" class="d-text-sm">2 duplicates × 2 duplicates ⇒ 4 output rows</text>
+    </svg>
+    <figcaption>Figure 2 — Duplicate keys force the merge join to backtrack: the mark records where
+    the matching run in S begins so it can be rescanned for each duplicate in R.</figcaption>
+  </figure>
+
+  <p>Cost, assuming neither input is sorted yet: sort <em>R</em>, sort <em>S</em>, then a single
+  interleaved pass over both — <code>sort(R) + sort(S) + [R] + [S]</code> in the typical case.<sup
+  class="cite"><a href="#ref-2">2</a></sup> The merge phase is only linear when duplicate runs are
+  short; in the degenerate worst case where every tuple of both relations carries the same key, the
+  rescanning collapses toward nested-loop behavior, <code>sort(R) + sort(S) + [R] +
+  |R|·[S]</code>.<sup class="cite"><a href="#ref-2">2</a></sup> For our example tables and
+  <code>B</code> = 52 (using sort costs derived <a href="#sec-sort">below</a>): 4,000 + 1,600 + 1,400 =
+  <strong>7,000 I/Os</strong>. A further refinement fuses the last merge pass of each sort into the
+  join itself — legal whenever the leftover sorted runs of both inputs together fit in <code>B −
+  1</code> buffers — saving one full read+write of both relations, 2·([R]+[S]) I/Os; here that brings
+  the total down to <strong>4,200</strong>.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p>Where do sorted inputs come from in practice? Three places, which map exactly onto PostgreSQL's
+  merge join plan shapes: an explicit sort node on either input; a B+Tree index scan that yields rows
+  already in key order, letting the planner skip the sort entirely; and optionally a materialize node
+  on the inner input to make its rescans cheap.<sup class="cite"><a href="#ref-4">4</a></sup>
+  PostgreSQL performs those input sorts in memory if they fit and falls back to temporary files on
+  disk if they do not.<sup class="cite"><a href="#ref-4">4</a></sup> Internally a single
+  <code>MergePath</code> chosen by the planner can therefore expand into as many as four plan nodes:
+  the merge join itself, up to two sorts, and a materialize.<sup class="cite"><a
+  href="#ref-9">9</a></sup></p>
+
+  <h2 id="sec-hash">Hash join</h2>
+
+  <h3 id="sec-hash-mem">Build and probe</h3>
+
+  <p>For a pure equi-join, sorting is more work than necessary — we do not need <em>order</em>, only
+  <em>matching</em>. The in-memory hash join exploits that in two phases. <strong>Build:</strong> scan
+  the smaller input once and insert every tuple into an in-memory hash table keyed by the join
+  attribute. <strong>Probe:</strong> scan the larger input once; hash each tuple's key, look into the
+  corresponding bucket, and emit a joined row for every entry whose key truly matches.<sup
+  class="cite"><a href="#ref-2">2</a>,<a href="#ref-5">5</a></sup> Total cost: <code>[R] + [S]</code>
+  — one read of each relation, the theoretical floor for any join — but it is only legal if the build
+  relation fits in the <code>B − 2</code> available buffer pages.<sup class="cite"><a
+  href="#ref-2">2</a></sup></p>
+
+  <p>In PostgreSQL's implementation the <em>inner</em> relation is the build side: its hash table (a
+  structure PostgreSQL calls a <em>batch</em>) holds 2<sup>n</sup> buckets, and the executor picks the
+  bucket count in <code>ExecChooseHashTableSize()</code>. Build inserts all inner tuples into the
+  batch; probe then compares each outer tuple against the bucket its hash selects.<sup
+  class="cite"><a href="#ref-5">5</a></sup> Note the bucket comparison in the probe phase still checks
+  the real key: different keys can share a bucket, so hashing narrows the candidates but equality
+  decides.<sup class="cite"><a href="#ref-5">5</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 760 330" role="img">
+      <title>Hash join phases: build inserts inner tuples into an in-memory hash table; probe streams outer tuples through the hash function into buckets and emits matches.</title>
+      <text x="90" y="30" text-anchor="middle" class="d-text">① build: inner S, once</text>
+      <rect x="40" y="44" width="100" height="28" rx="5" class="d-box"/>
+      <text x="90" y="63" text-anchor="middle" class="d-mono-sm">S: k=1</text>
+      <rect x="40" y="78" width="100" height="28" rx="5" class="d-box"/>
+      <text x="90" y="97" text-anchor="middle" class="d-mono-sm">S: k=2</text>
+      <rect x="40" y="112" width="100" height="28" rx="5" class="d-box"/>
+      <text x="90" y="131" text-anchor="middle" class="d-mono-sm">S: k=2</text>
+      <rect x="40" y="146" width="100" height="28" rx="5" class="d-box"/>
+      <text x="90" y="165" text-anchor="middle" class="d-mono-sm">S: k=5</text>
+
+      <rect x="210" y="80" width="80" height="56" rx="10" class="d-box-warn"/>
+      <text x="250" y="113" text-anchor="middle" class="d-mono">h(k)</text>
+      <line x1="140" y1="108" x2="210" y2="108" class="d-line"/>
+      <line x1="290" y1="108" x2="360" y2="108" class="d-line"/>
+
+      <rect x="360" y="36" width="210" height="200" rx="10" class="d-box"/>
+      <text x="465" y="58" text-anchor="middle" class="d-text-sm">hash table in memory (≤ B−2)</text>
+      <rect x="376" y="70" width="178" height="44" rx="5" class="d-box"/>
+      <text x="465" y="97" text-anchor="middle" class="d-mono-sm">bucket 0 : —</text>
+      <rect x="376" y="122" width="178" height="44" rx="5" class="d-box"/>
+      <text x="465" y="149" text-anchor="middle" class="d-mono-sm">bucket 1 : k=1</text>
+      <rect x="376" y="174" width="178" height="44" rx="5" class="d-box-hl"/>
+      <text x="465" y="201" text-anchor="middle" class="d-mono-sm">bucket 2 : k=2, k=2, k=5</text>
+
+      <text x="90" y="238" text-anchor="middle" class="d-text">② probe: outer R, streamed</text>
+      <rect x="40" y="252" width="100" height="28" rx="5" class="d-box-hl"/>
+      <text x="90" y="271" text-anchor="middle" class="d-mono-sm">R: k=2</text>
+      <path d="M 140 266 C 250 266 310 240 376 200" class="d-line-hl"/>
+      <text x="262" y="292" text-anchor="middle" class="d-text-sm">hash key → bucket 2, compare keys</text>
+
+      <line x1="570" y1="196" x2="676" y2="196" class="d-line-hl"/>
+      <text x="668" y="184" text-anchor="middle" class="d-text-sm">emit matches</text>
+      <text x="656" y="214" class="d-mono-sm">(k=2 rows join;</text>
+      <text x="656" y="228" class="d-mono-sm">k=5 fails the</text>
+      <text x="656" y="242" class="d-mono-sm">key check)</text>
+    </svg>
+    <figcaption>Figure 3 — Hash join: a blocking build phase loads the inner relation into a hash
+    table, then the probe phase streams the outer relation through it. A bucket can hold different
+    keys, so probes always re-check equality.</figcaption>
+  </figure>
+
+  <div class="callout tip">
+    <span class="callout-title">Tip: build on the smaller side</span>
+    <p>The hash table's size is set by the build relation, so build on the smaller input and probe
+    with the larger. The same instinct as "smaller relation outer" in page nested loop — every join
+    algorithm has an asymmetry you can exploit.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  </div>
+
+  <h3 id="sec-hash-grace">When the build side doesn't fit: partitioned hash</h3>
+
+  <p>If the build relation exceeds memory we fall back on divide and conquer, at survey level the
+  <strong>Grace hash join</strong>. <em>Partition phase:</em> using a hash function
+  h<sub>1</sub>, scatter <em>both</em> relations into <code>B − 1</code> partitions on disk; because
+  the same h<sub>1</sub> is applied to both sides, any two tuples that could ever join land in the
+  same partition number. <em>Build-and-probe phase:</em> for each partition pair
+  (R<sub>i</sub>, S<sub>i</sub>), load the smaller into an in-memory hash table (using a
+  <em>different</em> hash function h<sub>2</sub>) and probe with the other. If some partition is still
+  too big, partition it again, recursively.<sup class="cite"><a href="#ref-2">2</a></sup> The cost is
+  one read+write of both inputs per partitioning pass plus one final read of both:
+  with a single partitioning pass, roughly <code>3·([R]+[S])</code> — for our example
+  2 × 1,400 + 1,400 = <strong>4,200 I/Os</strong>, tying the optimized merge join.</p>
+
+  <figure>
+    <svg viewBox="0 0 760 300" role="img">
+      <title>Grace hash join: both relations are hashed into matching partitions on disk, then each partition pair is joined in memory.</title>
+      <rect x="20" y="60" width="90" height="44" rx="6" class="d-box"/>
+      <text x="65" y="87" text-anchor="middle" class="d-mono-sm">R (big)</text>
+      <rect x="20" y="180" width="90" height="44" rx="6" class="d-box"/>
+      <text x="65" y="207" text-anchor="middle" class="d-mono-sm">S (big)</text>
+
+      <rect x="160" y="118" width="70" height="50" rx="10" class="d-box-warn"/>
+      <text x="195" y="148" text-anchor="middle" class="d-mono">h₁(k)</text>
+      <line x1="110" y1="82" x2="160" y2="132" class="d-line"/>
+      <line x1="110" y1="202" x2="160" y2="154" class="d-line"/>
+
+      <line x1="230" y1="132" x2="300" y2="70" class="d-line"/>
+      <line x1="230" y1="143" x2="300" y2="143" class="d-line"/>
+      <line x1="230" y1="154" x2="300" y2="216" class="d-line"/>
+
+      <rect x="300" y="48" width="74" height="40" rx="5" class="d-box-hl"/>
+      <text x="337" y="73" text-anchor="middle" class="d-mono-sm">R₀ | S₀</text>
+      <rect x="300" y="122" width="74" height="40" rx="5" class="d-box-hl"/>
+      <text x="337" y="147" text-anchor="middle" class="d-mono-sm">R₁ | S₁</text>
+      <rect x="300" y="196" width="74" height="40" rx="5" class="d-box-hl"/>
+      <text x="337" y="221" text-anchor="middle" class="d-mono-sm">R₂ | S₂</text>
+      <text x="337" y="262" text-anchor="middle" class="d-text-sm">B−1 partition pairs on disk</text>
+      <text x="337" y="278" text-anchor="middle" class="d-text-sm">(matching keys share a pair)</text>
+
+      <line x1="374" y1="143" x2="450" y2="143" class="d-line-hl"/>
+      <rect x="450" y="106" width="180" height="74" rx="10" class="d-box-good"/>
+      <text x="540" y="136" text-anchor="middle" class="d-text-sm">per pair: build h₂ table on the</text>
+      <text x="540" y="152" text-anchor="middle" class="d-text-sm">smaller half, probe with the other</text>
+      <line x1="630" y1="143" x2="716" y2="143" class="d-line"/>
+      <text x="700" y="132" text-anchor="middle" class="d-text-sm">output</text>
+    </svg>
+    <figcaption>Figure 4 — Grace (partitioned) hash join. Partitioning is a full read+write of both
+    inputs; the build-and-probe phase then handles one memory-sized piece at a time.</figcaption>
+  </figure>
+
+  <p>Partitioned hashing has one enemy: <strong>skew</strong>. All copies of one key hash to the same
+  partition, so a key that appears in millions of tuples produces a partition that no amount of
+  re-partitioning can shrink — CS186 bluntly calls Grace hash "really sensitive to key skew".<sup
+  class="cite"><a href="#ref-2">2</a></sup> Production systems respond with hybrid designs; the tabs
+  below contrast the textbook algorithm with what PostgreSQL actually ships.</p>
+
+  <div class="tabs">
+    <div class="tab-list" role="tablist">
+      <button role="tab" aria-selected="true" type="button">Textbook · Grace hash (CS186)</button>
+      <button role="tab" aria-selected="false" type="button">PostgreSQL · hybrid hash + skew batch</button>
+    </div>
+    <div class="tab-panel">
+      <p>Partition both relations into <code>B − 1</code> pieces, recursing on any piece whose build
+      half still exceeds <code>B − 2</code> pages; then run the in-memory build/probe per pair.
+      Every tuple of both inputs is written to disk once per partitioning pass and read back once —
+      nothing stays resident between phases. Simple to implement, easy to cost, and the design
+      FerricDB's stretch-goal join follows if you outgrow the in-memory <code>HashJoin</code> of
+      Milestone&nbsp;6.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+    </div>
+    <div class="tab-panel" hidden>
+      <p>PostgreSQL uses the in-memory variant while the inner table stays small relative to
+      <code>work_mem</code> (about a quarter of it); beyond that it switches to a <em>hybrid hash
+      join</em> with 2<sup>m</sup> batches, where batch 0 is kept in <code>work_mem</code> and only
+      the remaining batches spill to temporary files — tuples of batch 0 are joined immediately with
+      no I/O detour, while later batches must be written out and reloaded, which the documentation
+      notes is costly.<sup class="cite"><a href="#ref-5">5</a></sup> Skew is attacked directly: a
+      special <em>skew batch</em> holds the inner tuples whose join keys match the outer relation's
+      most common values (from its MCV statistics), so the highest-frequency outer tuples are joined
+      in memory during the first pass instead of flooding one spilled batch.<sup class="cite"><a
+      href="#ref-5">5</a></sup></p>
+    </div>
+  </div>
+
+  <h2 id="sec-race">The three joins, side by side</h2>
+
+  <p>Formulas tell you the asymptotics; watching the algorithms run tells you <em>why</em>. The widget
+  below joins the same two four-row tables (<code>R ⋈ S ON R.k = S.k</code>, three columns each) with
+  all three algorithms at once. One click of <em>Next</em> gives every algorithm one unit of work: one
+  key comparison, or one hash-table insert/probe. Watch the counters — at this toy scale a
+  "comparison" stands in for the page I/Os of the formulas above, and the finishing order tells the
+  whole story: hash finishes first but had to build a table before emitting anything; merge pays its
+  sort up front and then streams; nested loop starts instantly and grinds through all 16 pairs.
+  Duplicates (key 2 appears twice on each side) let you watch the merge join's mark-and-rescan from
+  Figure 2 happen live.</p>
+
+  <div class="widget" id="widget-joinrace">
+    <p class="widget-title">Join race: nested loop vs merge vs hash</p>
+    <p class="widget-sub">Same inputs, same 5 output rows, very different amounts of work. Step all
+    three algorithms together; each panel's status line narrates its current move. (Without
+    JavaScript: the trace is exactly the algorithms described above — 16 comparisons for nested loop,
+    12 plus a sort for merge, 8 hash operations for hash join, all emitting the same 5 rows.)</p>
+    <div id="jr-panels" style="display:flex;flex-wrap:wrap;gap:1rem;align-items:flex-start;"></div>
+    <div id="jr-ctl"></div>
+  </div>
+
+  <h2 id="sec-sort">External merge sort</h2>
+
+  <p>Merge join wanted sorted inputs; <code>ORDER BY</code> wants sorted output;
+  sort-based aggregation (next section) wants groups adjacent; B+Tree bulk loading wants keys in
+  order. Sorting is the executor's workhorse — and the in-memory sorts from the standard library
+  assume the data fits in RAM, which is exactly what a database cannot assume: tables are routinely an
+  order of magnitude larger than available memory, so the sort must be organized around disk I/O.<sup
+  class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <h3 id="sec-sort-algo">Run generation, then merging</h3>
+
+  <p>External merge sort with <code>B</code> buffer pages has two stages.<sup class="cite"><a
+  href="#ref-6">6</a></sup></p>
+
+  <ol>
+    <li><strong>Pass 0 — run generation.</strong> Read <code>B</code> pages at a time into memory,
+    sort them with any in-memory sort, and write each sorted batch back out as a <em>run</em>. Result:
+    <code>⌈N/B⌉</code> sorted runs of (up to) <code>B</code> pages each.<sup class="cite"><a
+    href="#ref-6">6</a></sup></li>
+    <li><strong>Merge passes.</strong> Dedicate one buffer page to output and use the other
+    <code>B − 1</code> as input cursors, merging <code>B − 1</code> runs into one longer run per
+    group. Each pass over the data divides the number of runs by <code>B − 1</code>; repeat until one
+    run remains.<sup class="cite"><a href="#ref-6">6</a></sup></li>
+  </ol>
+
+  <p>Every pass reads and writes all <code>N</code> pages (2N I/Os), which gives the two formulas you
+  should be able to reproduce from memory:<sup class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <pre><code>passes = 1 + ⌈ log_(B−1) ⌈N/B⌉ ⌉
+I/O    = 2·N · passes</code></pre>
+
+  <p>The special case <code>B = 3</code> is the classic two-way sort: runs shrink by a factor of 2
+  per pass, giving <code>1 + ⌈log₂ ⌈N/B⌉⌉</code> passes — and the general formula shows why memory is so
+  valuable: <code>B</code> appears <em>inside a logarithm's base</em>. Concretely, sorting
+  N = 10,000 pages with B = 100 buffers produces 100 runs and needs
+  1 + ⌈log₉₉ 100⌉ = 3 passes → 60,000 I/Os; give it just one more buffer page (B = 101, fan-in 100)
+  and the same sort collapses to 2 passes → 40,000 I/Os. One page of memory, twenty thousand I/Os.
+  This is also where the merge-join numbers earlier came from: sorting our 1,000-page <code>R</code>
+  with B = 52 yields ⌈1000/52⌉ = 20 runs, one 51-way merge pass finishes the job, so 2 passes ×
+  2,000 = 4,000 I/Os.<sup class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <p>The widget below runs the exact configuration you will unit-test in Milestone 6:
+  <strong>N = 8 pages, B = 3 buffers</strong>. Pass 0 makes ⌈8/3⌉ = 3 runs; the 2-way merges then need
+  ⌈log₂ 3⌉ = 2 more passes; 3 passes × 2×8 = 48 I/Os. Watch the I/O counter agree with the formula.</p>
+
+  <div class="widget" id="widget-extsort">
+    <p class="widget-title">External merge sort: 8 pages, 3 buffers</p>
+    <p class="widget-sub">Step through run generation and both merge passes; every box is a disk page
+    (two keys per page). The I/O counter counts each page read and each page write. (Without
+    JavaScript: the run contents for each pass are listed in the prose above and the formula predicts
+    3 passes, 48 I/Os.)</p>
+    <div class="stat-row">
+      <span class="stat">I/O so far: <b id="es-io">0</b> / 48</span>
+      <span class="stat">passes done: <b id="es-pass">0</b> / 3</span>
+      <span class="stat">formula: 1 + ⌈log₂⌈8/3⌉⌉ = 3 passes ⇒ 2·8·3 = 48 I/O</span>
+    </div>
+    <div id="es-canvas"></div>
+    <div id="es-ctl"></div>
+  </div>
+
+  <div class="callout note">
+    <span class="callout-title">Course choice: the sort budget is explicit</span>
+    <p>FerricDB's <code>sort::ExternalSorter</code> (crate <code>course/ferricdb/crates/exec</code>)
+    takes a <code>memory_pages</code> parameter and must never hold more than that many pages of
+    tuples in memory — spilling runs to temp pages and k-way merging exactly as above. The tests pin
+    small budgets like B = 3 on purpose: correctness bugs in run boundaries and merge cursors only
+    show up when spilling actually happens. The budget-then-spill discipline mirrors PostgreSQL, whose
+    sorts run in memory when they fit and otherwise fall back to temporary files on disk.<sup
+    class="cite"><a href="#ref-4">4</a></sup></p>
+  </div>
+
+  <h2 id="sec-agg">Aggregation: sort it or hash it</h2>
+
+  <p><code>GROUP BY dept</code> asks the executor to fold every input tuple into one accumulator per
+  distinct <code>dept</code> value. Architecturally this is a post-processing step: optimizers plan
+  the <code>SELECT‑FROM‑WHERE</code> block first and pin operators for <code>GROUP BY</code>,
+  <code>ORDER BY</code>, <code>HAVING</code>, and <code>DISTINCT</code> on top, with grouped
+  aggregation and duplicate elimination appearing as ordinary iterators in the plan tree.<sup
+  class="cite"><a href="#ref-1">1</a></sup> There are exactly two classic strategies, and they reuse
+  the two machines you just built.</p>
+
+  <p><strong>Sort-based aggregation</strong> sorts the input on the grouping key. Equal keys are now
+  adjacent, so a single streaming pass keeps one accumulator, emits a result row each time the key
+  changes, and never holds more than one group in memory. The survey's example plan is precisely this
+  shape — a sort on the grouping column feeding a group-by/average operator.<sup class="cite"><a
+  href="#ref-1">1</a></sup> The output conveniently arrives sorted by group key.</p>
+
+  <p><strong>Hash-based aggregation</strong> hashes each input tuple's grouping key into a table whose
+  entries hold the running aggregate state; sorting is skipped entirely. This is the standard use
+  of hashing in a database: often "all we want is to group the same value together" without caring
+  about order, and GROUP BY and duplicate removal are the canonical examples.<sup class="cite"><a
+  href="#ref-7">7</a></sup> If the table of groups outgrows memory, the same divide-and-conquer as
+  Grace hash applies: partition the input into <code>B − 1</code> partitions on the grouping key
+  (recursively if needed — every occurrence of a value lands in the same partition), then build an
+  in-memory hash table per partition.<sup class="cite"><a href="#ref-7">7</a></sup> And the same
+  caveat applies: external hashing is very susceptible to data skew, since a heavily repeated
+  grouping value cannot be split across partitions.<sup class="cite"><a href="#ref-7">7</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 880 240" role="img">
+      <title>Two GROUP BY pipelines: sort-based aggregation sorts input so groups are adjacent and streams accumulators; hash-based aggregation keeps one hash table entry of running state per group.</title>
+      <text x="20" y="34" class="d-text">sort-based</text>
+      <rect x="20" y="48" width="120" height="44" rx="6" class="d-box"/>
+      <text x="80" y="75" text-anchor="middle" class="d-mono-sm">B A C A B A</text>
+      <line x1="140" y1="70" x2="196" y2="70" class="d-line"/>
+      <rect x="196" y="48" width="130" height="44" rx="6" class="d-box-warn"/>
+      <text x="261" y="75" text-anchor="middle" class="d-text-sm">external sort</text>
+      <line x1="326" y1="70" x2="382" y2="70" class="d-line"/>
+      <rect x="382" y="48" width="120" height="44" rx="6" class="d-box"/>
+      <text x="442" y="75" text-anchor="middle" class="d-mono-sm">A A A B B C</text>
+      <line x1="502" y1="70" x2="558" y2="70" class="d-line"/>
+      <rect x="558" y="48" width="170" height="44" rx="6" class="d-box-good"/>
+      <text x="643" y="68" text-anchor="middle" class="d-text-sm">stream: emit on</text>
+      <text x="643" y="84" text-anchor="middle" class="d-text-sm">key change (1 group live)</text>
+      <line x1="728" y1="70" x2="768" y2="70" class="d-line"/>
+      <text x="806" y="66" text-anchor="middle" class="d-text-sm">sorted</text>
+      <text x="806" y="82" text-anchor="middle" class="d-text-sm">groups</text>
+
+      <text x="20" y="152" class="d-text">hash-based</text>
+      <rect x="20" y="166" width="120" height="44" rx="6" class="d-box"/>
+      <text x="80" y="193" text-anchor="middle" class="d-mono-sm">B A C A B A</text>
+      <line x1="140" y1="188" x2="196" y2="188" class="d-line"/>
+      <rect x="196" y="166" width="130" height="44" rx="6" class="d-box-warn"/>
+      <text x="261" y="193" text-anchor="middle" class="d-mono-sm">h(key)</text>
+      <line x1="326" y1="188" x2="382" y2="188" class="d-line"/>
+      <rect x="382" y="152" width="220" height="76" rx="6" class="d-box-hl"/>
+      <text x="492" y="174" text-anchor="middle" class="d-text-sm">hash table of running state</text>
+      <text x="492" y="194" text-anchor="middle" class="d-mono-sm">A: n=3 · B: n=2 · C: n=1</text>
+      <text x="492" y="212" text-anchor="middle" class="d-text-sm">one entry per group, no sort</text>
+      <line x1="602" y1="188" x2="658" y2="188" class="d-line"/>
+      <text x="726" y="184" text-anchor="middle" class="d-text-sm">groups, arbitrary order</text>
+      <text x="726" y="202" text-anchor="middle" class="d-text-sm">(spill: partition like Grace)</text>
+    </svg>
+    <figcaption>Figure 5 — The two GROUP BY strategies. Sorting buys adjacency (and ordered output);
+    hashing buys directness (one pass when the groups fit in memory).</figcaption>
+  </figure>
+
+  <p>Which one wins? If the number of <em>groups</em> is small, hashing is hard to beat: the running
+  states fit in memory even when the input is enormous, so aggregation costs a single read of the
+  input — no sort passes at all. Sorting earns its keep when its byproduct is useful: if the query
+  also has <code>ORDER BY dept</code>, or a downstream merge join wants the same order, the sorted
+  aggregation output is an <em>interesting order</em> the planner can reuse, while hash operators
+  never produce ordered output.<sup class="cite"><a href="#ref-8">8</a></sup> FerricDB's
+  Milestone&nbsp;6 <code>Aggregate</code> executor is hash-based (a course choice — it is the simpler
+  first implementation, and <code>DISTINCT</code> falls out for free by treating the whole row as the
+  group key<sup class="cite"><a href="#ref-7">7</a></sup>); you can add the sort-based variant once
+  your <code>ExternalSorter</code> lands.</p>
+
+  <h2 id="sec-planner">When the planner picks each algorithm</h2>
+
+  <p>Nothing on this page is "the best join". A cost-based planner enumerates candidate plans,
+  estimates the I/O each would perform using statistics — selectivity of predicates, distinct-value
+  counts, the estimated join output size <code>|R|·|S| / max(distinct(R.k), distinct(S.k))</code> —
+  and keeps the cheapest, plus any plan that is more expensive but produces an interesting
+  order.<sup class="cite"><a href="#ref-8">8</a></sup> PostgreSQL represents the candidates
+  explicitly: a <code>JoinPath</code> for nested loop, and <code>MergePath</code> and
+  <code>HashPath</code> variants built on it, each carrying its estimated cost through the search.<sup
+  class="cite"><a href="#ref-9">9</a></sup> You will build exactly this in
+  <a href="../m08-query-optimization/index.html">M08</a>/Milestone 7; for now, internalize the
+  decision inputs:</p>
+
+  <ul>
+    <li><strong>Predicate type.</strong> Merge and hash join handle equality predicates only; an
+    arbitrary condition such as <code>R.a &lt; S.b</code> leaves nested loop as the general
+    fallback.<sup class="cite"><a href="#ref-4">4</a>,<a href="#ref-5">5</a></sup></li>
+    <li><strong>Input sizes and memory.</strong> A build side that fits in <code>B − 2</code> pages
+    makes in-memory hash join the cost floor <code>[R]+[S]</code>; a tiny outer relation makes block
+    nested loop nearly as cheap; big-on-big favors partitioned hash or sort-merge.<sup
+    class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Indexes.</strong> An index on the inner join column enables index nested loop, which
+    wins when the outer input is small or highly selective; a B+Tree on the join column can also feed
+    a merge join with pre-sorted input, deleting a sort node from the plan.<sup class="cite"><a
+    href="#ref-2">2</a>,<a href="#ref-4">4</a></sup></li>
+    <li><strong>Sortedness, present and future.</strong> Already-sorted inputs make merge join cheap;
+    an <code>ORDER BY</code>/<code>GROUP BY</code>/later merge join downstream makes sort-merge's
+    ordered output worth paying extra for. Hash-based operators never contribute order.<sup
+    class="cite"><a href="#ref-8">8</a></sup></li>
+    <li><strong>Time to first row.</strong> Nested loop has zero start-up cost and streams
+    immediately, which matters for <code>LIMIT</code>-style queries and interactive clients that
+    optimize for time-to-first-row; hash join must finish its build, and sorts must finish
+    sorting, before anything is emitted.<sup class="cite"><a href="#ref-1">1</a>,<a
+    href="#ref-3">3</a></sup></li>
+    <li><strong>Data distribution.</strong> Heavy key skew punishes partitioned hashing; PostgreSQL's
+    skew batch exists precisely to keep the most common values in memory.<sup class="cite"><a
+    href="#ref-2">2</a>,<a href="#ref-5">5</a></sup></li>
+  </ul>
+
+  <p>Here is the whole worked example in one table — every algorithm on the same
+  <code>R ⋈ S</code> (1,000 + 400 pages, B = 52), using the formulas cited in each section:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Algorithm</th><th>Cost formula</th><th>I/Os on R ⋈ S</th><th>Remarks</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Naive nested loop (tuple)</td><td><code>[R] + |R|·[S]</code></td><td>40,001,000</td><td>any predicate; never pick this</td></tr>
+        <tr><td>Page nested loop (S outer)</td><td><code>[S] + [S]·[R]</code></td><td>400,400</td><td>smaller relation outer</td></tr>
+        <tr><td>Block nested loop (S outer)</td><td><code>[S] + ⌈[S]/(B−2)⌉·[R]</code></td><td>8,400</td><td>uses all B pages</td></tr>
+        <tr><td>Index nested loop (index on S)</td><td><code>[R] + |R|·lookup</code></td><td>≈ 201,000</td><td>wins only with a small/filtered outer</td></tr>
+        <tr><td>Sort-merge</td><td><code>sort(R)+sort(S)+[R]+[S]</code></td><td>7,000</td><td>4,200 with the fused final pass; output sorted</td></tr>
+        <tr><td>Grace hash</td><td><code>≈ 3·([R]+[S])</code>, 1 partition pass</td><td>4,200</td><td>equi-join only; skew-sensitive</td></tr>
+        <tr><td>In-memory hash</td><td><code>[R] + [S]</code></td><td>n/a here</td><td>needs build side ≤ B−2 = 50 pages</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>In FerricDB, Milestone 6 gives your executor <code>NestedLoopJoin</code>, <code>HashJoin</code>
+  (build/probe on bound key columns), hash <code>Aggregate</code>, and the <code>ExternalSorter</code>
+  behind <code>Sort</code> — with the planner still choosing naively. Milestone 7 then adds the cost
+  model (<code>seq_page_cost</code>-style constants and selectivity estimates, patterned after
+  PostgreSQL's defaults<sup class="cite"><a href="#ref-8">8</a></sup>) that turns the table above into
+  code.</p>
+
+  <h2 id="sec-quiz">Check your understanding</h2>
+
+  <fieldset class="quiz" data-explain="Block nested loop with S as the 100-page outer: keep chunks of B−2 = 10 pages, so S is consumed in ⌈100/10⌉ = 10 chunks, each triggering one full 1,000-page scan of R. Total = [S] + 10·[R] = 100 + 10,000 = 10,100. The 100,100 figure is page nested loop ([S] + [S]·[R]); 1,100 would be a single pass over both, which no nested loop achieves.">
+    <legend class="quiz-q">With B = 12 buffer pages, outer [S] = 100 pages, inner [R] = 1,000 pages, what does block nested loop join cost?</legend>
+    <label><input type="radio" name="q1"> 1,100 I/Os</label>
+    <label><input type="radio" name="q1" data-correct> 10,100 I/Os</label>
+    <label><input type="radio" name="q1"> 100,100 I/Os</label>
+    <label><input type="radio" name="q1"> 101,000 I/Os</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="A run of equal keys in R must each see the full run of equal keys in S (the join emits the cross product of the two runs). After the S cursor walks past the end of the run for one R tuple, the next R tuple with the same key needs S rewound to the start of that run — the mark records where it starts. Without it you either miss output rows or restart S from the beginning.">
+    <legend class="quiz-q">Why does merge join keep a "mark" into the inner (S) input?</legend>
+    <label><input type="radio" name="q2"> Because S might not be fully sorted and the mark bounds the unsorted region</label>
+    <label><input type="radio" name="q2" data-correct> Because duplicate join keys in R must each rescan S's run of matching tuples, so S must rewind to where that run starts</label>
+    <label><input type="radio" name="q2"> To remember where the next output page should be written</label>
+    <label><input type="radio" name="q2"> To let the planner switch to hash join mid-execution</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="The build relation must fit in the B−2 buffer pages left after reserving an input page and an output page; the probe side just streams through one page at a time, so its size is irrelevant. That asymmetry is why you always build on the smaller input — and why PostgreSQL builds on the inner table and switches to batched (hybrid) hashing when the inner side outgrows its work_mem allowance.">
+    <legend class="quiz-q">The in-memory (naive) hash join is applicable only when…</legend>
+    <label><input type="radio" name="q3"> both relations fit in memory together</label>
+    <label><input type="radio" name="q3"> the probe relation fits in B−2 buffer pages</label>
+    <label><input type="radio" name="q3" data-correct> the build relation fits in B−2 buffer pages</label>
+    <label><input type="radio" name="q3"> the join keys are unique on both sides</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Pass 0 produces ⌈1000/10⌉ = 100 runs of 10 pages. Each merge pass is (B−1) = 9-way: 100 → 12 → 2 → 1, i.e. ⌈log₉ 100⌉ = 3 merge passes, 4 passes total (matching 1 + ⌈log₉⌈N/B⌉⌉). Every pass reads and writes all 1,000 pages: 2 × 1,000 × 4 = 8,000 I/Os. If you answered 6,000 you likely forgot that ⌈log₉ 100⌉ is 3, not 2 (9² = 81 < 100).">
+    <legend class="quiz-q">External merge sort of N = 1,000 pages with B = 10 buffers costs how many I/Os?</legend>
+    <label><input type="radio" name="q4"> 2,000</label>
+    <label><input type="radio" name="q4"> 4,000</label>
+    <label><input type="radio" name="q4"> 6,000</label>
+    <label><input type="radio" name="q4" data-correct> 8,000</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Merge join and hash join both rely on equality: merge join is restricted to natural/equi-joins, and hashing only co-locates identical keys — an inequality gives the hash function nothing to work with. Nested loop simply evaluates the predicate on every pair, so it accepts any condition. (Real planners may still find rewrites, but among these three algorithms only nested loop applies directly.)">
+    <legend class="quiz-q">Which join algorithms can directly execute <code>R JOIN S ON R.a &lt; S.b</code>?</legend>
+    <label><input type="radio" name="q5"> All three — the predicate is just a function of the pair</label>
+    <label><input type="radio" name="q5"> Merge join and nested loop, since sorted order makes &lt; easy</label>
+    <label><input type="radio" name="q5" data-correct> Nested loop only</label>
+    <label><input type="radio" name="q5"> Hash join only, using range-partitioned hashing</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Sort-based aggregation's byproduct is exactly the order the ORDER BY asks for — an 'interesting order' — so one sort serves both clauses. Hash aggregation might use fewer I/Os for the aggregation itself (especially with few groups), but its output is unordered, forcing an additional sort of the results before returning them; with many groups that extra sort usually erases the savings.">
+    <legend class="quiz-q">A query has <code>GROUP BY dept ORDER BY dept</code> over a huge table with many distinct departments. Why might the planner prefer sort-based aggregation?</legend>
+    <label><input type="radio" name="q6"> Sorting is always fewer I/Os than hashing</label>
+    <label><input type="radio" name="q6" data-correct> The sort's output order satisfies the ORDER BY for free, while hash aggregation would need an extra sort afterwards</label>
+    <label><input type="radio" name="q6"> Hash aggregation cannot compute AVG, only COUNT</label>
+    <label><input type="radio" name="q6"> Hash tables cannot hold more than B−2 groups</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <footer class="page-footer">
+    <h2 id="sec-sources">Primary sources</h2>
+    <div class="refs">
+      <ol>
+        <li id="ref-1">J. M. Hellerstein, M. Stonebraker, J. Hamilton, “Architecture of a Database
+          System”, §4 (Relational Query Processor), <em>Foundations and Trends in Databases</em> 1(2).
+          <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf" rel="external">https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf</a></li>
+        <li id="ref-2">Berkeley CS186 staff, “Note 9: Iterators &amp; Joins”, CS186 course notes.
+          <a href="https://cs186berkeley.net/notes/note9/" rel="external">https://cs186berkeley.net/notes/note9/</a></li>
+        <li id="ref-3">H. Suzuki, “The Internals of PostgreSQL”, §3.5.1 Nested Loop Join.
+          <a href="https://www.interdb.jp/pg/pgsql03/05/01.html" rel="external">https://www.interdb.jp/pg/pgsql03/05/01.html</a></li>
+        <li id="ref-4">H. Suzuki, “The Internals of PostgreSQL”, §3.5.2 Merge Join.
+          <a href="https://www.interdb.jp/pg/pgsql03/05/02.html" rel="external">https://www.interdb.jp/pg/pgsql03/05/02.html</a></li>
+        <li id="ref-5">H. Suzuki, “The Internals of PostgreSQL”, §3.5.3 Hash Join.
+          <a href="https://www.interdb.jp/pg/pgsql03/05/03.html" rel="external">https://www.interdb.jp/pg/pgsql03/05/03.html</a></li>
+        <li id="ref-6">Berkeley CS186 staff, “Note 8: Sorting”, CS186 course notes.
+          <a href="https://cs186berkeley.net/notes/note8/" rel="external">https://cs186berkeley.net/notes/note8/</a></li>
+        <li id="ref-7">Berkeley CS186 staff, “Note 7: Hashing”, CS186 course notes.
+          <a href="https://cs186berkeley.net/notes/note7/" rel="external">https://cs186berkeley.net/notes/note7/</a></li>
+        <li id="ref-8">Berkeley CS186 staff, “Note 10: Query Optimization”, CS186 course notes.
+          <a href="https://cs186berkeley.net/notes/note10/" rel="external">https://cs186berkeley.net/notes/note10/</a></li>
+        <li id="ref-9">H. Suzuki, “The Internals of PostgreSQL”, §3.5.4 Join Access Paths and Join Nodes.
+          <a href="https://www.interdb.jp/pg/pgsql03/05/04.html" rel="external">https://www.interdb.jp/pg/pgsql03/05/04.html</a></li>
+      </ol>
+    </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>The rest of interdb.jp Chapter 3 — how PostgreSQL's planner derives the cost numbers these
+        join operators compete on. <a href="https://www.interdb.jp/pg/pgsql03.html" rel="external">interdb.jp/pg/pgsql03.html</a></li>
+      <li>The CS186 notes index — read notes 7→10 in sequence for the full sorting/hashing/joins/optimization arc
+        this module condenses. <a href="https://cs186berkeley.net/notes/" rel="external">cs186berkeley.net/notes</a></li>
+      <li>“Architecture of a Database System” in full — §4 continues into parallelism and the memory-management
+        questions (BP-tuples vs M-tuples) your executor will hit next.
+        <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf" rel="external">dsf.berkeley.edu (PDF)</a></li>
+    </ul>
+
+    <h2 id="sec-milestone">Milestone link</h2>
+    <p>What to build now: <a href="../../project/milestone-06/index.html">Milestone 6 — Joins, Aggregation, External Sort</a>.</p>
+
+    <nav class="prevnext">
+      <a href="../../project/milestone-05/index.html"><span class="dir">← Previous</span> Milestone 5 · B+Tree Index</a>
+      <a class="next" href="../../project/milestone-06/index.html"><span class="dir">Next →</span> Milestone 6 · Joins, Aggregation, External Sort</a>
+    </nav>
+  </footer>
+</main>
+
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  "use strict";
+  (function () {
+    var C = window.Course;
+    if (!C) return;
+
+    /* ================= Join race widget ================= */
+
+    var R = [{id:"R1",k:2,v:"a"},{id:"R2",k:1,v:"b"},{id:"R3",k:4,v:"c"},{id:"R4",k:2,v:"d"}];
+    var S = [{id:"S1",k:1,v:"w"},{id:"S2",k:2,v:"x"},{id:"S3",k:2,v:"y"},{id:"S4",k:5,v:"z"}];
+    var NBUCKETS = 3;
+
+    function emitStr(rRow, sRow) { return rRow.k + ": " + rRow.v + "⋈" + sRow.v; }
+    function snapBuckets(b) { return b.map(function (a) { return a.slice(); }); }
+    var EMPTY_BUCKETS = [[], [], []];
+
+    /* --- nested loop: 16 steps, one comparison each --- */
+    var nljSteps = [];
+    (function () {
+      var cmp = 0, outs = [];
+      for (var i = 0; i < R.length; i++) {
+        for (var j = 0; j < S.length; j++) {
+          cmp++;
+          var m = R[i].k === S[j].k;
+          if (m) outs = outs.concat([emitStr(R[i], S[j])]);
+          nljSteps.push({ r: i, s: j, mark: null, cmp: cmp, outs: outs.slice(), emitNew: m,
+            note: "compare " + R[i].id + "(k=" + R[i].k + ") × " + S[j].id + "(k=" + S[j].k + ")" +
+                  (m ? " → match, emit" : " → no match") });
+        }
+      }
+    })();
+
+    /* --- merge join: display rows in sorted order; 1 sort step + 12 comparisons --- */
+    var mR = [R[1], R[0], R[3], R[2]];  /* keys 1,2,2,4 */
+    var mS = [S[0], S[1], S[2], S[3]];  /* keys 1,2,2,5 */
+    var mergeSteps = [];
+    (function () {
+      var outs = [], cmp = 0;
+      mergeSteps.push({ r: null, s: null, mark: null, cmp: 0, outs: [], emitNew: false,
+        note: "sort both inputs on k (extra cost not shown in this panel's counter)" });
+      function st(r, s, mark, note, rr, ss) {
+        cmp++;
+        var e = false;
+        if (rr != null) { outs = outs.concat([emitStr(rr, ss)]); e = true; }
+        mergeSteps.push({ r: r, s: s, mark: mark, cmp: cmp, outs: outs.slice(), emitNew: e, note: note });
+      }
+      st(0, 0, 0,    "1 = 1 → emit, set mark, advance S", mR[0], mS[0]);
+      st(0, 1, 0,    "1 < 2 → R's key done: advance R, rewind S to mark", null, null);
+      st(1, 0, null, "2 > 1 → advance S", null, null);
+      st(1, 1, 1,    "2 = 2 → emit, set mark at start of S's k=2 run", mR[1], mS[1]);
+      st(1, 2, 1,    "2 = 2 → emit (duplicate in S), advance S", mR[1], mS[2]);
+      st(1, 3, 1,    "2 < 5 → next R is also k=2: advance R, rewind S to mark", null, null);
+      st(2, 1, 1,    "2 = 2 → emit — rescanning S's run for the duplicate R key", mR[2], mS[1]);
+      st(2, 2, 1,    "2 = 2 → emit, advance S", mR[2], mS[2]);
+      st(2, 3, 1,    "2 < 5 → advance R, rewind S to mark", null, null);
+      st(3, 1, null, "4 > 2 → advance S", null, null);
+      st(3, 2, null, "4 > 2 → advance S", null, null);
+      st(3, 3, null, "4 < 5 → advance R: R exhausted, join complete", null, null);
+    })();
+
+    /* --- hash join: 4 build + 4 probe steps --- */
+    var hashSteps = [];
+    (function () {
+      var buckets = [[], [], []];
+      var outs = [], cmp = 0;
+      for (var j = 0; j < S.length; j++) {
+        var hb = S[j].k % NBUCKETS;
+        buckets[hb].push(j);
+        hashSteps.push({ r: null, s: j, mark: null, bucketHl: hb, buckets: snapBuckets(buckets),
+          cmp: cmp, outs: outs.slice(), emitNew: false,
+          note: "build: hash " + S[j].id + " (k=" + S[j].k + ") into bucket " + hb });
+      }
+      for (var i = 0; i < R.length; i++) {
+        var pb = R[i].k % NBUCKETS;
+        var hits = 0;
+        for (var t = 0; t < buckets[pb].length; t++) {
+          cmp++;
+          var sj = buckets[pb][t];
+          if (S[sj].k === R[i].k) { outs = outs.concat([emitStr(R[i], S[sj])]); hits++; }
+        }
+        hashSteps.push({ r: i, s: null, mark: null, bucketHl: pb, buckets: snapBuckets(buckets),
+          cmp: cmp, outs: outs.slice(), emitNew: hits > 0,
+          note: "probe: " + R[i].id + " (k=" + R[i].k + ") → bucket " + pb + ": " +
+                buckets[pb].length + " entr" + (buckets[pb].length === 1 ? "y" : "ies") +
+                " checked, " + hits + " match" + (hits === 1 ? "" : "es") });
+      }
+    })();
+
+    var INIT = { r: null, s: null, mark: null, cmp: 0, outs: [], emitNew: false,
+                 buckets: EMPTY_BUCKETS, note: "ready" };
+
+    function drawCol(svg, x, title, rows, hl, mark) {
+      svg.appendChild(C.svgEl("text", { x: x + 46, y: 14, "text-anchor": "middle", "class": "d-text-sm" }, title));
+      for (var i = 0; i < rows.length; i++) {
+        var y = 22 + i * 30;
+        svg.appendChild(C.svgEl("rect", { x: x, y: y, width: 92, height: 26, rx: 4,
+          "class": (hl === i ? "d-box-hl" : "d-box") }));
+        svg.appendChild(C.svgEl("text", { x: x + 46, y: y + 17, "text-anchor": "middle", "class": "d-mono-sm" },
+          rows[i].id + " k=" + rows[i].k + " " + rows[i].v));
+        if (mark === i) {
+          svg.appendChild(C.svgEl("text", { x: x - 4, y: y + 17, "text-anchor": "end", "class": "d-text-sm" }, "mark ▸"));
+        }
+      }
+    }
+
+    function drawPanel(cfg, t) {
+      var svg = cfg.svg;
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var len = cfg.steps.length;
+      var state = (t === 0) ? INIT : cfg.steps[Math.min(t, len) - 1];
+      var done = t >= len;
+
+      drawCol(svg, 8, cfg.leftTitle, cfg.leftRows, state.r, null);
+      drawCol(svg, 204, cfg.rightTitle, cfg.rightRows, state.s, state.mark);
+
+      if (cfg.kind === "hash") {
+        svg.appendChild(C.svgEl("text", { x: 152, y: 14, "text-anchor": "middle", "class": "d-text-sm" }, "buckets"));
+        var bks = state.buckets || EMPTY_BUCKETS;
+        for (var b = 0; b < NBUCKETS; b++) {
+          var by = 22 + b * 40;
+          svg.appendChild(C.svgEl("rect", { x: 108, y: by, width: 88, height: 34, rx: 4,
+            "class": (state.bucketHl === b ? "d-box-hl" : "d-box") }));
+          svg.appendChild(C.svgEl("text", { x: 152, y: by + 14, "text-anchor": "middle", "class": "d-mono-sm" }, "b" + b));
+          var keys = bks[b].map(function (sj) { return S[sj].k; }).join(" ");
+          svg.appendChild(C.svgEl("text", { x: 152, y: by + 28, "text-anchor": "middle", "class": "d-mono-sm" },
+            keys === "" ? "—" : keys));
+        }
+      } else {
+        svg.appendChild(C.svgEl("text", { x: 152, y: 80, "text-anchor": "middle", "class": "d-text" }, "⋈"));
+        if (cfg.kind === "nlj" && state.r !== null) {
+          svg.appendChild(C.svgEl("text", { x: 152, y: 102, "text-anchor": "middle", "class": "d-text-sm" },
+            "S scan " + (state.r + 1) + "/4"));
+        }
+      }
+
+      svg.appendChild(C.svgEl("text", { x: 8, y: 162, "class": "d-text-sm" }, "output (k: r⋈s):"));
+      for (var o = 0; o < state.outs.length; o++) {
+        var last = o === state.outs.length - 1;
+        svg.appendChild(C.svgEl("text", { x: 14, y: 177 + o * 13,
+          "class": (last && state.emitNew && !done ? "d-mono" : "d-mono-sm") }, state.outs[o]));
+      }
+      svg.appendChild(C.svgEl("text", { x: 8, y: 248, "class": "d-text-sm" },
+        "comparisons: " + state.cmp + " · rows out: " + state.outs.length));
+
+      if (done) {
+        svg.appendChild(C.svgEl("rect", { x: 156, y: 232, width: 138, height: 20, rx: 10, "class": "d-box-good" }));
+        svg.appendChild(C.svgEl("text", { x: 225, y: 246, "text-anchor": "middle", "class": "d-text-sm" },
+          "done: " + len + " work units"));
+      }
+
+      cfg.noteEl.textContent = done
+        ? "finished after " + len + " units of work"
+        : (t === 0 ? "ready — press Next" : state.note);
+    }
+
+    var raceHost = document.getElementById("jr-panels");
+    var raceCtl = document.getElementById("jr-ctl");
+    if (raceHost && raceCtl) {
+      var panels = [
+        { kind: "nlj",   name: "Nested loop",  steps: nljSteps,
+          leftRows: R,  rightRows: S,  leftTitle: "R (outer)",  rightTitle: "S (inner)" },
+        { kind: "merge", name: "Merge join",   steps: mergeSteps,
+          leftRows: mR, rightRows: mS, leftTitle: "R (sorted)", rightTitle: "S (sorted)" },
+        { kind: "hash",  name: "Hash join",    steps: hashSteps,
+          leftRows: R,  rightRows: S,  leftTitle: "R (probe)",  rightTitle: "S (build)" }
+      ];
+      panels.forEach(function (cfg) {
+        var box = C.el("div", { style: "flex:1 1 300px;max-width:320px;" });
+        var head = C.el("p", { style: "margin:0 0 0.2rem;font-weight:650;font-size:0.92rem;" }, cfg.name);
+        var svg = C.svgEl("svg", { viewBox: "0 0 300 256", width: "300", height: "256", role: "img" });
+        svg.appendChild(C.svgEl("title", null, cfg.name + " step-through of R join S"));
+        var note = C.el("div", { "class": "muted", style: "font-size:0.82rem;min-height:2.4em;" }, "");
+        box.appendChild(head); box.appendChild(svg); box.appendChild(note);
+        raceHost.appendChild(box);
+        cfg.svg = svg; cfg.noteEl = note;
+      });
+
+      var TOTAL = 1 + Math.max(nljSteps.length, mergeSteps.length, hashSteps.length); /* 17 */
+      var caps = [];
+      caps.push("Initial state: R ⋈ S on k, 4 rows each side, 5 result rows. Each Next gives every algorithm one unit of work.");
+      for (var t = 1; t < TOTAL; t++) {
+        var msg = "Work unit " + t + " of " + (TOTAL - 1) + ".";
+        if (t === hashSteps.length) msg += " Hash join finishes here: build 4, probe 4.";
+        if (t === mergeSteps.length) msg += " Merge join finishes: 12 comparisons (plus the up-front sort).";
+        if (t === nljSteps.length) msg += " Nested loop finally finishes: it compared all 4×4 = 16 pairs.";
+        caps.push(msg);
+      }
+      C.stepper(raceCtl, {
+        total: TOTAL,
+        captions: caps,
+        render: function (t) { panels.forEach(function (cfg) { drawPanel(cfg, t); }); }
+      });
+    }
+
+    /* ================= External merge sort widget ================= */
+
+    var esPages = [[33,7],[18,42],[5,27],[48,11],[2,39],[24,15],[45,9],[30,21]];
+    var runA = [[5,7],[18,27],[33,42]];
+    var runB = [[2,11],[15,24],[39,48]];
+    var runC = [[9,21],[30,45]];
+    var runD = [[2,5],[7,11],[15,18],[24,27],[33,39],[42,48]];
+    var runF = [[2,5],[7,9],[11,15],[18,21],[24,27],[30,33],[39,42],[45,48]];
+
+    /* Step definitions: which inputs are highlighted, what exists, buffers text, io/passes */
+    var esSteps = [
+      { io: 0,  pass: 0, hlIn: [],        buf: ["", "", ""], have: {},
+        cap: "Start: 8 unsorted pages on disk, B = 3 buffer pages. Formula predicts ⌈8/3⌉ = 3 runs, 3 passes, 48 I/Os." },
+      { io: 6,  pass: 0, hlIn: [0,1,2],   buf: ["P1", "P2", "P3"], have: { A: 1 }, newRun: "A",
+        cap: "Pass 0: read P1–P3 (3 reads), sort the 6 keys in memory, write run A (3 writes)." },
+      { io: 12, pass: 0, hlIn: [3,4,5],   buf: ["P4", "P5", "P6"], have: { A: 1, B: 1 }, newRun: "B",
+        cap: "Pass 0: read P4–P6, sort, write run B. Runs so far: A, B." },
+      { io: 16, pass: 1, hlIn: [6,7],     buf: ["P7", "P8", "—"], have: { A: 1, B: 1, C: 1 }, newRun: "C",
+        cap: "Pass 0 done: read P7–P8 (only 2 left), sort, write run C. ⌈8/3⌉ = 3 runs, 16 I/Os so far." },
+      { io: 28, pass: 1, hlRuns: ["A","B"], buf: ["in ← run A", "in ← run B", "out"], have: { A: 1, B: 1, C: 1, D: 1 }, newRun: "D",
+        cap: "Pass 1: B−1 = 2-way merge of runs A + B → run D (read 6, write 6). One buffer streams each input run; one collects output." },
+      { io: 32, pass: 2, hlRuns: ["C"],   buf: ["in ← run C", "—", "out"], have: { A: 1, B: 1, C: 1, D: 1, C2: 1 }, newRun: "C2",
+        cap: "Pass 1: run C has no merge partner and is carried through (read 2, write 2 — the 2N-per-pass formula counts every page; real systems can skip this copy). 2 runs remain." },
+      { io: 48, pass: 3, hlRuns: ["D","C2"], buf: ["in ← run D", "in ← run C", "out"], have: { A: 1, B: 1, C: 1, D: 1, C2: 1, F: 1 }, newRun: "F",
+        cap: "Pass 2: merge D + C → one fully sorted 8-page run (read 8, write 8). Done!" },
+      { io: 48, pass: 3, hlRuns: [],      buf: ["", "", ""], have: { A: 1, B: 1, C: 1, D: 1, C2: 1, F: 1 },
+        cap: "Check the formula: passes = 1 + ⌈log₂⌈8/3⌉⌉ = 1 + ⌈log₂ 3⌉ = 3, and I/O = 2·8·3 = 48 — exactly what the counter shows." }
+    ];
+
+    function esPageBox(svg, x, y, keys, cls) {
+      svg.appendChild(C.svgEl("rect", { x: x, y: y, width: 58, height: 30, rx: 4, "class": cls }));
+      svg.appendChild(C.svgEl("text", { x: x + 29, y: y + 20, "text-anchor": "middle", "class": "d-mono-sm" },
+        keys[0] + "·" + keys[1] ));
+    }
+
+    function esRun(svg, x, y, label, pages, cls, hl) {
+      svg.appendChild(C.svgEl("text", { x: x, y: y - 6, "class": "d-text-sm" }, label));
+      for (var i = 0; i < pages.length; i++) {
+        esPageBox(svg, x + i * 62, y, pages[i], hl ? "d-box-hl" : cls);
+      }
+      return x + pages.length * 62;
+    }
+
+    var esCanvas = document.getElementById("es-canvas");
+    var esCtl = document.getElementById("es-ctl");
+    if (esCanvas && esCtl) {
+      var esSvg = C.svgEl("svg", { viewBox: "0 0 940 330", role: "img" });
+      esSvg.appendChild(C.svgEl("title", null, "External merge sort of 8 pages with 3 buffers: run generation then two merge passes"));
+      esCanvas.appendChild(esSvg);
+      var ioEl = document.getElementById("es-io");
+      var passEl = document.getElementById("es-pass");
+
+      function esRender(t) {
+        var st = esSteps[t];
+        while (esSvg.firstChild) esSvg.removeChild(esSvg.firstChild);
+
+        /* input pages */
+        esSvg.appendChild(C.svgEl("text", { x: 10, y: 16, "class": "d-text-sm" }, "disk: input (N = 8 pages, unsorted)"));
+        for (var i = 0; i < esPages.length; i++) {
+          esPageBox(esSvg, 10 + i * 64, 22, esPages[i], (st.hlIn && st.hlIn.indexOf(i) >= 0) ? "d-box-hl" : "d-box");
+        }
+
+        /* buffers */
+        esSvg.appendChild(C.svgEl("text", { x: 10, y: 84, "class": "d-text-sm" }, "memory: B = 3 buffer pages"));
+        for (var b = 0; b < 3; b++) {
+          var bx = 10 + b * 160;
+          esSvg.appendChild(C.svgEl("rect", { x: bx, y: 90, width: 150, height: 32, rx: 5,
+            "class": st.buf[b] ? "d-box-warn" : "d-box" }));
+          esSvg.appendChild(C.svgEl("text", { x: bx + 75, y: 110, "text-anchor": "middle", "class": "d-mono-sm" },
+            st.buf[b] || "empty"));
+        }
+
+        /* pass 0 runs */
+        function hlR(name) { return st.newRun === name || (st.hlRuns && st.hlRuns.indexOf(name) >= 0); }
+        if (st.have.A || st.have.B || st.have.C) {
+          esSvg.appendChild(C.svgEl("text", { x: 10, y: 148, "class": "d-text-sm" }, "after pass 0: ⌈8/3⌉ = 3 sorted runs"));
+          var x0 = 10;
+          if (st.have.A) x0 = esRun(esSvg, x0, 160, "run A", runA, st.newRun === "A" ? "d-box-good" : "d-box", hlR("A") && st.newRun !== "A") + 28;
+          if (st.have.B) x0 = esRun(esSvg, x0, 160, "run B", runB, st.newRun === "B" ? "d-box-good" : "d-box", hlR("B") && st.newRun !== "B") + 28;
+          if (st.have.C) x0 = esRun(esSvg, x0, 160, "run C", runC, st.newRun === "C" ? "d-box-good" : "d-box", hlR("C") && st.newRun !== "C");
+        }
+
+        /* pass 1 */
+        if (st.have.D || st.have.C2) {
+          esSvg.appendChild(C.svgEl("text", { x: 10, y: 216, "class": "d-text-sm" }, "after pass 1: ⌈3/2⌉ = 2 runs"));
+          var x1 = 10;
+          if (st.have.D) x1 = esRun(esSvg, x1, 228, "run D = A + B", runD, st.newRun === "D" ? "d-box-good" : "d-box", hlR("D") && st.newRun !== "D") + 28;
+          if (st.have.C2) x1 = esRun(esSvg, x1, 228, "run C (carried)", runC, st.newRun === "C2" ? "d-box-good" : "d-box", hlR("C2") && st.newRun !== "C2");
+        }
+
+        /* pass 2 */
+        if (st.have.F) {
+          esSvg.appendChild(C.svgEl("text", { x: 10, y: 284, "class": "d-text-sm" }, "after pass 2: 1 sorted run — done"));
+          esRun(esSvg, 10, 296, "final", runF, "d-box-good", false);
+        }
+
+        if (ioEl) ioEl.textContent = String(st.io);
+        if (passEl) passEl.textContent = String(st.pass);
+      }
+
+      C.stepper(esCtl, {
+        total: esSteps.length,
+        captions: esSteps.map(function (s) { return s.cap; }),
+        render: esRender
+      });
+    }
+  })();
+});
+</script>
+</body>
+</html>
