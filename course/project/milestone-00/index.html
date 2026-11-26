@@ -108,8 +108,8 @@ impl Repl {
     pub fn run(&amp;mut self) -&gt; Result&lt;()&gt;;
 }
 
-// crates/ferricdb/src/main.rs — already sketched:
-// ferricdb [--db &lt;path&gt;] [--serve [addr]]     (--serve activates in MS10)</code></pre>
+// crates/ferricdb/src/main.rs — already implemented:
+// ferricdb [--db &lt;path&gt;] [--serve [addr]] [--help]   (--serve activates in MS10)</code></pre>
 
   <p>Behavior contract for this milestone:</p>
   <ul>
@@ -117,8 +117,9 @@ impl Repl {
       handling — the same split SQLite's shell makes.<sup class="cite"><a href="#ref-1">1</a></sup>
       Unknown meta-commands print an error and a pointer to <code>.help</code>.</li>
     <li><code>.help</code> lists all six meta-commands with one-line descriptions.</li>
-    <li><code>.exit</code> ends the session cleanly; so do <kbd>Ctrl-D</kbd> (EOF) and
-      <kbd>Ctrl-C</kbd> at an empty prompt.</li>
+    <li><code>.exit</code>, <kbd>Ctrl-D</kbd> (EOF), and <kbd>Ctrl-C</kbd> at an empty prompt end
+      the session cleanly; <kbd>Ctrl-C</kbd> at a continuation prompt clears the buffered
+      statement instead.</li>
     <li><code>.tables</code> and <code>.schema</code> will read the catalog from Milestone 3
       onward; today they print a friendly "no catalog yet" message.</li>
     <li><code>.ast</code> activates in Milestone 3 (it pretty-prints the parse tree);
@@ -135,9 +136,13 @@ impl Repl {
       <code>cargo test --workspace -- --list --ignored</code>. Skim <code>crates/common</code>'s
       source; you own its types (<code>Value</code>, <code>Schema</code>, <code>RecordId</code>)
       from here on.</li>
-    <li><strong>Parse the flags by hand.</strong> A small loop over <code>std::env::args()</code>
-      is enough for <code>--db</code> and <code>--serve</code>; the course crate policy leaves no
-      room for an argument-parsing dependency, and you will not need one.</li>
+    <li><strong>Inspect and test the provided CLI entrypoint.</strong>
+      <code>crates/ferricdb/src/main.rs</code> already parses <code>--db &lt;path&gt;</code>,
+      <code>--serve [addr]</code>, and <code>--help</code> by hand (no argument-parsing crate
+      needed under the course crate policy) and forwards <code>db_path</code> into
+      <code>Repl::new</code>. Read it and verify it with
+      <code>cargo run -p ferricdb -- --help</code> (plus a bad flag to check error exit) before
+      implementing <code>repl.rs</code>.</li>
     <li><strong>Build the loop.</strong> Construct the <code>rustyline</code> editor in
       <code>Repl::new</code>, then loop on <code>readline("ferricdb&gt; ")</code>. Match the three
       outcomes explicitly: a line, <code>Interrupted</code>, <code>Eof</code>.<sup class="cite"><a href="#ref-2">2</a></sup>
@@ -168,7 +173,10 @@ cargo test -p ferricdb
 # your inventory of what is coming
 cargo test --workspace -- --list --ignored</code></pre>
   <p>Manual session to reproduce before calling it done:</p>
-  <pre><code>$ cargo run -- --db /tmp/demo.db
+  <pre><code>$ cargo run -p ferricdb -- --help
+ferricdb [--db &lt;path&gt;] [--serve [addr]]
+
+$ cargo run -p ferricdb -- --db /tmp/demo.db
 ferricdb 0.1.0 — type .help for help
 ferricdb&gt; .help
 .help              show this help
@@ -187,10 +195,12 @@ ferricdb&gt; .exit</code></pre>
     touches the line; the shell language and SQL are different languages.<sup class="cite"><a href="#ref-1">1</a></sup></p>
   </div>
   <div class="callout pitfall">
-    <span class="callout-title">Ctrl-C kills the process</span>
+    <span class="callout-title">Ctrl-C kills the process or leaves stale buffered SQL</span>
     <p><code>rustyline</code> surfaces <kbd>Ctrl-C</kbd> as <code>ReadlineError::Interrupted</code>,
-    not a signal you can ignore. Swallow it at an empty prompt, clear the pending statement buffer
-    at a continuation prompt — never <code>std::process::exit</code> from inside the loop.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+    not an unhandled signal. At a continuation prompt (when the pending statement buffer is
+    non-empty), clear the buffered statement and return to the primary prompt; at an empty prompt,
+    break out of the loop and return <code>Ok(())</code> so destructors run cleanly — never call
+    <code>std::process::exit</code> from inside the loop.<sup class="cite"><a href="#ref-2">2</a></sup></p>
   </div>
   <div class="callout pitfall">
     <span class="callout-title">Skipping the workspace tour</span>
@@ -201,9 +211,11 @@ ferricdb&gt; .exit</code></pre>
 
   <h2 id="sec-done">Definition of done</h2>
   <ul>
-    <li>REPL starts with and without <code>--db</code>, echoes multi-line statements terminated by
-      <code>;</code>, and exits cleanly on <code>.exit</code>, <kbd>Ctrl-D</kbd>, and double
-      <kbd>Ctrl-C</kbd>.</li>
+    <li><code>crates/ferricdb/src/main.rs</code> handles <code>--help</code>, <code>--db</code>,
+      and <code>--serve</code>; the REPL starts with and without <code>--db</code>, echoes
+      multi-line statements terminated by <code>;</code>, clears a buffered statement on
+      <kbd>Ctrl-C</kbd> at the continuation prompt, and exits cleanly on <code>.exit</code>,
+      <kbd>Ctrl-D</kbd> (EOF), and <kbd>Ctrl-C</kbd> at an empty prompt.</li>
     <li>All six meta-commands respond (<code>.tables</code>/<code>.schema</code>/<code>.ast</code>/
       <code>.open</code> with their honest "not yet" messages).</li>
     <li><code>cargo test --workspace</code>, <code>cargo fmt --check</code>, and
@@ -253,12 +265,6 @@ ferricdb&gt; .exit</code></pre>
         <a href="https://sqlite.org/cli.html" rel="external">sqlite.org/cli.html</a></li>
     </ul>
 
-    <h2 id="sec-milestone">Milestone link</h2>
-    <p>Done here? Continue on the path with
-    <a href="../../modules/m01-relational-model-sql/index.html">M01 · The Relational Model &amp;
-    SQL Semantics</a>, then <a href="../../modules/m02-storage/index.html">M02 · Storage</a> —
-    Milestone 1 builds what M02 teaches.</p>
-
     <nav class="prevnext">
       <a href="../../modules/m00-orientation/index.html"><span class="dir">← Previous</span> M00 · Orientation</a>
       <a class="next" href="../../modules/m01-relational-model-sql/index.html"><span class="dir">Next →</span> M01 · The Relational Model &amp; SQL Semantics</a>
@@ -269,6 +275,7 @@ ferricdb&gt; .exit</code></pre>
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     done: [],
     current: [],

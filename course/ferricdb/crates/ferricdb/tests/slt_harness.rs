@@ -1,8 +1,11 @@
 //! End-to-end sqllogictest harness (provided plumbing — not learning
-//! content). From Milestone 4 on, `slt_all` replays every `tests/slt/*.slt`
-//! file through [`ferricdb_exec::execute`] over a fresh tempfile database.
+//! content). Replays `tests/slt/*.slt` files through
+//! [`ferricdb_exec::execute`] over a fresh tempfile database.
 //!
-//! Run with: `cargo test -p ferricdb -- --include-ignored slt_all`
+//! Run per milestone:
+//!   cargo test -p ferricdb -- --include-ignored ms4_slt_crud
+//!   cargo test -p ferricdb -- --include-ignored ms6_slt_joins_agg_sort
+//!   cargo test -p ferricdb -- --include-ignored slt_all
 
 use std::path::Path;
 use std::sync::Arc;
@@ -83,8 +86,30 @@ impl sqllogictest::DB for FerricDb {
     }
 }
 
+fn run_slt_file(file: &Path) {
+    let mut runner = sqllogictest::Runner::new(|| async { Ok(FerricDb::fresh()) });
+    runner
+        .run_file(file)
+        .unwrap_or_else(|e| panic!("{}: {e}", file.display()));
+    println!("ok — {}", file.display());
+}
+
 #[test]
 #[ignore = "milestone 4"]
+fn ms4_slt_crud() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/slt/ms4_crud.slt");
+    run_slt_file(&file);
+}
+
+#[test]
+#[ignore = "milestone 6"]
+fn ms6_slt_joins_agg_sort() {
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/slt/ms6_joins_agg_sort.slt");
+    run_slt_file(&file);
+}
+
+#[test]
+#[ignore = "milestone 6"]
 fn slt_all() {
     let slt_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/slt");
     let mut files: Vec<_> = std::fs::read_dir(&slt_dir)
@@ -97,11 +122,6 @@ fn slt_all() {
     assert!(!files.is_empty(), "no .slt files found in {slt_dir:?}");
 
     for file in files {
-        // fresh database per file: files are independent scripts
-        let mut runner = sqllogictest::Runner::new(|| async { Ok(FerricDb::fresh()) });
-        runner
-            .run_file(&file)
-            .unwrap_or_else(|e| panic!("{}: {e}", file.display()));
-        println!("ok — {}", file.display());
+        run_slt_file(&file);
     }
 }

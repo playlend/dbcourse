@@ -25,11 +25,13 @@
 
 <main>
   <h1>Milestone 10 · PostgreSQL Wire Protocol Server</h1>
-  <p class="subtitle">The finale: a tokio TCP server speaking the PG protocol. When this
-  milestone is done, psql connects to your database and doesn't know the difference.</p>
+  <p class="subtitle">The finale: a hand-rolled PostgreSQL v3 message codec over
+  <code>bytes::BytesMut</code>, an async <code>tokio</code> TCP server with per-connection
+  session isolation and clean <code>SSLRequest</code> handling, wired to <code>--serve</code> so
+  real <code>psql</code> connects out of the box.</p>
 
   <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
-  all specification content is readable without it.</p></noscript>
+  all specification content and SVG figures are readable without it.</p></noscript>
 
   <div class="toc">
     <strong>On this page</strong>
@@ -38,6 +40,8 @@
       <li><a href="#sec-reading">Required reading</a></li>
       <li><a href="#sec-arch">Where this fits</a></li>
       <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-wire">Wire format quick reference</a></li>
+      <li><a href="#sec-tls">SSL negotiation and going further with TLS</a></li>
       <li><a href="#sec-guidance">Step-by-step guidance</a></li>
       <li><a href="#sec-tests">Test plan</a></li>
       <li><a href="#sec-pitfalls">Common pitfalls</a></li>
@@ -48,195 +52,803 @@
     </ol>
   </div>
 
-  <p>Ten milestones of internals, and not one of them is visible from the outside. This one is
-  nothing <em>but</em> outside: a byte-exact implementation of somebody else's contract, judged
-  by the least forgiving integration test imaginable — real clients you didn't write. Two paths
-  are offered. Hand-rolling the message codec from the spec is the recommended one: it is a
-  weekend of exacting, satisfying work. The pgwire crate is the honorable escape hatch — it
-  implements the startup, simple-query, and extended-query sub-protocols and ships a complete
-  SQLite-backed example server.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  <p>Ten milestones of storage, indexing, planning, MVCC, and ARIES recovery, and until today
+  only your own REPL has ever spoken to the engine. This milestone turns FerricDB into a real
+  network server speaking the PostgreSQL frontend/backend wire protocol version 3 — judged by
+  the strictest integration test available: real PostgreSQL clients you did not write.<sup
+  class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>In line with FerricDB's crate policy, you implement the protocol codec <strong>by
+  hand</strong> using <code>bytes::BytesMut</code> and big-endian integer framing, with no
+  external PostgreSQL protocol crate. The provided <code>ms10_</code> suite tests your exact
+  incremental codec functions byte for byte before driving a live TCP connection through
+  <code>Server::serve</code>. Once those tests pass and <code>--serve</code> is wired in
+  <code>crates/ferricdb/src/main.rs</code>, plain <code>psql -h 127.0.0.1 -p 5433</code>
+  connects without special flags, renders your query tables, displays live MVCC transaction
+  status in its prompt, and receives real SQLSTATE <code>40001</code> serialization errors when
+  two terminals race on the same row.<sup class="cite"><a href="#ref-1">1</a></sup><sup
+  class="cite"><a href="#ref-3">3</a></sup></p>
 
   <h2 id="sec-objectives">Learning objectives</h2>
   <ul>
-    <li><strong>Implement</strong> the protocol codec: framing, StartupMessage's special case,
-      the frontend and backend message set.<sup class="cite"><a href="#ref-3">3</a></sup></li>
-    <li><strong>Implement</strong> the session state machine: startup → auth → query cycles →
-      termination, with correct ReadyForQuery discipline.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Build</strong> a tokio accept loop giving each connection its own session and
-      its own transaction state.</li>
-    <li><strong>Map</strong> FerricDB results and errors onto RowDescription/DataRow,
-      CommandComplete tags, and SQLSTATE codes.</li>
-    <li><strong>Prove it</strong> with psql and the full sqllogictest suite over the wire.</li>
+    <li><strong>Implement</strong> all four incremental, non-blocking PostgreSQL v3 codec
+      functions over <code>bytes::BytesMut</code>: framing, typeless startup/SSL packets, signed
+      <code>i32</code> length validation, and exact wire encodings for all 10 frontend and 12
+      backend message variants.<sup class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a
+      href="#ref-4">4</a></sup></li>
+    <li><strong>Implement</strong> the per-connection session state machine inside
+      <code>Server::serve</code>: <code>SSLRequest</code> decline (<code>b'N'</code>), startup
+      and trust/cleartext authentication, startup parameter burst, simple-query loop, and clean
+      <code>Terminate</code> / disconnect cleanup.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Isolate</strong> concurrent clients with <code>ExecContext::new_session()</code>
+      and bridge synchronous query execution onto <code>tokio::task::spawn_blocking</code> so
+      disk I/O and mutex locks never stall async worker threads.<sup class="cite"><a
+      href="#ref-4">4</a></sup></li>
+    <li><strong>Map</strong> FerricDB <code>QueryResult</code>s and <code>Error</code>s onto
+      PostgreSQL type OIDs, text-format <code>DataRow</code> values (including <code>"t"</code> /
+      <code>"f"</code> booleans and <code>-1</code> NULLs), <code>CommandComplete</code> tags,
+      SQLSTATE codes, and <code>ReadyForQuery</code> transaction status bytes.<sup
+      class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>Wire</strong> <code>ferricdb --db &lt;path&gt; --serve [addr]</code> in
+      <code>crates/ferricdb/src/main.rs</code> (with Milestone 9 WAL recovery on startup) and
+      validate end to end with live <code>psql</code> sessions.</li>
   </ul>
 
   <h2 id="sec-reading">Required reading</h2>
   <ul>
     <li><a href="../../modules/m11-wire-protocol-server/index.html">M11 · The Postgres Wire
-      Protocol</a> — the concept module; its byte explorer and sequence diagrams are your codec's
-      reference behavior.</li>
-    <li>PostgreSQL "Message Formats" — keep it open in a tab the entire milestone; your codec
-      matches it byte for byte.
+      Protocol</a> — the concept module; its byte explorer for <code>Query("SELECT 1;")</code>
+      and sequence diagrams match the exact bytes your tests check.</li>
+    <li>PostgreSQL Documentation, <em>Message Formats</em> — keep this open beside your editor;
+      every field width, tag byte, and terminator in your codec comes from this page.<sup
+      class="cite"><a href="#ref-2">2</a></sup>
       <a href="https://www.postgresql.org/docs/current/protocol-message-formats.html" rel="external">postgresql.org/docs/current/protocol-message-formats.html</a></li>
-    <li>PostgreSQL "Message Flow" — the state machine.
+    <li>PostgreSQL Documentation, <em>Message Flow</em> — the startup, authentication, simple
+      query, error recovery, and <code>ReadyForQuery</code> state machine.<sup class="cite"><a
+      href="#ref-1">1</a></sup>
       <a href="https://www.postgresql.org/docs/current/protocol-flow.html" rel="external">postgresql.org/docs/current/protocol-flow.html</a></li>
+    <li>PostgreSQL Documentation, <em>Appendix A: PostgreSQL Error Codes</em> — the SQLSTATE
+      codes (<code>42601</code>, <code>42P01</code>, <code>42703</code>, <code>40001</code>,
+      <code>XX000</code>) your <code>ErrorResponse</code> encoder emits.<sup class="cite"><a
+      href="#ref-3">3</a></sup>
+      <a href="https://www.postgresql.org/docs/current/errcodes-appendix.html" rel="external">postgresql.org/docs/current/errcodes-appendix.html</a></li>
   </ul>
 
   <h2 id="sec-arch">Where this fits</h2>
   <figure>
     <div id="arch-diagram"></div>
-    <figcaption>Figure 1 — the last two boxes light up: the protocol server, and the client
-    that is finally not your REPL.</figcaption>
+    <figcaption>Figure 1 — FerricDB architecture. The final two boxes light up: the PostgreSQL
+    wire-protocol server sitting atop <code>ferricdb-exec</code>, and real external clients
+    (<code>psql</code> and PostgreSQL drivers) talking to your engine over TCP.</figcaption>
   </figure>
 
-  <h2 id="sec-spec">Specification</h2>
-  <p>You implement <code>crates/server</code> and the <code>--serve</code> flag:</p>
+  <p>The server crate sits at the top of the dependency DAG: <code>ferricdb-server</code> depends
+  on <code>ferricdb-common</code>, <code>ferricdb-exec</code>, <code>ferricdb-catalog</code>,
+  <code>ferricdb-txn</code>, <code>tokio</code>, and <code>bytes</code>. It knows nothing about
+  slotted pages, B+Trees, or WAL records — every SQL string flows straight into
+  <code>ferricdb_exec::execute</code> on a per-connection <code>ExecContext</code> session, and
+  every result or error translates back into PostgreSQL wire frames.</p>
 
-  <pre><code>pub mod protocol {
-    pub enum FrontendMessage { StartupMessage { params: Vec&lt;(String, String)&gt; },
-        Query { sql: String }, Parse {..}, Bind {..}, Execute {..},
-        Describe {..}, Sync, Terminate, PasswordMessage { password: String } }
-    pub enum BackendMessage { AuthenticationOk, AuthenticationCleartextPassword,
-        ParameterStatus { name: String, value: String }, BackendKeyData {..},
-        ReadyForQuery { txn_status: u8 }, RowDescription { fields: Vec&lt;FieldDescription&gt; },
-        DataRow { values: Vec&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt; }, CommandComplete { tag: String },
+  <h2 id="sec-spec">Specification</h2>
+  <p>From <code>course/ferricdb/docs/api-spec.md</code>,
+  <code>course/ferricdb/crates/server/src/protocol.rs</code>, and
+  <code>course/ferricdb/crates/server/src/lib.rs</code> — the complete verbatim public API to
+  implement in <code>course/ferricdb/crates/server</code>:</p>
+
+  <pre><code>// crates/server/src/protocol.rs — verbatim public surface
+
+/// PostgreSQL frontend/backend protocol v3, hand-rolled incremental framing.
+pub mod protocol {
+    pub const PROTOCOL_VERSION: u32 = 196608; // 3.0
+    pub const SSL_REQUEST_CODE: u32 = 80877103;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum FrontendMessage {
+        SslRequest,
+        StartupMessage { params: Vec&lt;(String, String)&gt; },
+        Query { sql: String },
+        Parse { statement: String, sql: String, param_types: Vec&lt;u32&gt; },
+        Bind { portal: String, statement: String, params: Vec&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt; },
+        Execute { portal: String, max_rows: i32 },
+        Describe { kind: u8, name: String },
+        Sync,
+        Terminate,
+        PasswordMessage { password: String },
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum BackendMessage {
+        AuthenticationOk,
+        AuthenticationCleartextPassword,
+        ParameterStatus { name: String, value: String },
+        BackendKeyData { process_id: u32, secret_key: u32 },
+        ReadyForQuery { txn_status: u8 },
+        RowDescription { fields: Vec&lt;FieldDescription&gt; },
+        DataRow { values: Vec&lt;Option&lt;Vec&lt;u8&gt;&gt;&gt; },
+        CommandComplete { tag: String },
         ErrorResponse { severity: String, code: String, message: String },
-        EmptyQueryResponse, ParseComplete, BindComplete }
-    pub struct FieldDescription { pub name: String, pub type_oid: u32,
-                                  pub type_len: i16 }
-    pub fn read_message(...) -&gt; Result&lt;FrontendMessage&gt;;
-    pub fn write_message(...) -&gt; Result&lt;()&gt;;
+        EmptyQueryResponse,
+        ParseComplete,
+        BindComplete,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct FieldDescription {
+        pub name: String,
+        pub type_oid: u32,
+        pub type_len: i16,
+    }
+
+    // Incremental non-blocking wire codecs (Ok(None) = need more bytes)
+    pub fn read_message(buf: &amp;mut bytes::BytesMut, startup: bool) -&gt; Result&lt;Option&lt;FrontendMessage&gt;&gt;;
+    pub fn write_message(buf: &amp;mut bytes::BytesMut, msg: &amp;BackendMessage) -&gt; Result&lt;()&gt;;
+    pub fn write_frontend_message(buf: &amp;mut bytes::BytesMut, msg: &amp;FrontendMessage) -&gt; Result&lt;()&gt;;
+    pub fn read_backend_message(buf: &amp;mut bytes::BytesMut) -&gt; Result&lt;Option&lt;BackendMessage&gt;&gt;;
 }
 
-pub struct ServerConfig { pub addr: String /* default 127.0.0.1:5433 */,
-                          pub password: Option&lt;String&gt; }
-pub struct Server { /* ExecContext factory */ }
+// crates/server/src/lib.rs — verbatim public surface
+pub struct ServerConfig {
+    pub addr: String,               // default "127.0.0.1:5433"
+    pub password: Option&lt;String&gt;,
+}
+pub struct Server { /* config, Arc&lt;ExecContext&gt; */ }
 impl Server {
     pub fn new(config: ServerConfig, ctx: std::sync::Arc&lt;ExecContext&gt;) -&gt; Self;
-    pub async fn run(self) -&gt; Result&lt;()&gt;;   // tokio TCP accept loop
+    pub async fn run(self) -&gt; Result&lt;()&gt;;                                 // bind config.addr + serve
+    pub async fn serve(self, listener: tokio::net::TcpListener) -&gt; Result&lt;()&gt;;
 }</code></pre>
 
-  <p>Behavioral contract:</p>
+  <p>Key requirements across the codec and live server:</p>
   <ul>
-    <li><strong>Framing:</strong> type byte + self-inclusive Int32 length, big-endian, except
-      StartupMessage (length-only). Reject SSL requests politely (respond <code>'N'</code>) and
-      ignore CancelRequest connections gracefully.<sup class="cite"><a href="#ref-3">3</a></sup></li>
-    <li><strong>Startup:</strong> trust auth by default (AuthenticationOk immediately);
-      cleartext password when configured. Then at least two ParameterStatus messages
-      (<code>server_version</code> — report a Postgres-compatible string —,
-      <code>client_encoding</code> UTF8), BackendKeyData (any values), ReadyForQuery('I').<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Simple query:</strong> route the SQL through <code>execute()</code>; SELECTs
-      produce RowDescription (type OIDs: bool 16, int8 20, float8 701, text 25; values in text
-      format) then DataRows (NULL as length −1) then CommandComplete (<code>SELECT n</code>,
-      <code>INSERT 0 n</code>, <code>UPDATE n</code>, <code>DELETE n</code>); every cycle ends
-      with ReadyForQuery carrying the true transaction status
-      (I/T/E).<sup class="cite"><a href="#ref-3">3</a></sup> Empty query string →
-      EmptyQueryResponse. Errors → ErrorResponse with mapped SQLSTATE
-      (Serialization → 40001, parse → 42601, everything else → XX000-style fallback), then
-      ReadyForQuery — always.</li>
-    <li><strong>Sessions:</strong> one tokio task per connection, each with its own transaction
-      slot; BEGIN/COMMIT work per session exactly as in the REPL; a dropped connection with an
-      open transaction rolls it back.</li>
-    <li><strong>Extended protocol (optional):</strong> Parse/Bind/Execute/Describe/Sync for the
-      unnamed statement and portal is enough to satisfy most drivers' simple use.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>All four codec functions are required.</strong> <code>read_message</code> and
+      <code>write_message</code> drive the server; <code>write_frontend_message</code> and
+      <code>read_backend_message</code> are their client-side mirrors used by the provided
+      round-trip and live-TCP tests. Every extended-protocol variant (<code>Parse</code>,
+      <code>Bind</code>, <code>Execute</code>, <code>Describe</code>, <code>Sync</code>,
+      <code>ParseComplete</code>, <code>BindComplete</code>) <strong>must</strong> encode and
+      decode accurately in the codec (tested by <code>ms10_frontend_roundtrips</code> and
+      <code>ms10_backend_roundtrips</code>); wiring extended-protocol execution inside
+      <code>Server::serve</code> is an optional stretch once simple queries pass.</li>
+    <li><strong>Incremental, non-destructive decoding:</strong> when <code>buf</code> holds fewer
+      bytes than a complete frame requires, <code>read_message</code> and
+      <code>read_backend_message</code> return <code>Ok(None)</code> and leave <code>buf</code>
+      <strong>completely untouched</strong> (do not call <code>advance()</code> until you know
+      the entire message is present and valid!). When a full message is available, parse it and
+      consume its exact byte count from the front of <code>buf</code>.<sup class="cite"><a
+      href="#ref-4">4</a></sup></li>
+    <li><strong>Strict validation:</strong> decode every wire length header as a <strong>signed
+      <code>i32</code></strong> (big-endian). Reject any length <code>&lt; 4</code> (including
+      negative values like <code>-1</code>) immediately with <code>Err(Error::Protocol(_))</code>
+      rather than casting to <code>u32</code> and hanging for 4 GiB. For
+      <code>startup == true</code>, lengths <code>&lt; 8</code> and codes other than
+      <code>PROTOCOL_VERSION</code> (<code>196608</code>) or <code>SSL_REQUEST_CODE</code>
+      (<code>80877103</code>) return <code>Err(Error::Protocol(_))</code>. In both encoders,
+      reject C-string fields containing interior NUL (<code>\0</code>) bytes or column/parameter
+      counts exceeding <code>i16::MAX</code> with <code>Err(Error::Protocol(_))</code>.</li>
+    <li><strong>Server lifecycle:</strong> <code>Server::run</code> binds
+      <code>self.config.addr</code> (course default <code>127.0.0.1:5433</code> — one port above
+      PostgreSQL's default <code>5432</code> so both run side by side) and delegates to
+      <code>self.serve(listener)</code>. Splitting <code>serve(listener)</code> out lets
+      <code>ms10_server_ssl_decline_and_simple_query_over_tcp</code> bind an ephemeral port
+      <code>127.0.0.1:0</code> cleanly in tests.</li>
   </ul>
 
+  <h2 id="sec-wire">Wire format quick reference</h2>
+  <p>Every integer is big-endian (network byte order); every string is UTF-8 followed by a
+  <code>0x00</code> NUL byte unless noted; and every length field counts <strong>itself (4 bytes)
+  plus the body</strong>, excluding any leading type byte.<sup class="cite"><a
+  href="#ref-2">2</a></sup> Keep this summary table beside you while writing
+  <code>protocol.rs</code>:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Direction / Type</th><th>Message</th><th>Exact body layout &amp; rules</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>FE · <em>no type byte</em></td>
+          <td><code>SslRequest</code></td>
+          <td><code>Int32(8)</code>, <code>Int32(80877103)</code> (8 bytes total; decoded when <code>startup == true</code>).</td>
+        </tr>
+        <tr>
+          <td>FE · <em>no type byte</em></td>
+          <td><code>StartupMessage</code></td>
+          <td><code>Int32(len)</code>, <code>Int32(196608)</code>, repeated <code>key\0value\0</code>, final <code>\0</code>.</td>
+        </tr>
+        <tr>
+          <td>FE · <code>'Q'</code> / <code>'p'</code></td>
+          <td><code>Query</code> / <code>PasswordMessage</code></td>
+          <td>Single C-string (<code>sql\0</code> or <code>password\0</code>). Note lowercase <code>'p'</code> for password!</td>
+        </tr>
+        <tr>
+          <td>FE · <code>'P'</code> / <code>'B'</code> / <code>'D'</code> / <code>'E'</code> / <code>'S'</code> / <code>'X'</code></td>
+          <td>Extended &amp; control</td>
+          <td><code>Parse</code>: <code>stmt\0</code>, <code>sql\0</code>, <code>i16(n)</code>, <code>n × u32</code> OIDs.
+            <code>Bind</code>: <code>portal\0</code>, <code>stmt\0</code>, <code>i16(0)</code> param fmts, <code>i16(n)</code>, <code>n × (i32(-1) | i32(len)+bytes)</code>, <code>i16(0)</code> result fmts.
+            <code>Describe</code>: <code>u8</code> (<code>'S'</code>/<code>'P'</code>), <code>name\0</code>.
+            <code>Execute</code>: <code>portal\0</code>, <code>i32(max_rows)</code>.
+            <code>Sync</code> / <code>Terminate</code>: empty body (<code>len = 4</code>).</td>
+        </tr>
+        <tr>
+          <td>BE · <code>'R'</code></td>
+          <td><code>AuthenticationOk</code> / <code>Cleartext</code></td>
+          <td><code>Int32(0)</code> for Ok; <code>Int32(3)</code> for CleartextPassword (<code>len = 8</code>).</td>
+        </tr>
+        <tr>
+          <td>BE · <code>'S'</code> / <code>'K'</code> / <code>'Z'</code></td>
+          <td><code>ParameterStatus</code> / <code>BackendKeyData</code> / <code>ReadyForQuery</code></td>
+          <td><code>'S'</code>: <code>name\0</code>, <code>value\0</code> (send at least <code>server_version</code> &amp; <code>client_encoding = UTF8</code>).
+            <code>'K'</code>: <code>u32(pid)</code>, <code>u32(secret)</code>.
+            <code>'Z'</code>: 1 byte — <code>b'I'</code> idle, <code>b'T'</code> in txn, <code>b'E'</code> failed txn.</td>
+        </tr>
+        <tr>
+          <td>BE · <code>'T'</code></td>
+          <td><code>RowDescription</code></td>
+          <td><code>i16(n)</code>, then per field: <code>name\0</code> + <strong>18 fixed bytes</strong>:
+            <code>table_oid: i32 = 0</code>, <code>attr_num: i16 = 0</code>, <code>type_oid: u32</code>,
+            <code>type_len: i16</code>, <code>type_mod: i32 = -1</code>, <code>format_code: i16 = 0</code> (text).</td>
+        </tr>
+        <tr>
+          <td>BE · <code>'D'</code></td>
+          <td><code>DataRow</code></td>
+          <td><code>i16(n)</code>, then per column: <code>i32(-1)</code> for SQL <code>NULL</code> (no bytes),
+            or <code>i32(bytes.len())</code> followed by raw UTF-8 text bytes (empty string is <code>i32(0)</code>).</td>
+        </tr>
+        <tr>
+          <td>BE · <code>'C'</code> / <code>'I'</code> / <code>'1'</code> / <code>'2'</code></td>
+          <td><code>CommandComplete</code> / empties</td>
+          <td><code>'C'</code>: <code>QueryResult::tag</code> + <code>\0</code> (e.g. <code>"SELECT 3\0"</code>, <code>"INSERT 0 2\0"</code>).
+            <code>'I'</code>, <code>'1'</code>, <code>'2'</code>: empty body (<code>len = 4</code>).</td>
+        </tr>
+        <tr>
+          <td>BE · <code>'E'</code></td>
+          <td><code>ErrorResponse</code></td>
+          <td><code>b'S'</code> + <code>severity\0</code>, <code>b'C'</code> + <code>code\0</code>, <code>b'M'</code> + <code>message\0</code>, final <code>\0</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Map FerricDB's types, text values, and errors consistently onto PostgreSQL conventions:<sup
+  class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-3">3</a></sup></p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>FerricDB type / error</th><th>Wire representation</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>DataType::Boolean</code></td><td>OID <code>16</code>, <code>type_len = 1</code>, text <code>"t"</code> / <code>"f"</code></td><td>PostgreSQL text format for <code>bool</code> is <code>"t"</code> / <code>"f"</code> (not <code>"true"</code>/<code>"false"</code>).</td></tr>
+        <tr><td><code>DataType::Integer</code></td><td>OID <code>20</code> (<code>int8</code>), <code>type_len = 8</code></td><td>Base-10 ASCII text (<code>i.to_string()</code>).</td></tr>
+        <tr><td><code>DataType::Float</code></td><td>OID <code>701</code> (<code>float8</code>), <code>type_len = 8</code></td><td>Decimal ASCII text (<code>format!("{f}")</code>).</td></tr>
+        <tr><td><code>DataType::Text</code></td><td>OID <code>25</code> (<code>text</code>), <code>type_len = -1</code></td><td>Raw UTF-8 bytes without NUL terminator inside <code>DataRow</code>.</td></tr>
+        <tr><td><code>Error::Parse</code></td><td>SQLSTATE <code>"42601"</code></td><td><code>syntax_error</code>.<sup class="cite"><a href="#ref-3">3</a></sup></td></tr>
+        <tr><td><code>Error::Bind</code> / <code>Catalog</code></td><td>SQLSTATE <code>"42P01"</code> / <code>"42703"</code> / <code>"42000"</code></td><td><code>undefined_table</code> / <code>undefined_column</code> / general syntax-access error.<sup class="cite"><a href="#ref-3">3</a></sup></td></tr>
+        <tr><td><code>Error::Serialization</code></td><td>SQLSTATE <code>"40001"</code></td><td><code>serialization_failure</code> — triggers standard client retry loops.<sup class="cite"><a href="#ref-3">3</a></sup></td></tr>
+        <tr><td>All other <code>Error</code> variants</td><td>SQLSTATE <code>"XX000"</code></td><td><code>internal_error</code> fallback.<sup class="cite"><a href="#ref-3">3</a></sup></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="sec-tls">SSL negotiation and going further with TLS</h2>
+  <p>Real PostgreSQL clients — including <code>psql</code> with its default
+  <code>sslmode=prefer</code> and <code>libpq</code> drivers — do <strong>not</strong> send
+  <code>StartupMessage</code> first. Instead, they open every TCP connection with an 8-byte
+  <code>SSLRequest</code> packet: <code>[0x00, 0x00, 0x00, 0x08, 0x04, 0xD2, 0x16, 0x2F]</code>
+  (length <code>8</code>, code <code>80877103</code>).<sup class="cite"><a
+  href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p>Because <code>read_message(&amp;mut buf, true)</code> decodes this natively as
+  <code>FrontendMessage::SslRequest</code>, handling it in <code>Server::serve</code> takes only
+  a few lines: loop while in the startup phase; if the decoded message is
+  <code>FrontendMessage::SslRequest</code>, write the single unframed byte <code>b'N'</code> to
+  the socket and stay in the <code>startup = true</code> loop to read the real
+  <code>StartupMessage</code> that the client sends next. That single byte lets plain
+  <code>psql -h 127.0.0.1 -p 5433 -U ferric</code> connect immediately without forcing users to
+  type <code>sslmode=disable</code>.</p>
+
+  <div class="callout tip">
+    <span class="callout-title">Going further: real TLS (<code>'S'</code>)</span>
+    <p>Declining SSL with <code>b'N'</code> is standard for local loopback development, but
+    sending <code>PasswordMessage</code> (cleartext password auth) or sensitive SQL over a real
+    network requires transport encryption. PostgreSQL's wire protocol upgrades cleanly in place:
+    when your server wants TLS, reply with a single byte <code>b'S'</code> instead of
+    <code>b'N'</code>, immediately run a TLS server handshake over the same
+    <code>TcpStream</code> (for example, wrapping it with <code>tokio-rustls</code> and a local
+    self-signed certificate generated via <code>openssl</code> or <code>rcgen</code>), and then
+    run the exact same startup and query codec over the resulting encrypted
+    <code>AsyncRead + AsyncWrite</code> stream! Once upgraded, <code>psql</code> displays an
+    active TLS cipher banner on connect and protects both passwords and query payloads in
+    transit.<sup class="cite"><a href="#ref-1">1</a></sup> (Keep <code>b'N'</code> as the
+    default when no certificate is configured so <code>ms10_server_ssl_decline_and_simple_query_over_tcp</code>
+    stays green.)</p>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 920 335" role="img">
+      <title>Per-connection server session state machine: Accept TCP creating new_session(),
+      WaitStartup handling SslRequest with 'N' (or 'S' + TLS) before StartupMessage, Auth,
+      Startup Burst sending ParameterStatus, BackendKeyData, and ReadyForQuery('I'), the Ready
+      Loop dispatching Query through spawn_blocking and always returning ReadyForQuery(I/T/E),
+      and Cleanup aborting any open transaction on Terminate or EOF.</title>
+      <defs>
+        <marker id="ms10-f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"></path>
+        </marker>
+      </defs>
+
+      <!-- SSL self-loop above WaitStartup -->
+      <text x="234" y="18" class="d-mono-sm" text-anchor="middle">SslRequest → reply 'N' (or 'S'+TLS)</text>
+      <path d="M 204 58 C 204 26, 264 26, 264 55" class="d-line-hl" marker-end="url(#ms10-f2-arr)"></path>
+
+      <!-- Top row: startup pipeline -->
+      <rect x="16" y="58" width="110" height="54" rx="6" class="d-box"></rect>
+      <text x="71" y="81" class="d-text" font-weight="600" text-anchor="middle">Accept TCP</text>
+      <text x="71" y="99" class="d-mono-sm" text-anchor="middle">new_session()</text>
+
+      <path d="M 126 85 H 158" class="d-line" marker-end="url(#ms10-f2-arr)"></path>
+
+      <rect x="160" y="58" width="148" height="54" rx="6" class="d-box-hl"></rect>
+      <text x="234" y="81" class="d-text" font-weight="600" text-anchor="middle">WaitStartup</text>
+      <text x="234" y="99" class="d-mono-sm" text-anchor="middle">startup = true</text>
+
+      <path d="M 308 85 H 352" class="d-line" marker-end="url(#ms10-f2-arr)"></path>
+      <text x="330" y="77" class="d-text-sm" text-anchor="middle">Startup</text>
+
+      <rect x="354" y="58" width="128" height="54" rx="6" class="d-box"></rect>
+      <text x="418" y="81" class="d-text" font-weight="600" text-anchor="middle">Authenticate</text>
+      <text x="418" y="99" class="d-mono-sm" text-anchor="middle">Ok / Cleartext</text>
+
+      <path d="M 482 85 H 514" class="d-line" marker-end="url(#ms10-f2-arr)"></path>
+
+      <rect x="516" y="58" width="164" height="54" rx="6" class="d-box"></rect>
+      <text x="598" y="81" class="d-text" font-weight="600" text-anchor="middle">Startup Burst</text>
+      <text x="598" y="99" class="d-mono-sm" text-anchor="middle">Param·Key·Ready('I')</text>
+
+      <path d="M 680 85 H 718" class="d-line-hl" marker-end="url(#ms10-f2-arr)"></path>
+
+      <rect x="720" y="58" width="184" height="54" rx="6" class="d-box-good"></rect>
+      <text x="812" y="81" class="d-text" font-weight="600" text-anchor="middle">Ready Loop</text>
+      <text x="812" y="99" class="d-mono-sm" text-anchor="middle">startup=false (I/T/E)</text>
+
+      <!-- Bottom row: Execute, Encode Reply, Cleanup/Close (zero crossing orthogonal layout) -->
+      <rect x="116" y="230" width="276" height="62" rx="6" class="d-box"></rect>
+      <text x="254" y="253" class="d-text" font-weight="600" text-anchor="middle">Send Query Reply</text>
+      <text x="254" y="271" class="d-mono-sm" text-anchor="middle">RowDesc·DataRow*·CmdComplete</text>
+      <text x="254" y="285" class="d-mono-sm" text-anchor="middle">or ErrorResponse → Ready(I/T/E)</text>
+
+      <rect x="434" y="230" width="232" height="62" rx="6" class="d-box-hl"></rect>
+      <text x="550" y="253" class="d-text" font-weight="600" text-anchor="middle">Execute SQL</text>
+      <text x="550" y="271" class="d-mono-sm" text-anchor="middle">tokio::task::spawn_blocking</text>
+      <text x="550" y="285" class="d-mono-sm" text-anchor="middle">ferricdb_exec::execute()</text>
+
+      <rect x="794" y="232" width="114" height="58" rx="6" class="d-box-bad"></rect>
+      <text x="851" y="256" class="d-text" font-weight="600" text-anchor="middle">Close</text>
+      <text x="851" y="275" class="d-mono-sm" text-anchor="middle">abort open txn</text>
+
+      <!-- Orthogonal non-crossing edges -->
+      <!-- Ready (782, 112) down to y=261, left to Execute (666, 261) -->
+      <path d="M 780 112 V 261 H 669" class="d-line-hl" marker-end="url(#ms10-f2-arr)"></path>
+      <text x="772" y="196" class="d-mono-sm" text-anchor="end">Query('Q')</text>
+
+      <!-- Execute (434, 261) left to Send Reply (392, 261) -->
+      <path d="M 434 261 H 395" class="d-line-hl" marker-end="url(#ms10-f2-arr)"></path>
+
+      <!-- Send Reply (254, 230) up to y=160, right to x=746, up to Ready (746, 112) -->
+      <path d="M 254 230 V 160 H 746 V 115" class="d-line" marker-end="url(#ms10-f2-arr)"></path>
+      <text x="500" y="152" class="d-mono-sm" text-anchor="middle">ReadyForQuery('I' | 'T' | 'E') — ALWAYS sent after every query or error</text>
+
+      <!-- Ready (851, 112) straight down to Close (851, 232) -->
+      <path d="M 851 112 V 229" class="d-line" marker-end="url(#ms10-f2-arr)"></path>
+      <text x="858" y="176" class="d-mono-sm" text-anchor="start">Terminate</text>
+      <text x="858" y="191" class="d-mono-sm" text-anchor="start">or EOF</text>
+
+      <!-- Bottom footnote -->
+      <text x="460" y="320" class="d-text-sm" text-anchor="middle">Bad password or Error::Protocol in startup/query sends ErrorResponse (on auth fail) and closes cleanly.</text>
+    </svg>
+    <figcaption>Figure 2 — Per-connection session state machine inside <code>Server::serve</code>:
+    isolated <code>new_session()</code> state, <code>SSLRequest</code> loop, blocking execution
+    bridge, and guaranteed <code>ReadyForQuery</code> completion.<sup class="cite"><a
+    href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-4">4</a></sup></figcaption>
+  </figure>
+
   <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <p>Follow this build order: finish the pure byte codec first while every test runs offline in
+  milliseconds, then build the async session loop, and finally wire <code>--serve</code> and test
+  with live <code>psql</code>.</p>
+
   <ol>
-    <li><strong>Codec first, offline.</strong> Implement <code>read_message</code>/<code>write_message</code>
-      over byte buffers (the <code>bytes</code> crate earns its keep here) and drive them with
-      the ms10_ round-trip tests. Get the length arithmetic perfect now: the tests assert exact
-      byte sequences for Query("SELECT 1") among others, straight from the module's byte
-      explorer.</li>
-    <li><strong>The session state machine as plain code.</strong> A per-connection async
-      function: read startup, answer the auth dance, then loop { read message, dispatch }.
-      Keep it a function of (socket, ExecContext) with no shared mutable state beyond what
-      Milestone 8 already synchronizes.</li>
-    <li><strong>Wire execute().</strong> The result-mapping layer is mechanical: Schema →
-      RowDescription (name + OID per column), rows → text-encoded DataRows, affected counts →
-      tags. Reuse the REPL's value-formatting code — pull it into a shared helper rather than
-      duplicating it.</li>
-    <li><strong>First contact.</strong> <code>cargo run -- --serve</code> then
-      <code>psql -h 127.0.0.1 -p 5433 -U ferric</code>. Expect failure; enjoy it. psql's
-      <code>PGDEBUG</code>-style tracing and a packet capture (<code>tcpdump -X port 5433</code>)
-      are your microscopes. The classic first crash: psql immediately sends a parameterized
-      startup you didn't expect, or an SSLRequest you forgot to decline.</li>
-    <li><strong>Transaction status discipline.</strong> Thread the session's real state into
-      every ReadyForQuery. psql renders it in the prompt (<code>=&gt;</code>,
-      <code>*=&gt;</code>, <code>!=&gt;</code>) — free UI for your MVCC layer.</li>
-    <li><strong>The suite over the wire.</strong> Run the sqllogictest files through a real
-      session: simplest is a small runner mode that pipes each statement through psql
-      (<code>psql -At -c</code>) and compares; if you implemented the extended protocol, run the
-      harness through a Rust Postgres driver instead. Same files, fourth transport — the point
-      of the course's testing pyramid.</li>
-    <li><strong>Concurrency check.</strong> Two psql sessions: BEGIN in both, update the same
-      row, watch first-committer-wins deliver a real 40001 over the wire to the loser. Your
-      whole stack, end to end, standing on every milestone at once.</li>
+    <li>
+      <p><strong>Implement the byte codec in <code>crates/server/src/protocol.rs</code>.</strong>
+      Use <code>bytes::{Buf, BufMut, BytesMut}</code> to avoid manual slice index arithmetic.<sup
+      class="cite"><a href="#ref-4">4</a></sup></p>
+      <ul>
+        <li><em>Encoder helper pattern:</em> for standard framed messages, reserve or build the
+          body in a small scratch <code>BytesMut</code> (or record the length-field offset, append
+          the body, and back-patch the <code>i32</code> length). Check that
+          <code>4 + body.len()</code> fits in <code>i32</code>, write the type byte (omitted for
+          <code>SslRequest</code> and <code>StartupMessage</code>), write
+          <code>(4 + body.len()) as i32</code> in big-endian, then append the body. Write a small
+          helper <code>put_cstring(buf, s)</code> that rejects any interior <code>0x00</code> byte
+          with <code>Err(Error::Protocol(_))</code> before appending <code>s.as_bytes()</code> and
+          <code>0u8</code>.</li>
+        <li><em>Decoder peek-before-consume pattern:</em> never mutate <code>buf</code> until the
+          entire frame has arrived (Figure 3):
+          <ul>
+            <li>When <code>startup == true</code>: if <code>buf.len() &lt; 4</code>, return
+              <code>Ok(None)</code>. Peek <code>len = i32::from_be_bytes(...)</code>. If
+              <code>len &lt; 8</code>, return <code>Err(Error::Protocol(_))</code>. If
+              <code>buf.len() &lt; len as usize</code>, return <code>Ok(None)</code>. Now consume
+              <code>let mut frame = buf.split_to(len as usize);</code>, skip the 4-byte length,
+              read <code>code = frame.get_u32()</code>: match <code>SSL_REQUEST_CODE</code>
+              (verify <code>len == 8</code> → <code>SslRequest</code>) or
+              <code>PROTOCOL_VERSION</code> (parse <code>key\0value\0</code> pairs up to the
+              trailing <code>0x00</code> → <code>StartupMessage</code>); any other code returns
+              <code>Err(Error::Protocol(_))</code>.</li>
+            <li>When <code>startup == false</code>: if <code>buf.len() &lt; 5</code>, return
+              <code>Ok(None)</code>. Peek <code>tag = buf[0]</code> and
+              <code>len = i32::from_be_bytes(buf[1..5])</code>. If <code>len &lt; 4</code>, return
+              <code>Err(Error::Protocol(_))</code>. Total frame bytes = <code>1 + len as usize</code>;
+              if <code>buf.len() &lt; total</code>, return <code>Ok(None)</code>. Consume
+              <code>let mut frame = buf.split_to(total);</code>, advance past the 5-byte header,
+              and decode the body by <code>tag</code> (mirroring the exact same pattern in
+              <code>read_backend_message</code>).</li>
+          </ul>
+        </li>
+      </ul>
+      <p>Run <code>cargo test -p ferricdb-server -- --include-ignored ms10_</code> — the first 10
+      codec tests (all except the live TCP test) should pass immediately!</p>
+    </li>
+
+    <li>
+      <p><strong>Build the per-connection session loop in <code>crates/server/src/lib.rs</code>.</strong>
+      Inside <code>Server::serve(self, listener)</code>, loop on
+      <code>let (socket, _) = listener.accept().await?;</code>. Clone the config password and
+      create an isolated session: <code>let session = Arc::new(self.ctx.new_session());</code>,
+      then <code>tokio::spawn</code> an async handler task per connection (logging any unexpected
+      connection error cleanly without crashing the accept loop). Inside the connection task:</p>
+      <ol>
+        <li>Maintain two buffers: <code>read_buf = BytesMut::with_capacity(4096)</code> and
+          <code>write_buf = BytesMut::with_capacity(4096)</code>.</li>
+        <li><em>Startup loop (<code>startup = true</code>):</em> read from the socket with
+          <code>socket.read_buf(&amp;mut read_buf).await?</code> (return cleanly on <code>0</code>
+          bytes EOF) and call <code>read_message(&amp;mut read_buf, true)?</code>. On
+          <code>SslRequest</code>, write <code>&amp;[b'N']</code> to the socket and continue the
+          startup loop. On <code>StartupMessage</code>, exit the startup loop.</li>
+        <li><em>Authentication:</em> if <code>password</code> is <code>None</code>, encode
+          <code>AuthenticationOk</code>. If <code>Some(expected)</code>, encode
+          <code>AuthenticationCleartextPassword</code>, <strong>flush <code>write_buf</code></strong>
+          so the client actually receives the challenge, read a <code>PasswordMessage</code>
+          (<code>startup = false</code>), and either encode <code>AuthenticationOk</code> on match
+          or send <code>ErrorResponse { severity: "FATAL", code: "28P01", ... }</code> (flushed) and
+          close the connection on mismatch.</li>
+        <li><em>Startup burst:</em> encode <code>ParameterStatus("server_version", "16.0 (FerricDB)")</code>,
+          <code>ParameterStatus("client_encoding", "UTF8")</code>,
+          <code>BackendKeyData { process_id, secret_key }</code>, and
+          <code>ReadyForQuery { txn_status: b'I' }</code>, then flush <code>write_buf</code>.</li>
+        <li><em>Query loop (<code>startup = false</code>):</em> drain <strong>every</strong>
+          complete message already sitting in <code>read_buf</code> via
+          <code>while let Some(msg) = read_message(&amp;mut read_buf, false)?</code> before
+          issuing another <code>socket.read_buf</code> (Figure 3 — a client may pipeline
+          <code>Query</code> and <code>Terminate</code> in a single TCP segment!). On
+          <code>Terminate</code> or TCP EOF, break out of the loop and execute cleanup: if
+          <code>session.current_txn</code> holds an open transaction, run
+          <code>ferricdb_exec::execute("ROLLBACK", &amp;session)</code> inside
+          <code>spawn_blocking</code> so the engine's normal rollback path aborts the transaction
+          (and runs WAL physical undo + CLRs when attached) and dropped clients never leak active
+          snapshots that stall <code>VACUUM</code>.</li>
+      </ol>
+    </li>
+
+    <li>
+      <p><strong>Bridge <code>ferricdb_exec::execute</code> cleanly with <code>spawn_blocking</code>.</strong>
+      <code>ferricdb_exec::execute</code> performs synchronous buffer-pool I/O, disk fsyncs, and
+      <code>std::sync::Mutex</code> locking. Never invoke it directly inside an async task on a
+      tokio worker thread — doing so stalls other concurrent client connections! Instead, clone
+      <code>Arc::clone(&amp;session)</code> and await
+      <code>tokio::task::spawn_blocking(move || ferricdb_exec::execute(&amp;sql, &amp;s)).await</code>.<sup
+      class="cite"><a href="#ref-4">4</a></sup></p>
+      <p>Translate the result onto the wire:</p>
+      <ul>
+        <li>Empty or whitespace/semicolon-only <code>sql</code> (where <code>execute</code>
+          returns an empty <code>Vec&lt;QueryResult&gt;</code>): send
+          <code>EmptyQueryResponse</code>.</li>
+        <li>For each <code>QueryResult</code> in the returned vector:
+          <ul>
+            <li>If <code>res.explain</code> is <code>Some(plan_text)</code>: emit a single-column
+              <code>RowDescription</code> (<code>FieldDescription { name: "QUERY PLAN".into(), type_oid: 25, type_len: -1 }</code>),
+              one <code>DataRow</code> per line of <code>plan_text</code>, and
+              <code>CommandComplete { tag: "EXPLAIN".into() }</code> — just like real PostgreSQL
+              so <code>psql</code> prints <code>EXPLAIN</code> plans as a clean table!</li>
+            <li>Else if <code>!res.schema.columns.is_empty()</code>: emit
+              <code>RowDescription</code> using the OID table above, one <code>DataRow</code> per
+              row (rendering <code>Value::Null</code> as <code>None</code> and
+              <code>Value::Boolean(b)</code> as <code>"t"</code> / <code>"f"</code>), and
+              <code>CommandComplete { tag: res.tag }</code>.</li>
+            <li>Else (DDL / DML / TCL): emit <code>CommandComplete { tag: res.tag }</code>.</li>
+          </ul>
+        </li>
+        <li>On <code>Err(e)</code>: map <code>e</code> to <code>ErrorResponse</code> with the
+          matching SQLSTATE (<code>42601</code>, <code>42P01</code>/<code>42703</code>,
+          <code>40001</code>, or <code>XX000</code>).</li>
+        <li><strong>Always</strong> finish the query cycle by computing the session's live
+          transaction status byte — <code>b'E'</code> if <code>*session.failed_txn.lock().unwrap()</code>,
+          else <code>b'T'</code> if <code>session.current_txn.lock().unwrap().is_some()</code>,
+          else <code>b'I'</code> — and appending <code>ReadyForQuery { txn_status }</code>, then
+          flushing <code>write_buf</code> to the socket.<sup class="cite"><a
+          href="#ref-1">1</a></sup></li>
+      </ul>
+      <p>Now re-run <code>cargo test -p ferricdb-server -- --include-ignored ms10_</code> — all
+      11 tests including <code>ms10_server_ssl_decline_and_simple_query_over_tcp</code> should
+      now pass!</p>
+    </li>
+
+    <li>
+      <p><strong>Wire <code>--serve</code> in <code>crates/ferricdb/src/main.rs</code>.</strong>
+      Open <code>course/ferricdb/crates/ferricdb/src/main.rs</code> around lines 41–47. Because
+      <code>main()</code> stays synchronous for the interactive <code>rustyline</code> REPL, build
+      a <code>tokio::runtime::Runtime::new()</code> inside the <code>if let Some(addr) = serve</code>
+      branch: open the database (using <code>db_path</code> or a temp file), run Milestone 9 WAL
+      recovery + <code>TransactionManager::restore</code> + <code>WalHook</code> wiring, wrap the
+      resulting <code>ExecContext</code> in <code>Arc::new(ctx)</code>, construct
+      <code>Server::new(ServerConfig { addr, password: None }, ctx)</code>, print the listening
+      address to stderr, and call <code>rt.block_on(server.run())</code>.</p>
+    </li>
+
+    <li>
+      <p><strong>First live contact with <code>psql</code> and concurrent sessions.</strong> Start
+      FerricDB in one terminal with
+      <code>cargo run -p ferricdb -- --db /tmp/ferric_wire.db --serve</code>, then connect from a
+      second terminal with <code>psql -h 127.0.0.1 -p 5433 -U ferric</code>. Watch the prompt
+      change from <code>=&gt;</code> to <code>*=&gt;</code> after <code>BEGIN;</code> and to
+      <code>!=&gt;</code> after an error inside a transaction until <code>ROLLBACK;</code> — free
+      UI confirming your <code>ReadyForQuery</code> state machine! If anything hangs or
+      desynchronizes, inspect raw bytes with <code>tcpdump -i lo0 -X port 5433</code> (macOS) or
+      <code>tcpdump -i lo -X port 5433</code> (Linux).</p>
+    </li>
   </ol>
 
+  <figure>
+    <svg viewBox="0 0 920 330" role="img">
+      <title>PostgreSQL v3 wire framing comparison (standard type-byte framing versus typeless
+      SslRequest and StartupMessage) and incremental BytesMut decoding across partial TCP reads
+      and back-to-back pipelined messages.</title>
+      <defs>
+        <marker id="ms10-f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"></path>
+        </marker>
+      </defs>
+
+      <!-- Top half: Framing rules -->
+      <text x="20" y="24" class="d-text" font-weight="600">Wire Framing: Standard Message vs. Typeless Startup Packets</text>
+
+      <!-- Standard message strip -->
+      <rect x="20" y="36" width="84" height="38" rx="4" class="d-box-warn"></rect>
+      <text x="62" y="59" class="d-mono" text-anchor="middle">'Q' (1 B)</text>
+      <rect x="104" y="36" width="136" height="38" rx="4" class="d-box-hl"></rect>
+      <text x="172" y="59" class="d-mono" text-anchor="middle">len=14 (i32, 4 B)</text>
+      <rect x="240" y="36" width="206" height="38" rx="4" class="d-box-good"></rect>
+      <text x="343" y="59" class="d-mono" text-anchor="middle">"SELECT 1;\0" (10 B)</text>
+      <text x="233" y="92" class="d-mono-sm" text-anchor="middle">length = 4 + body (excludes 'Q'; &lt; 4 → Error::Protocol)</text>
+
+      <!-- Startup strips (typeless) -->
+      <rect x="478" y="36" width="96" height="38" rx="4" class="d-box-hl"></rect>
+      <text x="526" y="59" class="d-mono-sm" text-anchor="middle">len=8 (i32)</text>
+      <rect x="574" y="36" width="128" height="38" rx="4" class="d-box-warn"></rect>
+      <text x="638" y="59" class="d-mono-sm" text-anchor="middle">80877103 (SSL)</text>
+
+      <rect x="716" y="36" width="184" height="38" rx="4" class="d-box"></rect>
+      <text x="808" y="59" class="d-mono-sm" text-anchor="middle">len · 196608 · k\0v\0\0</text>
+      <text x="689" y="92" class="d-mono-sm" text-anchor="middle">startup=true (NO type byte): SslRequest or StartupMessage</text>
+
+      <!-- Divider -->
+      <path d="M 20 110 H 900" class="d-line" stroke-dasharray="5 4"></path>
+
+      <!-- Bottom half: Incremental BytesMut decoding -->
+      <text x="20" y="134" class="d-text" font-weight="600">Incremental Decoding Across TCP Chunks (read_message(&amp;mut buf, false))</text>
+
+      <!-- Step 1 -->
+      <rect x="20" y="148" width="260" height="132" rx="6" class="d-box-warn"></rect>
+      <text x="150" y="170" class="d-text" font-weight="600" text-anchor="middle">1. TCP read #1 (7 bytes)</text>
+      <rect x="32" y="184" width="158" height="28" rx="4" class="d-box-hl"></rect>
+      <text x="111" y="202" class="d-mono-sm" text-anchor="middle">'Q' 00 00 00 0E 'S' 'E'</text>
+      <rect x="190" y="184" width="78" height="28" rx="4" class="d-box" stroke-dasharray="4 3"></rect>
+      <text x="229" y="202" class="d-text-sm" text-anchor="middle">need 8 B</text>
+      <text x="150" y="238" class="d-mono-sm" text-anchor="middle">read_message → Ok(None)</text>
+      <text x="150" y="258" class="d-text-sm" text-anchor="middle">buf untouched (all 7 B retained)</text>
+
+      <path d="M 280 214 H 312" class="d-line-hl" marker-end="url(#ms10-f3-arr)"></path>
+
+      <!-- Step 2 -->
+      <rect x="314" y="148" width="280" height="132" rx="6" class="d-box"></rect>
+      <text x="454" y="170" class="d-text" font-weight="600" text-anchor="middle">2. TCP read #2 (+13 bytes)</text>
+      <rect x="326" y="184" width="170" height="28" rx="4" class="d-box-good"></rect>
+      <text x="411" y="202" class="d-mono-sm" text-anchor="middle">Query('SELECT 1;') [15 B]</text>
+      <rect x="496" y="184" width="86" height="28" rx="4" class="d-box-hl"></rect>
+      <text x="539" y="202" class="d-mono-sm" text-anchor="middle">'X' 0..4 [5B]</text>
+      <text x="454" y="238" class="d-mono-sm" text-anchor="middle">buf.len() == 20 (2 messages)</text>
+      <text x="454" y="258" class="d-text-sm" text-anchor="middle">drain in a while loop before next read</text>
+
+      <path d="M 594 214 H 626" class="d-line-hl" marker-end="url(#ms10-f3-arr)"></path>
+
+      <!-- Step 3 -->
+      <rect x="628" y="148" width="272" height="132" rx="6" class="d-box-good"></rect>
+      <text x="764" y="170" class="d-text" font-weight="600" text-anchor="middle">3. while let Some(m) loop</text>
+      <text x="764" y="198" class="d-mono-sm" text-anchor="middle">iter 1 → Some(Query)  (-15 B)</text>
+      <text x="764" y="220" class="d-mono-sm" text-anchor="middle">iter 2 → Some(Term.)  (-5 B)</text>
+      <text x="764" y="242" class="d-mono-sm" text-anchor="middle">iter 3 → Ok(None)     (0 B)</text>
+      <text x="764" y="264" class="d-text-sm" text-anchor="middle">buf empty → await next TCP read</text>
+
+      <text x="460" y="308" class="d-text-sm" text-anchor="middle">TCP is an unframed byte stream: one read can deliver half a message or several back-to-back messages.</text>
+    </svg>
+    <figcaption>Figure 3 — Framing layout and incremental <code>BytesMut</code> decoding:
+    <code>read_message</code> leaves incomplete input untouched, and the server drains every
+    buffered message in a loop before waiting on TCP again.<sup class="cite"><a
+    href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-4">4</a></sup></figcaption>
+  </figure>
+
   <h2 id="sec-tests">Test plan</h2>
-  <pre><code>cargo test -p ferricdb-server -- --include-ignored ms10_   # codec round-trips
-cargo run -- --db /tmp/wire.db --serve &amp;
-psql -h 127.0.0.1 -p 5433 -U ferric -c "SELECT 1;"          # the handshake proof
-# then the full slt suite through a live session (see guidance step 6)</code></pre>
-  <p>The ms10_ group is pure codec: encode/decode round-trips for every message, exact-byte
-  assertions (length includes itself, excludes type byte; StartupMessage typeless; DataRow NULL
-  as −1), and malformed-length rejection. Everything beyond the codec is validated live — this
-  milestone's definition of done is unusually external.</p>
+  <p>Run the provided <code>ms10_</code> suite (10 pure codec tests + 1 live async TCP test)
+  followed by live <code>psql</code> verification:</p>
+  <pre><code># 1. All 11 provided tests in ferricdb-server (codec + live TCP SSL-decline &amp; query)
+cargo test -p ferricdb-server -- --include-ignored ms10_
+
+# 2. Launch the server with a persistent DB file (in terminal 1)
+cargo run -p ferricdb -- --db /tmp/wire.db --serve
+
+# 3. Connect with real psql — no sslmode=disable needed once 'N' is handled (terminal 2)
+psql -h 127.0.0.1 -p 5433 -U ferric -c "SELECT 1 + 1;"
+
+# 4. Run full end-to-end regressions
+cargo test -p ferricdb -- --include-ignored slt_all</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Provided <code>ms10_</code> tests (<code>crates/server/tests/protocol.rs</code>)</th><th>What they verify</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ms10_query_select_1_exact_bytes</code>, <code>ms10_startup_message_has_no_type_byte</code>, <code>ms10_datarow_null_is_minus_one</code>, <code>ms10_ssl_request_roundtrip_and_exact_bytes</code></td>
+          <td>Exact wire bytes: self-inclusive length excluding type byte, typeless <code>StartupMessage</code> &amp; <code>SslRequest</code>, and <code>DataRow</code> distinguishing NULL (<code>-1</code>) from empty string (<code>0</code>).</td>
+        </tr>
+        <tr>
+          <td><code>ms10_frontend_roundtrips</code>, <code>ms10_backend_roundtrips</code></td>
+          <td>Lossless encode/decode round-trip for every <code>FrontendMessage</code> (including extended-protocol variants) and every <code>BackendMessage</code>.</td>
+        </tr>
+        <tr>
+          <td><code>ms10_partial_message_returns_none_and_keeps_bytes</code>, <code>ms10_two_messages_in_one_buffer_parse_in_order</code></td>
+          <td>Incremental non-blocking <code>BytesMut</code> behavior: partial frames return <code>Ok(None)</code> without consuming bytes, and pipelined frames drain sequentially.</td>
+        </tr>
+        <tr>
+          <td><code>ms10_malformed_length_is_a_protocol_error</code>, <code>ms10_negative_length_and_bad_startup_version_error</code></td>
+          <td>Immediate <code>Err(Error::Protocol)</code> on lengths <code>&lt; 4</code>, negative signed <code>i32</code> lengths (<code>-1</code>), and unknown startup protocol codes.</td>
+        </tr>
+        <tr>
+          <td><code>ms10_server_ssl_decline_and_simple_query_over_tcp</code></td>
+          <td>Live async TCP test binding <code>127.0.0.1:0</code>: sends <code>SslRequest</code> → expects <code>b'N'</code> → sends <code>StartupMessage</code> → expects <code>AuthenticationOk</code> + <code>ReadyForQuery('I')</code> → runs <code>SELECT 1 + 1;</code> → expects <code>DataRow(["2"])</code> → sends <code>Terminate</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Live multi-client &amp; durability verification:</strong> once <code>psql</code>
+  connects, run two interactive demonstrations that exercise every single milestone in the
+  course simultaneously:</p>
+  <ol>
+    <li><strong>Two concurrent <code>psql</code> terminals:</strong> create a table
+      <code>acct(id INTEGER PRIMARY KEY, bal INTEGER)</code> with <code>(1, 100)</code>. Run
+      <code>BEGIN;</code> in both terminals; verify terminal A still reads <code>100</code> after
+      terminal B updates <code>bal = 150</code> and commits (snapshot isolation live over TCP!).
+      Next, start two fresh <code>BEGIN;</code> blocks, have both terminals run
+      <code>UPDATE acct SET bal = bal + 10 WHERE id = 1;</code>, commit terminal A, and watch
+      terminal B receive a real PostgreSQL <code>ERROR: ... (40001)</code> over the wire!</li>
+    <li><strong>Crash recovery over the wire:</strong> start a transaction in <code>psql</code>,
+      insert a row without committing, insert and commit another row in a second terminal, send
+      <code>SIGKILL</code> (<code>kill -9</code>) to the <code>ferricdb</code> server, restart
+      <code>ferricdb --db /tmp/wire.db --serve</code>, reconnect with <code>psql</code>, and
+      verify that the committed row survived and the uncommitted row vanished.</li>
+  </ol>
 
   <h2 id="sec-pitfalls">Common pitfalls</h2>
   <div class="callout pitfall">
-    <span class="callout-title">Length-field off-by-one</span>
-    <p><em>Symptom:</em> psql connects then hangs or reports garbled messages. <em>Cause:</em>
-    counting the type byte in the length, or not counting the length field itself. One wrong
-    constant desynchronizes every subsequent message on the stream. The exact-byte tests exist
-    to catch this before psql does.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+    <span class="callout-title">Pitfall — signed vs. unsigned length decoding and off-by-one framing</span>
+    <p><em>Symptom:</em> <code>ms10_negative_length_and_bad_startup_version_error</code> hangs or
+    returns <code>Ok(None)</code> instead of <code>Err(Error::Protocol)</code>, or
+    <code>psql</code> stalls after the first message. <em>Cause:</em> decoding the 4-byte length
+    as <code>u32</code> (so <code>-1</code> looks like a 4 GiB partial frame waiting for more
+    bytes), or counting the type byte inside the length field. Always decode lengths as
+    big-endian <code>i32</code>, reject <code>&lt; 4</code> immediately, and remember the length
+    counts itself plus body, never the type byte.<sup class="cite"><a href="#ref-2">2</a></sup></p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Missing ReadyForQuery after an error</span>
-    <p><em>Symptom:</em> the first bad statement freezes the session. <em>Cause:</em> the error
-    path returns early. ErrorResponse tells the client what went wrong; ReadyForQuery tells it
-    that it may speak again. Both, every time.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+    <span class="callout-title">Pitfall — omitting <code>ReadyForQuery</code> after an error or empty query</span>
+    <p><em>Symptom:</em> <code>psql</code> freezes forever after the first syntax error, failed
+    transaction, or bare <code>;</code>. <em>Cause:</em> returning early on <code>Err(e)</code>
+    or empty SQL without emitting <code>ReadyForQuery</code>. Both <code>ErrorResponse</code> and
+    <code>EmptyQueryResponse</code> must always be followed by <code>ReadyForQuery</code> with
+    the session's true transaction status (<code>'I'</code>, <code>'T'</code>, or
+    <code>'E'</code>).<sup class="cite"><a href="#ref-1">1</a></sup></p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Forgetting the SSLRequest and empty query</span>
-    <p><em>Symptom:</em> psql fails before authentication, or a bare semicolon kills the
-    session. Modern psql opens with an SSLRequest (answer <code>'N'</code> and it retries
-    plaintext) and really does send empty query strings (answer EmptyQueryResponse).<sup class="cite"><a href="#ref-1">1</a></sup></p>
+    <span class="callout-title">Pitfall — blocking tokio workers or sharing one <code>ExecContext</code></span>
+    <p><em>Symptom:</em> one client's <code>BEGIN</code> puts every connected <code>psql</code>
+    session inside the same transaction, or a slow query freezes every other client's handshake.
+    <em>Cause:</em> passing <code>self.ctx</code> directly instead of calling
+    <code>self.ctx.new_session()</code> per accepted TCP connection, or calling synchronous
+    <code>ferricdb_exec::execute</code> directly on a tokio worker thread instead of wrapping it
+    in <code>tokio::task::spawn_blocking</code>.<sup class="cite"><a href="#ref-4">4</a></sup></p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Sharing one transaction across sessions</span>
-    <p><em>Symptom:</em> one client's BEGIN puts every client in a transaction. <em>Cause:</em>
-    the transaction slot living in the shared ExecContext instead of per-session state. The
-    two-psql concurrency check in the guidance catches it immediately.</p>
+    <span class="callout-title">Pitfall — forgetting to drain multiple buffered messages or encoding booleans as <code>"true"</code></span>
+    <p><em>Symptom:</em> <code>ms10_two_messages_in_one_buffer_parse_in_order</code> fails, a
+    pipelined <code>Terminate</code> hangs until timeout, or Postgres drivers fail to parse
+    boolean columns. <em>Cause:</em> calling <code>read_message</code> once per
+    <code>read_buf</code> instead of looping <code>while let Some(msg) = read_message(...)</code>,
+    or formatting <code>Value::Boolean</code> with Rust's <code>to_string()</code> instead of
+    PostgreSQL's wire text representation <code>"t"</code> / <code>"f"</code> for OID
+    <code>16</code>.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — leaking an active transaction when a client disconnects</span>
+    <p><em>Symptom:</em> killing a <code>psql</code> terminal with <code>Ctrl-C</code> /
+    <code>kill</code> while inside <code>BEGIN</code> permanently pins
+    <code>oldest_visible_xid()</code> so <code>VACUUM</code> never reclaims dead versions.
+    <em>Cause:</em> breaking out of the connection loop on TCP EOF without checking
+    <code>session.current_txn</code> and calling <code>txn_manager.abort(&amp;txn)</code>.</p>
   </div>
 
   <h2 id="sec-done">Definition of done</h2>
   <ul>
-    <li><code>ms10_</code> codec tests pass.</li>
-    <li><code>psql -h localhost -p 5433</code> connects, runs CREATE/INSERT/SELECT/UPDATE/DELETE
-      with correct output and tags, survives SQL errors, and shows transaction state in its
-      prompt.</li>
-    <li>The full sqllogictest suite passes through a real psql session.</li>
-    <li>Two concurrent psql sessions demonstrate snapshot isolation and a wire-delivered 40001
-      on write conflict.</li>
-    <li>Kill the server mid-transaction, restart with recovery (Milestone 9), reconnect:
-      committed data present, uncommitted gone — the whole course in one demo.</li>
+    <li>All 11 <code>ms10_</code> tests in <code>ferricdb-server</code> pass (both the 10 offline
+      codec tests and the live TCP <code>ms10_server_ssl_decline_and_simple_query_over_tcp</code>
+      test), and all earlier milestone suites plus <code>slt_all</code> pass.</li>
+    <li><code>ferricdb --db /tmp/wire.db --serve</code> starts cleanly and plain
+      <code>psql -h 127.0.0.1 -p 5433 -U ferric</code> connects without needing
+      <code>sslmode=disable</code>, executes <code>CREATE TABLE</code>, <code>INSERT</code>,
+      <code>SELECT</code>, <code>UPDATE</code>, <code>DELETE</code>, <code>EXPLAIN</code>,
+      <code>ANALYZE</code>, and <code>VACUUM</code>, recovers gracefully from SQL errors, and
+      reflects <code>=&gt;</code> / <code>*=&gt;</code> / <code>!=&gt;</code> transaction status
+      in its prompt.</li>
+    <li>Two concurrent <code>psql</code> terminals demonstrate live MVCC snapshot isolation and a
+      wire-delivered SQLSTATE <code>40001</code> serialization error on conflicting updates.</li>
+    <li>Running the <code>.slt</code> queries through a live server session (e.g. scripting
+      statements via <code>psql -At</code>) matches the in-process results.</li>
+    <li>Killing the server with <code>SIGKILL</code> mid-transaction, restarting it with
+      Milestone 9 ARIES recovery, and reconnecting with <code>psql</code> shows committed rows
+      intact and uncommitted rows gone — the entire FerricDB stack working end to end.</li>
   </ul>
 
   <h2 id="sec-quiz">Check your understanding</h2>
-  <fieldset class="quiz" data-explain="The StartupMessage is the one typeless message — Int32 length then Int32 version then parameters. There is nothing to disambiguate at stream start, and special version values (SSLRequest, CancelRequest) do the job a type byte would.">
-    <legend class="quiz-q">What is structurally unique about StartupMessage?</legend>
-    <label><input type="radio" name="q1"> It is the only message with a checksum</label>
-    <label><input type="radio" name="q1" data-correct> It has no type byte — just length, version, and parameters</label>
-    <label><input type="radio" name="q1"> It is sent by the server, not the client</label>
+  <fieldset class="quiz" data-explain="Both SslRequest and StartupMessage omit the 1-byte type tag — they begin immediately with the big-endian Int32 total packet length followed by an Int32 protocol code (80877103 for SSLRequest, 196608 for protocol 3.0). That is why read_message takes a startup: bool flag.">
+    <legend class="quiz-q">1. What is structurally unique about <code>SslRequest</code> and <code>StartupMessage</code> compared with every later message?</legend>
+    <label><input type="radio" name="q-ms10-1"> They use little-endian lengths instead of big-endian</label>
+    <label><input type="radio" name="q-ms10-1" data-correct> They have no leading type byte — just an <code>Int32</code> length followed by the <code>Int32</code> code/version</label>
+    <label><input type="radio" name="q-ms10-1"> They are sent by the backend server immediately after TCP accept</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
-  <fieldset class="quiz" data-explain="Mapping Error::Serialization to SQLSTATE 40001 means every Postgres client library's existing retry logic works against FerricDB unchanged — the entire point of speaking a shared protocol. Invent your own code and every client needs custom handling.">
-    <legend class="quiz-q">Why must a FerricDB write-conflict abort surface as SQLSTATE 40001 specifically?</legend>
-    <label><input type="radio" name="q2"> The protocol rejects unknown SQLSTATE values</label>
-    <label><input type="radio" name="q2" data-correct> Existing Postgres clients already retry on 40001 — compatibility is the product</label>
-    <label><input type="radio" name="q2"> psql crashes on other codes</label>
+
+  <fieldset class="quiz" data-explain="PostgreSQL clients and ORMs inspect the 5-character SQLSTATE code, not the human-readable message string. Mapping Error::Serialization to SQLSTATE 40001 lets standard Postgres retry middleware automatically catch and retry FerricDB write conflicts with zero custom code.">
+    <legend class="quiz-q">2. Why must a FerricDB <code>Error::Serialization</code> abort travel inside <code>ErrorResponse</code> with SQLSTATE <code>40001</code> specifically?</legend>
+    <label><input type="radio" name="q-ms10-2"> The wire protocol drops any <code>ErrorResponse</code> whose code does not start with <code>40</code></label>
+    <label><input type="radio" name="q-ms10-2" data-correct> Existing PostgreSQL clients and drivers already recognize <code>40001</code> as a retryable serialization failure</label>
+    <label><input type="radio" name="q-ms10-2"> <code>psql</code> terminates the connection on any other SQLSTATE</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="ExecContext::new_session() shares the database's catalog, buffer pool, transaction manager, and WAL while giving each TCP client its own current_txn and failed_txn mutexes. Running execute() inside tokio::task::spawn_blocking moves synchronous disk I/O and lock waits onto tokio's blocking thread pool so async network I/O for other clients never stalls.">
+    <legend class="quiz-q">3. Why does <code>Server::serve</code> both call <code>self.ctx.new_session()</code> per connection and run <code>ferricdb_exec::execute</code> inside <code>tokio::task::spawn_blocking</code>?</legend>
+    <label><input type="radio" name="q-ms10-3"> Because <code>ferricdb_exec::execute</code> cannot run unless each client creates a separate database file</label>
+    <label><input type="radio" name="q-ms10-3" data-correct> <code>new_session()</code> isolates each client's transaction state while sharing the database, and <code>spawn_blocking</code> prevents synchronous I/O and mutexes from stalling tokio worker threads</label>
+    <label><input type="radio" name="q-ms10-3"> Because <code>tokio::net::TcpListener</code> refuses connections unless <code>spawn_blocking</code> is called first</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
@@ -246,32 +858,41 @@ psql -h 127.0.0.1 -p 5433 -U ferric -c "SELECT 1;"          # the handshake proo
     <div class="refs">
       <ol>
         <li id="ref-1">PostgreSQL Documentation, "Frontend/Backend Protocol — Message Flow" —
-          startup/auth, simple and extended query cycles, error handling and ReadyForQuery
-          discipline.
+          <code>SSLRequest</code> negotiation (<code>'N'</code> / <code>'S'</code>), startup and
+          authentication, simple/extended query cycles, error handling, and
+          <code>ReadyForQuery</code> discipline.
           <a href="https://www.postgresql.org/docs/current/protocol-flow.html" rel="external">https://www.postgresql.org/docs/current/protocol-flow.html</a></li>
-        <li id="ref-2">sunng87/pgwire — the escape-hatch crate: startup, simple query, and
-          extended query sub-protocols, with a SQLite-backed example server.
-          <a href="https://github.com/sunng87/pgwire" rel="external">https://github.com/sunng87/pgwire</a>
-          (docs: <a href="https://docs.rs/pgwire/latest/pgwire/" rel="external">docs.rs/pgwire</a>)</li>
-        <li id="ref-3">PostgreSQL Documentation, "Message Formats" — byte-exact layouts for the
-          codec: framing lengths, StartupMessage, RowDescription/DataRow, CommandComplete tags,
-          ErrorResponse fields, ReadyForQuery status byte.
+        <li id="ref-2">PostgreSQL Documentation, "Message Formats" — byte-exact layouts for the
+          hand-rolled codec: big-endian self-inclusive lengths, typeless startup packets,
+          <code>RowDescription</code>, <code>DataRow</code> (<code>-1</code> NULL),
+          <code>CommandComplete</code> tags, <code>ErrorResponse</code> fields, and
+          <code>ReadyForQuery</code> status byte.
           <a href="https://www.postgresql.org/docs/current/protocol-message-formats.html" rel="external">https://www.postgresql.org/docs/current/protocol-message-formats.html</a></li>
+        <li id="ref-3">PostgreSQL Documentation, "Appendix A. PostgreSQL Error Codes" — canonical
+          SQLSTATE codes (<code>42601</code>, <code>42P01</code>, <code>42703</code>,
+          <code>40001</code>, <code>XX000</code>).
+          <a href="https://www.postgresql.org/docs/current/errcodes-appendix.html" rel="external">https://www.postgresql.org/docs/current/errcodes-appendix.html</a></li>
+        <li id="ref-4"><code>bytes</code> and <code>tokio</code> API Documentation — incremental
+          <code>BytesMut</code> framing and <code>tokio::task::spawn_blocking</code> for bridging
+          synchronous storage/execution into an async accept loop.
+          <a href="https://docs.rs/bytes/latest/bytes/" rel="external">https://docs.rs/bytes/latest/bytes/</a>
+          and <a href="https://docs.rs/tokio/latest/tokio/" rel="external">https://docs.rs/tokio/latest/tokio/</a></li>
       </ol>
     </div>
 
     <h2 id="sec-deeper">Go deeper</h2>
     <ul>
-      <li>Protocol docs, "SASL Authentication" — what implementing SCRAM (the modern default)
-        would take beyond this milestone's trust/cleartext.
+      <li>PostgreSQL docs, "Secure TCP/IP Connections with SSL" — TLS handshake modes
+        (<code>prefer</code>, <code>require</code>, <code>verify-full</code>) and certificate
+        configuration if you implement the optional <code>'S'</code> TLS upgrade.
+        <a href="https://www.postgresql.org/docs/current/ssl-tcp.html" rel="external">postgresql.org/docs/current/ssl-tcp.html</a></li>
+      <li>PostgreSQL docs, "SASL Authentication" — what implementing SCRAM-SHA-256 (PostgreSQL's
+        modern default) takes beyond trust and cleartext password authentication.
         <a href="https://www.postgresql.org/docs/current/sasl-authentication.html" rel="external">postgresql.org/docs/current/sasl-authentication.html</a></li>
-      <li>pgwire examples — compare your hand-rolled server with the library-based one for the
-        same feature set. <a href="https://github.com/sunng87/pgwire" rel="external">github.com/sunng87/pgwire</a></li>
+      <li><code>sunng87/pgwire</code> — optional post-milestone reading: compare your hand-rolled
+        codec and session loop against a library implementation of the same PostgreSQL wire
+        sub-protocols. <a href="https://github.com/sunng87/pgwire" rel="external">github.com/sunng87/pgwire</a></li>
     </ul>
-
-    <h2 id="sec-milestone">Milestone link</h2>
-    <p>Next on the path: <a href="../../modules/m12-advanced-topics/index.html">M12 · Advanced
-    Topics</a> — where to take FerricDB (and yourself) from here.</p>
 
     <nav class="prevnext">
       <a href="../../modules/m11-wire-protocol-server/index.html"><span class="dir">← Previous</span> M11 · The Postgres Wire Protocol</a>
@@ -283,6 +904,7 @@ psql -h 127.0.0.1 -p 5433 -U ferric -c "SELECT 1;"          # the handshake proo
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor", "index", "txn", "wal"],
     current: ["protocol", "client"],

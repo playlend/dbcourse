@@ -17,8 +17,8 @@ ferricdb-txn = { workspace = true }
 ferricdb-wal = { workspace = true }
 ferricdb-server = { workspace = true }
 rustyline = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
 sqllogictest = { workspace = true }
-tempfile = { workspace = true }

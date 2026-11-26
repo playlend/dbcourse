@@ -10,7 +10,6 @@
 (function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
 </script>
 <script defer src="../../assets/site.js"></script>
-<!-- include arch.js ONLY if the page renders the shared architecture diagram -->
 </head>
 <body>
 
@@ -69,7 +68,7 @@
   Queries were procedural code: the developer chose access paths and execution ordering by hand,
   based on how the data happened to be laid out at the time.<sup class="cite"><a href="#ref-1">1</a></sup>
   When the data grew or its physical organization changed, hard-coded query programs became
-  inefficient or simply wrong, and had to be rewritten.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  inefficient or outright wrong, and had to be rewritten.<sup class="cite"><a href="#ref-1">1</a></sup></p>
 
   <p>Ted Codd, at IBM Research, watched people rebuild their database systems every time the
   physical layer changed and in 1969 proposed the relational model as the way out.<sup class="cite"><a href="#ref-1">1</a></sup>
@@ -161,7 +160,7 @@
       <path d="M 442 238 C 420 210, 408 190, 394 168" class="d-line" stroke-dasharray="5 4"/>
       <!-- FK arrow -->
       <path d="M 675 206 C 675 300, 110 300, 110 212" class="d-line-hl"/>
-      <polygon points="110,206 104,218 116,218" fill="currentColor"/>
+      <polygon points="110,206 104,218 116,218" fill="var(--accent)"/>
       <text x="392" y="302" text-anchor="middle" class="d-text-sm">foreign key: every albums.artist_id equals some artists.artist_id</text>
     </svg>
     <figcaption>Figure 1 — the running example schema. <code>artists</code> and <code>albums</code> are relations;
@@ -190,7 +189,8 @@
   what happens to referencing rows when the referenced row disappears — <code>NO ACTION</code> (the
   default, checkable at end of transaction), <code>RESTRICT</code>, <code>CASCADE</code>,
   <code>SET NULL</code>, or <code>SET DEFAULT</code>.<sup class="cite"><a href="#ref-9">9</a></sup> In Figure 1,
-  deleting artist 101 under <code>CASCADE</code> would delete albums 9001 and 9003 with it.</p>
+  deleting artist 101 (Nirvana) under <code>CASCADE</code> would automatically delete album 9001
+  (<em>In Utero</em>) with it, while leaving albums 9002 and 9003 untouched.</p>
 
   <p>Keys are the most common instances of a more general idea. An <strong>integrity
   constraint</strong> is a user-defined condition that must hold for <em>every</em> instance of the
@@ -223,7 +223,7 @@
   expressions.<sup class="cite"><a href="#ref-1">1</a></sup> Where SQL is declarative, the algebra is
   procedural — an algebra expression states an <em>order of steps</em>, which is precisely why it is
   the language query plans are written in.<sup class="cite"><a href="#ref-5">5</a></sup> When you build
-  FerricDB's executor in Milestone 4, every operator struct you write is one of the symbols
+  FerricDB's executor across Milestones 4 and 6, every operator struct you write is one of the symbols
   below.</p>
 
   <p><strong>Selection (σ)</strong> emits the subset of input tuples that satisfy a predicate; predicates
@@ -493,9 +493,13 @@
     </div>
   </div>
 
-  <p>FerricDB's course choice: our <code>UNIQUE</code> and NULL semantics follow PostgreSQL's defaults
-  (NULLs distinct in unique indexes, excluded by WHERE unless the predicate is TRUE), because
-  that is the behavior the test harness asserts from Milestone 4 onward.</p>
+  <p>FerricDB's course choice: our NULL semantics follow PostgreSQL's defaults —
+  <code>PRIMARY KEY</code> implies <code>NOT NULL</code>, and <code>WHERE</code> keeps a row only
+  when its predicate evaluates to TRUE (dropping both FALSE and NULL), as asserted by the test
+  harness from Milestone 4 onward. FerricDB omits a separate SQL <code>UNIQUE</code> constraint
+  keyword; instead, Milestone 5's B+Tree index orders entries by the composite pair
+  <code>(key, rid)</code> (supporting non-unique secondary indexes and MVCC tuple versions) and
+  rejects <code>NULL</code> keys outright.</p>
 
   <h2 id="sec-declarative">Why declarative queries enable optimization</h2>
 
@@ -676,12 +680,15 @@
     </ul>
 
     <h2 id="sec-milestone">Milestone link</h2>
-    <p>No milestone builds relational algebra directly — this module is pure vocabulary. The place
-    that vocabulary becomes load-bearing is
-    <a href="../../project/milestone-04/index.html">Milestone 4 — Volcano Executor</a>: its operator
-    tree implements exactly this algebra (sequential scan, filter σ, projection π, nested-loop join ⋈,
-    aggregation γ, sort, limit), and every module and milestone from there onward speaks it. Nothing
-    to build right now: continue to <a href="../m02-storage/index.html">M02</a> and then
+    <p>No milestone builds relational algebra directly — this module is pure vocabulary. That
+    vocabulary becomes load-bearing first in
+    <a href="../../project/milestone-04/index.html">Milestone 4 — Planner &amp; Volcano Executor</a>,
+    whose single-table CRUD operator tree implements sequential scan, filter (σ), projection (π),
+    sort, limit, <code>Values</code>, and <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>;
+    joins (⋈) and aggregation (γ) then arrive in
+    <a href="../../project/milestone-06/index.html">Milestone 6 — Joins, Aggregation, External Sort</a>,
+    and every module and milestone from there onward speaks this algebra. Nothing to build right now:
+    continue to <a href="../m02-storage/index.html">M02</a> and then
     <a href="../../project/milestone-01/index.html">Milestone 1</a>.</p>
 
     <nav class="prevnext">

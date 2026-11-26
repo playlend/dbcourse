@@ -24,8 +24,9 @@
 
 <main>
   <h1>M09 · Transactions, Concurrency Control, MVCC</h1>
-  <p class="subtitle">Serializability, the anomaly zoo, two-phase locking — and the
-  multi-version design where readers never block writers, exactly as PostgreSQL does it.</p>
+  <p class="subtitle">Serializability, the anomaly zoo, two-phase locking, optimistic concurrency
+  control — and the multi-version snapshot isolation design where readers never block writers,
+  as PostgreSQL and FerricDB implement it.</p>
 
   <noscript><p class="noscript-warn">The visibility checker, anomaly timelines, 2PL checker, and
   quizzes on this page need JavaScript; all explanatory content is readable without it.</p></noscript>
@@ -35,86 +36,190 @@
     <ol>
       <li><a href="#sec-acid">ACID and the isolation problem</a></li>
       <li><a href="#sec-serial">Schedules and serializability</a></li>
-      <li><a href="#sec-anomalies">The anomaly zoo</a></li>
+      <li><a href="#sec-anomalies">The anomaly zoo and isolation levels</a></li>
       <li><a href="#sec-zoo">Anomaly timelines (interactive)</a></li>
       <li><a href="#sec-2pl">Two-phase locking and deadlocks</a></li>
       <li><a href="#sec-2plcheck">The 2PL schedule checker</a></li>
-      <li><a href="#sec-mvcc">MVCC: versions, snapshots, visibility</a></li>
+      <li><a href="#sec-occ">Optimistic concurrency control (OCC)</a></li>
+      <li><a href="#sec-mvcc">MVCC: versions, snapshots, and the ten rules</a></li>
       <li><a href="#sec-checker">The MVCC visibility checker</a></li>
-      <li><a href="#sec-si">Snapshot isolation vs serializable</a></li>
-      <li><a href="#sec-vacuum">Vacuum: taking out the dead versions</a></li>
+      <li><a href="#sec-si">Snapshot isolation, write conflicts, and write skew</a></li>
+      <li><a href="#sec-vacuum">VACUUM and the bridge to WAL recovery</a></li>
       <li><a href="#sec-quiz">Check your understanding</a></li>
       <li><a href="#sec-sources">Primary sources</a></li>
     </ol>
   </div>
 
-  <p>Everything so far assumed one user. Real databases juggle many transactions at once, and
-  the moment two of them touch the same row, correctness stops being obvious. This module builds
-  the vocabulary (schedules, serializability, anomalies), tours the classic solution (locking),
-  and then goes deep on the design FerricDB and PostgreSQL actually use: multi-version
-  concurrency control, where <em>readers don't block writers and writers don't block
-  readers</em>.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  <p>Everything in FerricDB through Milestone&nbsp;7 assumed one session running one statement at a
+  time. Real database servers juggle dozens or thousands of concurrent clients, and the moment two
+  transactions touch overlapping rows, naive interleaving produces corrupted balances, phantom rows,
+  and broken application invariants. This module introduces the formal vocabulary (schedules,
+  conflict vs view serializability, and the anomaly hierarchy), compares the three major
+  concurrency-control families (two-phase locking, optimistic concurrency control, and multi-version
+  concurrency control), and goes deep on the PostgreSQL-style MVCC architecture you will implement in
+  <code>course/ferricdb/crates/txn</code> for Milestone&nbsp;8 — where <em>readers never block
+  writers and writers never block readers</em>.<sup class="cite"><a href="#ref-1">1</a></sup></p>
 
   <h2 id="sec-acid">ACID and the isolation problem</h2>
-  <p>A transaction is a group of statements that succeeds or fails as one. The classic contract
-  is ACID: <strong>A</strong>tomicity (all or nothing — Milestone 9's WAL delivers this),
-  <strong>C</strong>onsistency (integrity constraints hold), <strong>I</strong>solation
-  (concurrent transactions don't corrupt each other's view — this module), and
-  <strong>D</strong>urability (committed means committed — WAL again). Concurrency control is
-  the machinery that maintains atomicity and isolation while transactions run concurrently, and
-  there are three broad families: multi-version (MVCC), strict two-phase locking (S2PL), and
-  optimistic (OCC).<sup class="cite"><a href="#ref-1">1</a></sup> FerricDB implements MVCC; you
-  should understand all three well enough to say why.</p>
+  <p>A <strong>transaction</strong> is a sequence of reads and writes demarcated by
+  <code>BEGIN</code> and <code>COMMIT</code> (or <code>ROLLBACK</code>) that the engine treats as a
+  single logical unit of work. Its correctness contract is <strong>ACID</strong>:</p>
+  <ul>
+    <li><strong>Atomicity:</strong> Either every write in the transaction takes effect or none of
+      them do. Milestone&nbsp;8 enforces logical atomicity via MVCC visibility rules;
+      <a href="../m10-logging-recovery/index.html">Module 10</a> and Milestone&nbsp;9 add physical
+      crash-safe undo via write-ahead logging (WAL).</li>
+    <li><strong>Consistency:</strong> Every committed transaction carries the database from one state
+      that obeys declared integrity constraints (types, keys, application invariants) to another.</li>
+    <li><strong>Isolation:</strong> Concurrent transactions must not corrupt each other's view of the
+      database, even when the OS scheduler interleaves their page accesses arbitrarily — the core
+      subject of this module.</li>
+    <li><strong>Durability:</strong> Once <code>COMMIT</code> returns success to the client, the
+      transaction's changes survive process crashes and power loss (Module&nbsp;10 / Milestone&nbsp;9).</li>
+  </ul>
+  <p>Concurrency control protocols fall into three broad families:<sup class="cite"><a href="#ref-1">1</a></sup>
+  <strong>pessimistic locking</strong> (strict two-phase locking, S2PL), <strong>optimistic
+  concurrency control</strong> (OCC), and <strong>multi-version concurrency control</strong> (MVCC).
+  FerricDB implements MVCC snapshot isolation — the same foundation as PostgreSQL — and understanding
+  all three families clarifies every tradeoff in that choice.</p>
 
   <h2 id="sec-serial">Schedules and serializability</h2>
-  <p>A <em>schedule</em> is the interleaved order in which operations of concurrent transactions
-  actually execute. The gold standard is <strong>serializability</strong>: a schedule is
-  acceptable if its result equals <em>some</em> serial (one-at-a-time) execution of the same
-  transactions. Checking results directly is hopeless, so we use a syntactic sufficient
-  condition: two operations <em>conflict</em> if they belong to different transactions, touch
-  the same object, and at least one writes. A schedule is <strong>conflict-serializable</strong>
-  if its conflicting pairs can be ordered consistently with some serial order — checked in
-  practice with a precedence graph: a cycle means not
-  serializable.<sup class="cite"><a href="#ref-6">6</a></sup></p>
+  <p>A <strong>schedule</strong> is the interleaved timeline of read and write operations executed by
+  a set of concurrent transactions. A <em>serial</em> schedule runs one transaction completely to
+  commit or abort before starting the next; serial schedules are trivially isolated but sacrifice
+  all concurrency. The gold standard for interleaved execution is <strong>serializability</strong>:
+  a schedule is serializable if its final database state and every value returned to every
+  transaction are identical to <em>some</em> serial ordering of the committed
+  transactions.<sup class="cite"><a href="#ref-6">6</a></sup></p>
 
-  <h2 id="sec-anomalies">The anomaly zoo</h2>
-  <p>Isolation levels are defined by which <em>phenomena</em> they forbid. The PostgreSQL
-  documentation defines the standard four:<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  <p>Checking semantic equivalence against every possible serial schedule is intractable because the
+  database does not know what arbitrary arithmetic a client executes between reads and writes. Theory
+  therefore defines two syntactic notions of equivalence:<sup class="cite"><a href="#ref-6">6</a></sup></p>
+  <ul>
+    <li><strong>Conflict-serializability (practical standard):</strong> Two operations
+      <em>conflict</em> if they belong to different transactions, access the same data item, and at
+      least one of them is a write — giving three conflict kinds: read–write (RW), write–read (WR),
+      and write–write (WW). Build a directed <strong>precedence (conflict) graph</strong> whose nodes
+      are committed transactions, drawing an edge <code>Tᵢ → Tⱼ</code> whenever an operation of
+      <code>Tᵢ</code> conflicts with and precedes an operation of <code>Tⱼ</code>. A schedule is
+      <strong>conflict-serializable if and only if its precedence graph is acyclic</strong>; any
+      topological sort of the acyclic graph is an equivalent serial order.<sup class="cite"><a href="#ref-6">6</a></sup></li>
+    <li><strong>View-serializability (strictly broader, NP-complete):</strong> Notice carefully that a
+      cycle in the precedence graph means the schedule is <em>not conflict-serializable</em> — not
+      necessarily unserializable in the broader semantic sense! Consider a schedule with <em>blind
+      writes</em> (writes without prior reads): <code>T1: R(A)</code>, <code>T2: W(A)</code>,
+      <code>T1: W(A)</code>, <code>T3: W(A)</code>. The precedence graph has a cycle
+      <code>T1 → T2</code> (RW) and <code>T2 → T1</code> (WW), so it is not conflict-serializable;
+      yet every transaction reads the same initial value of <code>A</code> and <code>T3</code>'s blind
+      write determines the final state, making the schedule <em>view-equivalent</em> to the serial
+      order <code>T1, T2, T3</code>.<sup class="cite"><a href="#ref-6">6</a></sup> Because testing
+      view-serializability is NP-complete, real lock managers enforce conflict-serializability (a
+      strict subset of view-serializability).</li>
+  </ul>
+
+  <h2 id="sec-anomalies">The anomaly zoo and isolation levels</h2>
+  <p>Enforcing full serializability carries real runtime overhead (lock blocking or read-set
+  tracking and retries). The SQL standard therefore defines four tiered <strong>isolation
+  levels</strong> characterized by which concurrency <em>phenomena</em> (anomalies) they forbid.
+  PostgreSQL's documentation defines the four canonical phenomena plus the write-protection
+  anomalies that matter in production:<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  <ul>
+    <li><strong>Dirty write:</strong> Transaction <code>T2</code> overwrites a value written by an
+      uncommitted transaction <code>T1</code>. If <code>T1</code> later aborts (or commits out of
+      order), rolling back can clobber committed data. Every serious engine forbids dirty writes at
+      every isolation level.</li>
+    <li><strong>Dirty read:</strong> Transaction <code>T2</code> reads data modified by a concurrent
+      <em>uncommitted</em> transaction <code>T1</code>.<sup class="cite"><a href="#ref-2">2</a></sup>
+      If <code>T1</code> rolls back, <code>T2</code> acted on data that never existed.</li>
+    <li><strong>Non-repeatable (fuzzy) read:</strong> Transaction <code>T1</code> reads a row,
+      <code>T2</code> modifies or deletes that row and commits, and <code>T1</code> re-reads the
+      same row and observes a different value.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Phantom read:</strong> Transaction <code>T1</code> executes a predicate query (e.g.,
+      <code>COUNT(*) WHERE dept = 7</code>), <code>T2</code> inserts or modifies rows matching that
+      predicate and commits, and <code>T1</code> re-runs the query and finds a different <em>set of
+      rows</em>.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Lost update:</strong> Both <code>T1</code> and <code>T2</code> read the same row
+      (say <code>balance = 100</code>), compute a new value locally (<code>+20</code> and
+      <code>+50</code>), and write back; <code>T2</code> overwrites <code>T1</code>'s committed
+      increment so the final balance is <code>150</code> instead of <code>170</code>.</li>
+    <li><strong>Write skew (serialization anomaly):</strong> Two concurrent transactions read an
+      overlapping set of rows, check a multi-row invariant, and update <em>disjoint</em> rows so that
+      each transaction is valid alone yet their combined committed state is impossible under
+      <em>any</em> serial execution.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+  </ul>
+
+  <p>Because the 1992 SQL standard defined levels solely in terms of the first three read anomalies
+  (a famous gap analyzed by Berenson et&nbsp;al.), PostgreSQL's actual implementations are strictly
+  stronger than the SQL minimum at two levels:<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Anomaly</th><th>Definition (per the Postgres docs)</th></tr></thead>
+      <thead>
+        <tr>
+          <th>Isolation level</th>
+          <th>Dirty read</th>
+          <th>Non-repeatable (fuzzy) read</th>
+          <th>Phantom read</th>
+          <th>Lost update</th>
+          <th>Write skew</th>
+        </tr>
+      </thead>
       <tbody>
-        <tr><td><strong>Dirty read</strong></td><td>reading data written by a concurrent
-          <em>uncommitted</em> transaction<sup class="cite"><a href="#ref-2">2</a></sup></td></tr>
-        <tr><td><strong>Nonrepeatable (fuzzy) read</strong></td><td>re-reading data and finding
-          it modified by another transaction that committed since the first
-          read<sup class="cite"><a href="#ref-2">2</a></sup></td></tr>
-        <tr><td><strong>Phantom read</strong></td><td>re-running a query and finding the
-          <em>set of rows</em> matching the condition has changed due to a recently-committed
-          transaction<sup class="cite"><a href="#ref-2">2</a></sup></td></tr>
-        <tr><td><strong>Serialization anomaly</strong></td><td>a committed result inconsistent
-          with <em>every</em> one-at-a-time ordering of the transactions
-          (write skew is the canonical example)<sup class="cite"><a href="#ref-2">2</a></sup></td></tr>
+        <tr>
+          <td><strong>Read Uncommitted</strong><br><span class="muted">SQL standard vs PG</span></td>
+          <td>SQL: possible<br><strong>PG: prevented</strong> (maps RU → RC)</td>
+          <td>Possible</td>
+          <td>Possible</td>
+          <td>Possible</td>
+          <td>Possible</td>
+        </tr>
+        <tr>
+          <td><strong>Read Committed</strong><br><span class="muted">PostgreSQL default</span></td>
+          <td>Prevented</td>
+          <td>Possible</td>
+          <td>Possible</td>
+          <td>Possible</td>
+          <td>Possible</td>
+        </tr>
+        <tr>
+          <td><strong>Repeatable Read</strong><br><span class="muted">PG Snapshot Isolation &amp; <strong>FerricDB MS8</strong></span></td>
+          <td>Prevented</td>
+          <td>Prevented</td>
+          <td>SQL: possible<br><strong>PG / FerricDB: prevented</strong></td>
+          <td><strong>PG / FerricDB: prevented</strong></td>
+          <td><strong>Possible</strong> (documented hole)</td>
+        </tr>
+        <tr>
+          <td><strong>Serializable</strong><br><span class="muted">PG SSI &amp; Stretch S2</span></td>
+          <td>Prevented</td>
+          <td>Prevented</td>
+          <td>Prevented</td>
+          <td>Prevented</td>
+          <td><strong>Prevented</strong> (aborts with <code>40001</code>)</td>
+        </tr>
       </tbody>
     </table>
   </div>
-  <p>Two more matter in practice: the <strong>dirty write</strong> (overwriting uncommitted
-  data) which every real system forbids at all levels, and the <strong>lost update</strong> —
-  two read-modify-write transactions both based on the same original value, one overwriting the
-  other's increment. Keep the zoo straight and isolation levels become simple: each level is
-  just a row in the which-anomalies-can-happen table.</p>
+
+  <p>Notice two essential PostgreSQL facts in that matrix:<sup class="cite"><a href="#ref-2">2</a></sup>
+  first, PostgreSQL's <code>READ UNCOMMITTED</code> behaves identically to
+  <code>READ COMMITTED</code>, so dirty reads never happen in PostgreSQL at any setting; second,
+  PostgreSQL's <code>REPEATABLE READ</code> implements <strong>Snapshot Isolation</strong>, which
+  already prevents phantoms and lost updates without range locks — leaving write skew as the sole
+  serialization anomaly that requires <code>SERIALIZABLE</code> (Serializable Snapshot Isolation,
+  SSI).</p>
 
   <h2 id="sec-zoo">Anomaly timelines (interactive)</h2>
   <div class="widget" id="zoo">
     <p class="widget-title">Anomaly zoo — replayable two-transaction timelines</p>
-    <p class="widget-sub">Pick an anomaly and an isolation level, then step the clock. The level
-    selector shows what Read Committed allows that Snapshot Isolation prevents — and the one
-    thing SI itself lets through.</p>
+    <p class="widget-sub">Pick an anomaly and an isolation level, then step the clock. Every step
+    updates the schedule table synchronously — showing what Read Committed allows that Snapshot
+    Isolation prevents, and the one serialization anomaly SI itself lets through.</p>
     <div class="controls">
       <label for="zoo-anom">anomaly</label>
       <select id="zoo-anom">
         <option value="lost" selected>Lost update</option>
-        <option value="fuzzy">Fuzzy (nonrepeatable) read</option>
+        <option value="fuzzy">Fuzzy (non-repeatable) read</option>
         <option value="phantom">Phantom read</option>
         <option value="skew">Write skew</option>
       </select>
@@ -126,101 +231,487 @@
     </div>
     <div id="zoo-stepper"></div>
     <div class="table-wrap"><table>
-      <thead><tr><th style="width:8rem">step</th><th>T1</th><th>T2</th></tr></thead>
+      <thead><tr><th style="width:5.5rem">step</th><th>T1</th><th>T2</th></tr></thead>
       <tbody id="zoo-body"></tbody>
     </table></div>
     <div class="callout note" id="zoo-verdict" style="margin-top:0.6rem"><span class="callout-title">Outcome</span><p id="zoo-verdict-text">Step through to the end.</p></div>
   </div>
 
   <h2 id="sec-2pl">Two-phase locking and deadlocks</h2>
-  <p>The classical route to serializability is locking: shared (S) locks to read, exclusive (X)
-  locks to write, granted by a lock manager that queues conflicting
-  requests.<sup class="cite"><a href="#ref-7">7</a></sup> The protocol that makes locks
-  <em>sufficient</em> is <strong>two-phase locking</strong>: every transaction has a growing
-  phase in which it acquires locks and a shrinking phase in which it releases them — once it
-  releases anything, it may never acquire again. 2PL guarantees conflict-serializable schedules,
-  but it still allows <em>cascading aborts</em>: T1 releases a lock early, T2 reads T1's write,
-  T1 aborts, and T2 must abort too. <strong>Strict 2PL</strong> closes that hole by holding all
-  locks until the transaction completes.<sup class="cite"><a href="#ref-7">7</a></sup></p>
-  <p>The price of blocking is the <strong>deadlock</strong>: two transactions each waiting for a
-  lock the other holds — the textbook case being two holders of S locks on the same row both
-  requesting an upgrade to X.<sup class="cite"><a href="#ref-7">7</a></sup> The standard cure is
-  detection: maintain a <em>waits-for graph</em> with an edge T<sub>i</sub> → T<sub>j</sub>
-  whenever T<sub>i</sub> waits on a lock T<sub>j</sub> holds; a cycle is a deadlock, and the
-  system aborts a victim to break it. The alternative is avoidance by priority (wait-die /
-  wound-wait), which never deadlocks but aborts more.<sup class="cite"><a href="#ref-7">7</a></sup>
-  FerricDB's core path doesn't need any of this — MVCC reads take no locks — but stretch
-  milestone S1 builds a lock manager for <code>SELECT FOR UPDATE</code>, and the checker below
-  builds the intuition.</p>
+  <p>Before MVCC became universal, databases guaranteed conflict-serializability using a
+  <strong>lock manager</strong> issuing two lock modes: <strong>Shared (S)</strong> locks for reads
+  (compatible with other S locks) and <strong>Exclusive (X)</strong> locks for writes (incompatible
+  with both S and X).<sup class="cite"><a href="#ref-7">7</a></sup> Acquiring a lock before
+  each access and releasing it right afterward does <em>not</em> guarantee serializability —
+  interleaving can still create cycles in the conflict graph.</p>
+
+  <p>The protocol that makes locking sufficient for conflict-serializability is <strong>Two-Phase
+  Locking (2PL)</strong>: every transaction divides its lifetime into two
+  phases:<sup class="cite"><a href="#ref-7">7</a></sup></p>
+  <ol>
+    <li><strong>Growing phase:</strong> The transaction may acquire new locks (or upgrade S → X),
+      but may not release any lock.</li>
+    <li><strong>Shrinking phase:</strong> Once the transaction releases its first lock, it may never
+      acquire another lock.</li>
+  </ol>
+  <p>2PL guarantees that every committed schedule is conflict-serializable (the equivalent serial
+  order follows each transaction's <em>lock point</em> — the instant it held its last newly acquired
+  lock). However, plain 2PL still suffers from <strong>cascading aborts</strong>: if <code>T1</code>
+  writes <code>A</code>, finishes acquiring its locks, unlocks <code>A</code> early during its
+  shrinking phase, and <code>T2</code> reads <code>A</code> before <code>T1</code> aborts, then
+  <code>T2</code> read dirty data and must also abort (and if <code>T2</code> already committed,
+  the schedule is <em>non-recoverable</em>!). <strong>Strict 2PL (S2PL)</strong> closes both holes
+  by holding all locks — or at minimum all exclusive locks — until the transaction commits or
+  aborts.<sup class="cite"><a href="#ref-7">7</a></sup></p>
+
+  <p>Blocking creates a new hazard: <strong>deadlock</strong>, a cycle of transactions each waiting
+  for a lock held by the next.<sup class="cite"><a href="#ref-7">7</a></sup> The classic deadlock
+  requires only a single row: <code>T1</code> and <code>T2</code> both take compatible
+  <code>S(A)</code> locks, then both request an upgrade to <code>X(A)</code>; each blocks on the
+  other's <code>S(A)</code> forever. Engines handle deadlocks either via <strong>detection</strong>
+  — maintaining a directed <em>waits-for graph</em> (<code>Tᵢ → Tⱼ</code> when <code>Tᵢ</code> waits
+  on a lock held by <code>Tⱼ</code>), periodically checking for cycles, and aborting a victim — or
+  via timestamp-priority <strong>prevention</strong> (<em>wait-die</em>: older waits for younger,
+  younger aborts; <em>wound-wait</em>: older preempts/aborts younger, younger waits), which forbids
+  cycles at the cost of extra aborts.<sup class="cite"><a href="#ref-7">7</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 920 265" role="img">
+      <title>Two-panel diagram comparing a precedence (conflict) graph cycle proving non-conflict-serializability
+      on the left against a waits-for graph deadlock cycle on the right.</title>
+      <defs>
+        <marker id="m09-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.75"/>
+        </marker>
+        <marker id="m09-arr-bad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" style="fill:var(--bad)"/>
+        </marker>
+      </defs>
+
+      <!-- Left panel: Precedence (conflict) graph -->
+      <rect x="14" y="14" width="432" height="237" rx="8" class="d-box"/>
+      <text x="230" y="38" text-anchor="middle" class="d-text" font-weight="600">Precedence (conflict) graph</text>
+      <text x="230" y="56" text-anchor="middle" class="d-mono-sm">T1: R(A) → T2: W(A) → T2: R(B) → T1: W(B)</text>
+
+      <circle cx="122" cy="144" r="28" class="d-box-hl"/>
+      <text x="122" y="149" text-anchor="middle" class="d-mono" font-weight="600">T1</text>
+
+      <circle cx="338" cy="144" r="28" class="d-box-hl"/>
+      <text x="338" y="149" text-anchor="middle" class="d-mono" font-weight="600">T2</text>
+
+      <path d="M 146 126 Q 230 82 312 126" class="d-line" style="stroke:var(--bad);stroke-width:2" marker-end="url(#m09-arr-bad)"/>
+      <text x="230" y="96" text-anchor="middle" class="d-mono-sm">RW conflict on A</text>
+
+      <path d="M 314 162 Q 230 206 148 162" class="d-line" style="stroke:var(--bad);stroke-width:2" marker-end="url(#m09-arr-bad)"/>
+      <text x="230" y="203" text-anchor="middle" class="d-mono-sm">RW conflict on B</text>
+
+      <text x="230" y="236" text-anchor="middle" class="d-text-sm">Cycle T1 → T2 → T1 ⇒ schedule is NOT conflict-serializable</text>
+
+      <!-- Right panel: Waits-for graph (deadlock) -->
+      <rect x="474" y="14" width="432" height="237" rx="8" class="d-box"/>
+      <text x="690" y="38" text-anchor="middle" class="d-text" font-weight="600">Waits-for graph (deadlock detection)</text>
+      <text x="690" y="56" text-anchor="middle" class="d-mono-sm">T1: S(A), T2: S(A), T1: X(A)?, T2: X(A)?</text>
+
+      <circle cx="582" cy="144" r="28" class="d-box-hl"/>
+      <text x="582" y="149" text-anchor="middle" class="d-mono" font-weight="600">T1</text>
+
+      <circle cx="798" cy="144" r="28" class="d-box-bad"/>
+      <text x="798" y="149" text-anchor="middle" class="d-mono" font-weight="600">T2</text>
+      <text x="798" y="187" text-anchor="middle" class="d-text-sm">victim</text>
+
+      <path d="M 606 126 Q 690 82 772 126" class="d-line" style="stroke:var(--bad);stroke-width:2" marker-end="url(#m09-arr-bad)"/>
+      <text x="690" y="96" text-anchor="middle" class="d-mono-sm">T1 waits for X(A) held S by T2</text>
+
+      <path d="M 774 162 Q 690 206 608 162" class="d-line" style="stroke:var(--bad);stroke-width:2" marker-end="url(#m09-arr-bad)"/>
+      <text x="690" y="203" text-anchor="middle" class="d-mono-sm">T2 waits for X(A) held S by T1</text>
+
+      <text x="690" y="236" text-anchor="middle" class="d-text-sm">Cycle ⇒ deadlock; detector aborts victim T2 so T1 proceeds</text>
+    </svg>
+    <figcaption>Figure 1 — Two distinct cycle tests in locking theory: an offline precedence graph
+    cycle (left) proves a schedule is not conflict-serializable;<sup class="cite"><a href="#ref-6">6</a></sup>
+    an online waits-for graph cycle (right) signals an active deadlock requiring a victim
+    abort.<sup class="cite"><a href="#ref-7">7</a></sup></figcaption>
+  </figure>
 
   <h2 id="sec-2plcheck">The 2PL schedule checker</h2>
+  <p>Step through four schedules below to watch each transaction's 2PL phase (growing vs shrinking),
+  the live lock table (held locks and waiting queue per object), and the waits-for graph. Pay close
+  attention to the distinction between Schedule&nbsp;B (valid plain 2PL that still suffers a
+  <em>cascading abort</em> when <code>T1</code> unlocks early and aborts) and Schedule&nbsp;C (an
+  actual 2PL violation combined with a <em>dirty write / non-recoverable</em> commit).</p>
+
   <div class="widget" id="tpl">
-    <p class="widget-title">2PL schedule checker</p>
-    <p class="widget-sub">Three canned schedules. Step through lock and data operations; the
-    checker tracks each transaction's phase and the waits-for graph.</p>
+    <p class="widget-title">2PL schedule checker — phases, lock table, and waits-for graph</p>
+    <p class="widget-sub">Choose one of four schedules and step through lock grants, waits, phase
+    transitions, and aborts.</p>
     <div class="controls">
       <label for="tpl-sched">schedule</label>
       <select id="tpl-sched">
-        <option value="ok" selected>A — strict 2PL, clean</option>
-        <option value="bad">B — 2PL violation</option>
-        <option value="dead">C — deadlock</option>
+        <option value="strict" selected>A — Strict 2PL (clean, serializable)</option>
+        <option value="cascade">B — Plain 2PL (valid 2PL, cascading abort)</option>
+        <option value="violation">C — 2PL violation + dirty write (non-recoverable)</option>
+        <option value="deadlock">D — Deadlock (S→X lock upgrade cycle)</option>
       </select>
     </div>
     <div id="tpl-stepper"></div>
-    <div class="log" id="tpl-log" style="max-height:16rem"></div>
+    <div class="grid-2">
+      <div class="log" id="tpl-log" style="max-height:17rem"></div>
+      <div>
+        <div class="log" id="tpl-phases" style="max-height:5.5rem"></div>
+        <div class="log" id="tpl-locks" style="max-height:6rem;margin-top:0.5rem"></div>
+        <div class="log" id="tpl-wfg" style="max-height:4.5rem;margin-top:0.5rem"></div>
+      </div>
+    </div>
   </div>
 
-  <h2 id="sec-mvcc">MVCC: versions, snapshots, visibility</h2>
-  <p>MVCC's move is to never update in place: each write creates a <em>new version</em> of the
-  row while retaining the old one, and each reader is shown the version appropriate to
-  <em>its</em> transaction — which is how readers and writers stop blocking each
-  other.<sup class="cite"><a href="#ref-1">1</a></sup> In PostgreSQL — and byte-for-byte in your
-  Milestone 1 tuple header — every tuple version carries two transaction ids:
-  <code>xmin</code>, the transaction that created it, and <code>xmax</code>, the transaction
-  that deleted it (zero/invalid while alive). An UPDATE is a delete plus an insert: the old
-  version gets its <code>xmax</code> stamped, and a new version is written with
-  <code>xmin</code> = the updater.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  <h2 id="sec-occ">Optimistic concurrency control (OCC)</h2>
+  <p>Two-phase locking is <em>pessimistic</em>: it assumes conflicts are frequent, so every read and
+  write pays lock-table latching overhead up front and risks blocking or deadlocking even when no
+  other transaction touches the same row. <strong>Optimistic Concurrency Control (OCC)</strong> —
+  introduced by Kung and Robinson and summarized alongside S2PL and MVCC in interdb Ch.&nbsp;5 —
+  bets the opposite: assume conflicts are rare, execute without locking, and verify serializability
+  only at commit time.<sup class="cite"><a href="#ref-1">1</a></sup></p>
 
-  <p>A transaction decides what it can see using a <strong>snapshot</strong> taken at BEGIN.
-  Postgres represents one as <code>xmin:xmax:xip_list</code> — for example
-  <code>100:104:100,102</code>: transactions below 100 are settled, 104 and above haven't
-  started (or are unfinished), and 100, 102 were in flight when the snapshot was
-  taken.<sup class="cite"><a href="#ref-3">3</a></sup> "Active in the snapshot" means: in the
-  xip list, or ≥ the snapshot's xmax. One subtlety with big consequences: under Read Committed,
-  Postgres takes a <em>new snapshot for every statement</em>; under Repeatable Read and
-  Serializable, one snapshot at the first statement serves the whole
-  transaction.<sup class="cite"><a href="#ref-3">3</a></sup> FerricDB implements the latter —
-  one snapshot per transaction.</p>
+  <p>Every OCC transaction moves through three distinct phases:</p>
+  <ol>
+    <li><strong>Read phase:</strong> Read tuples freely from the shared database without acquiring
+      locks, recording every read item in a private <em>read set</em>. All inserts, updates, and
+      deletes are buffered in a private <em>write workspace</em> (never visible to other transactions
+      during execution).</li>
+    <li><strong>Validation phase:</strong> On <code>COMMIT</code>, enter a brief critical section,
+      assign a commit timestamp, and check whether any concurrently committed transaction wrote an
+      item in this transaction's read set (or, in parallel write phases, overlapped its write set).
+      If an overlap exists, validation fails and the transaction aborts and retries from scratch —
+      discarding its private workspace cleanly without touching shared pages.</li>
+    <li><strong>Write phase:</strong> If validation succeeds, copy the private workspace into the
+      shared database and mark the transaction committed.</li>
+  </ol>
 
-  <p>Visibility is then a pure function
-  <code>is_visible(xmin, xmax, snapshot, clog) → bool</code>, and interdb Ch. 5 pins it down as
-  ten rules organized by the commit status of <code>xmin</code>:<sup class="cite"><a href="#ref-4">4</a></sup></p>
+  <p>OCC shines on <strong>read-heavy, low-contention workloads</strong> (such as analytical reads
+  over in-memory tables) because readers never contend on shared lock structures and deadlocks are
+  impossible. Under <strong>hot-row write contention</strong> (think a global counter or a popular
+  inventory SKU), however, OCC degrades harshly: ten concurrent updaters all do full execution work
+  only for nine of them to fail validation at the finish line and retry repeatedly, wasting CPU
+  (livelock risk). Compare all three concurrency-control families side by side:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Dimension</th>
+          <th>Strict 2PL (S2PL)</th>
+          <th>Optimistic (OCC)</th>
+          <th>MVCC (Snapshot Isolation)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Core mechanism</strong></td>
+          <td>Shared/exclusive row locks held until commit/abort<sup class="cite"><a href="#ref-7">7</a></sup></td>
+          <td>Private workspace + commit-time read/write validation<sup class="cite"><a href="#ref-1">1</a></sup></td>
+          <td>Immutable tuple versions stamped with <code>xmin</code>/<code>xmax</code> + snapshots<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-3">3</a></sup></td>
+        </tr>
+        <tr>
+          <td><strong>Readers block writers?</strong></td>
+          <td>Yes (S blocks X; X blocks S)</td>
+          <td>No (reads never lock)</td>
+          <td><strong>No</strong> — readers read historical versions<sup class="cite"><a href="#ref-1">1</a></sup></td>
+        </tr>
+        <tr>
+          <td><strong>Deadlocks possible?</strong></td>
+          <td>Yes (requires detector or wait-die/wound-wait)</td>
+          <td>No (conflicts resolve by abort)</td>
+          <td>Not between readers and writers (only if row locks are added for concurrent writes)</td>
+        </tr>
+        <tr>
+          <td><strong>Low-contention read-heavy</strong></td>
+          <td>Lock-table overhead on every read</td>
+          <td>Excellent (zero read-path contention)</td>
+          <td>Excellent (zero read locks, stable snapshots)</td>
+        </tr>
+        <tr>
+          <td><strong>Hot-row write contention</strong></td>
+          <td>Queues cleanly (some deadlock aborts)</td>
+          <td>Heavy wasted work &amp; repeated aborts</td>
+          <td>First-updater/first-committer wins; loser aborts with <code>40001</code></td>
+        </tr>
+        <tr>
+          <td><strong>Storage &amp; GC cost</strong></td>
+          <td>In-place updates (no dead versions)</td>
+          <td>Private workspace RAM per txn</td>
+          <td>Dead tuple versions accumulate; requires <code>VACUUM</code><sup class="cite"><a href="#ref-4">4</a></sup></td>
+        </tr>
+        <tr>
+          <td><strong>Default isolation</strong></td>
+          <td>Conflict-serializable (with predicate locks for phantoms)</td>
+          <td>Serializable</td>
+          <td>Snapshot Isolation (requires SSI for full Serializable)<sup class="cite"><a href="#ref-2">2</a></sup></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="sec-mvcc">MVCC: versions, snapshots, and the ten rules</h2>
+  <p>MVCC resolves the reader-vs-writer conflict by refusing to overwrite rows in place. Every write
+  creates a <strong>new physical tuple version</strong> while leaving the old version on the heap
+  page for readers whose transactions began earlier.<sup class="cite"><a href="#ref-1">1</a></sup>
+  Specifically, every tuple carries two transaction-id stamps: <code>xmin</code> (the transaction
+  that created this version) and <code>xmax</code> (the transaction that deleted or superseded it,
+  or <code>0</code> while alive). An <code>INSERT</code> writes a tuple with
+  <code>xmin = my_id, xmax = 0</code>; a <code>DELETE</code> stamps <code>xmax = my_id</code> on the
+  existing version without erasing its bytes; an <code>UPDATE</code> is strictly a
+  <strong>delete plus insert</strong> — stamping <code>xmax = my_id</code> on the old version and
+  inserting a brand-new tuple with <code>xmin = my_id, xmax = 0</code>.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <div class="callout note">
+    <span class="callout-title">Tuple header sizing: PostgreSQL (32-bit xid) vs FerricDB (64-bit TxnId)</span>
+    <p>PostgreSQL packs 32-bit <code>TransactionId</code> fields (4-byte <code>t_xmin</code> and
+    4-byte <code>t_xmax</code>, alongside command id, <code>t_ctid</code>, and infomask flags) into
+    a compact 23-byte <code>HeapTupleHeaderData</code>.<sup class="cite"><a href="#ref-9">9</a></sup>
+    Because 32-bit transaction ids wrap around every ~2 billion transactions (2³¹), production
+    PostgreSQL requires aggressive <em>transaction-id freezing</em> during <code>VACUUM</code> to
+    prevent old committed tuples from suddenly looking like the future.<sup class="cite"><a href="#ref-4">4</a></sup>
+    FerricDB makes an explicit course choice in <code>crates/common</code>: every tuple carries a
+    16-byte <code>TupleMeta { xmin: u64, xmax: u64 }</code>. Widening <code>TxnId</code> to 64 bits
+    eliminates wraparound machinery completely (even at 1&nbsp;million transactions per second, a
+    <code>u64</code> lasts over 584,000 years) while preserving PostgreSQL's exact visibility logic,
+    with <code>xmin == 0</code> denoting frozen/bootstrap tuples written before Milestone&nbsp;8 or
+    during catalog initialization.</p>
+  </div>
+
+  <p>To decide which tuple versions belong to its consistent point in time, a transaction captures a
+  <strong>snapshot</strong> atomically with transaction-id assignment under a single lock. In
+  PostgreSQL's <code>xmin:xmax:xip_list</code> notation:<sup class="cite"><a href="#ref-3">3</a></sup></p>
   <ul>
-    <li><strong>xmin aborted</strong> → invisible, always (R1).</li>
-    <li><strong>xmin in progress</strong> → invisible (R4) — unless it is <em>my own</em>
-      transaction: then visible if I haven't also deleted it (R2), invisible if I have (R3).</li>
-    <li><strong>xmin committed</strong> → visible (R6, R8, R9) with three exceptions: the
-      creator is still <em>active in my snapshot</em> — it committed after I began — (R5,
-      invisible); <em>I</em> deleted it myself (R7, invisible); or the deleter committed and is
-      <em>not</em> active in my snapshot (R10, invisible). A deleter that is another in-progress
-      transaction (R8) or committed-but-active-in-snapshot (R9) leaves it visible.</li>
+    <li><code>xmin</code> is the oldest transaction id still active at snapshot time — every id
+      strictly below <code>xmin</code> has already settled (committed or aborted).</li>
+    <li><code>xmax</code> is the first <em>unassigned</em> transaction id at snapshot time — every id
+      <code>≥ xmax</code> had not even started yet ("the future").</li>
+    <li><code>active</code> (PostgreSQL's <code>xip_list</code>) lists every <em>other</em>
+      transaction in <code>[xmin, xmax)</code> that was still in flight when the snapshot was taken.
+      In FerricDB's <code>crates/txn</code>, <code>Snapshot { owner, xmin, xmax, active }</code>
+      stores <code>owner</code> explicitly and keeps <code>active: BTreeSet&lt;TxnId&gt;</code>
+      strictly to <em>other</em> in-flight transactions (excluding <code>owner</code>). For any other
+      transaction <code>x</code>, <strong>"active in the snapshot"</strong> means
+      <code>snap.active.contains(&amp;x) || x &gt;= snap.xmax</code>.<sup class="cite"><a href="#ref-3">3</a></sup></li>
   </ul>
-  <p>Read those exceptions twice — they <em>are</em> snapshot isolation. R5 makes commits that
-  happen after your BEGIN invisible; R9 keeps rows alive for you even after their deleter
-  commits, because the delete happened in your future. Your Milestone 8
-  <code>Snapshot::is_visible</code> implements exactly these rules, and the table-driven test
-  in the workspace walks every one.</p>
+
+  <p>One timing decision separates Read Committed from Repeatable Read (Snapshot Isolation): under
+  <strong>Read Committed</strong>, PostgreSQL takes a <em>fresh snapshot before every SQL
+  statement</em>; under <strong>Repeatable Read</strong> (and FerricDB's Milestone&nbsp;8), a single
+  snapshot taken at <code>BEGIN</code> serves the entire transaction.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 940 348" role="img">
+      <title>MVCC tuple version chain overlaid on a transaction timeline: T98 updates a row committed
+      by T95 after T100 takes its snapshot, so T100 continues seeing v1 while T102 takes a fresh
+      snapshot and sees v2.</title>
+      <defs>
+        <marker id="m09-mv-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+        <marker id="m09-mv-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" style="fill:var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- Timeline axis -->
+      <line x1="72" y1="26" x2="896" y2="26" class="d-line" marker-end="url(#m09-mv-arr)"/>
+      <text x="904" y="30" class="d-text-sm">time</text>
+
+      <!-- Snapshot vertical guides -->
+      <line x1="420" y1="34" x2="420" y2="196" class="d-line-hl" stroke-dasharray="4 4"/>
+      <line x1="710" y1="34" x2="710" y2="196" class="d-line" stroke-dasharray="4 4"/>
+
+      <!-- Lane T95 -->
+      <text x="62" y="62" text-anchor="end" class="d-mono" font-weight="600">T95</text>
+      <rect x="84" y="44" width="190" height="28" rx="6" class="d-box-good"/>
+      <text x="179" y="62" text-anchor="middle" class="d-mono-sm">INSERT v1 · COMMIT ✓</text>
+
+      <!-- Lane T98 -->
+      <text x="62" y="102" text-anchor="end" class="d-mono" font-weight="600">T98</text>
+      <rect x="292" y="84" width="356" height="28" rx="6" class="d-box-warn"/>
+      <text x="470" y="102" text-anchor="middle" class="d-mono-sm">BEGIN · UPDATE v1→v2 · COMMIT ✓ (after T100 began)</text>
+
+      <!-- Lane T100 -->
+      <text x="62" y="142" text-anchor="end" class="d-mono" font-weight="600">T100</text>
+      <rect x="420" y="124" width="466" height="28" rx="6" class="d-box-hl"/>
+      <text x="653" y="142" text-anchor="middle" class="d-mono-sm">Snapshot: owner=100, xmin=98, xmax=101, active={98} · SELECT</text>
+
+      <!-- Lane T102 -->
+      <text x="62" y="182" text-anchor="end" class="d-mono" font-weight="600">T102</text>
+      <rect x="710" y="164" width="176" height="28" rx="6" class="d-box"/>
+      <text x="798" y="182" text-anchor="middle" class="d-mono-sm">Fresh snap (active={100})</text>
+
+      <!-- Divider -->
+      <line x1="30" y1="206" x2="910" y2="206" class="d-line" opacity="0.35"/>
+
+      <!-- Version chain boxes -->
+      <rect x="64" y="222" width="308" height="72" rx="8" class="d-box-warn"/>
+      <text x="218" y="244" text-anchor="middle" class="d-mono" font-weight="600">v1 · rid(1, 0) · balance = 100</text>
+      <text x="218" y="264" text-anchor="middle" class="d-mono-sm">xmin = 95 (COMMITTED) · xmax = 98</text>
+      <text x="218" y="282" text-anchor="middle" class="d-text-sm">old version preserved for earlier snapshots</text>
+
+      <path d="M 374 258 H 558" class="d-line-hl" marker-end="url(#m09-mv-hl)"/>
+      <text x="466" y="246" text-anchor="middle" class="d-mono-sm">UPDATE =</text>
+      <text x="466" y="274" text-anchor="middle" class="d-mono-sm">stamp xmax + insert v2</text>
+
+      <rect x="568" y="222" width="308" height="72" rx="8" class="d-box-good"/>
+      <text x="722" y="244" text-anchor="middle" class="d-mono" font-weight="600">v2 · rid(1, 1) · balance = 150</text>
+      <text x="722" y="264" text-anchor="middle" class="d-mono-sm">xmin = 98 · xmax = 0 (alive)</text>
+      <text x="722" y="282" text-anchor="middle" class="d-text-sm">new version visible to post-commit snapshots</text>
+
+      <!-- Visibility verdicts below boxes -->
+      <text x="218" y="315" text-anchor="middle" class="d-text-sm" font-weight="600">T100 sees v1 (Rule 9: deleter T98 active in snap)</text>
+      <text x="218" y="332" text-anchor="middle" class="d-text-sm">T102 skips v1 (Rule 10: T98 committed before T102)</text>
+
+      <text x="722" y="315" text-anchor="middle" class="d-text-sm" font-weight="600">T100 skips v2 (Rule 5: creator T98 active in snap)</text>
+      <text x="722" y="332" text-anchor="middle" class="d-text-sm">T102 sees v2 (Rule 6a: T98 committed, xmax = 0)</text>
+    </svg>
+    <figcaption>Figure 2 — MVCC version chain overlaid on a concurrent timeline. Even after
+    <code>T98</code> commits, <code>T100</code>'s snapshot still lists <code>98</code> in
+    <code>active</code>, so Rule&nbsp;9 keeps <code>v1</code> alive and Rule&nbsp;5 hides
+    <code>v2</code>. A fresh snapshot (<code>T102</code>) sees the flipped world.<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-4">4</a></sup></figcaption>
+  </figure>
+
+  <p>With <code>xmin</code>, <code>xmax</code>, a <code>Snapshot</code>, and a commit-state oracle
+  (PostgreSQL's <code>pg_xact</code> / <code>clog</code>; FerricDB's
+  <code>TransactionManager::is_committed</code>), tuple visibility becomes a pure, side-effect-free
+  boolean function <code>Snapshot::is_visible(meta, committed)</code>. Interdb&nbsp;§5.6 organizes
+  every case into <strong>ten exact visibility rules</strong> grouped by the status of
+  <code>xmin</code> (plus FerricDB's frozen/bootstrap <code>xmin == 0</code> rule):<sup class="cite"><a href="#ref-4">4</a></sup></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Rule</th>
+          <th><code>xmin</code> status</th>
+          <th><code>xmax</code> condition</th>
+          <th>Verdict</th>
+          <th>Why</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Frozen</strong><br><span class="muted">(FerricDB)</span></td>
+          <td><code>xmin == 0</code> (bootstrap / frozen)</td>
+          <td>Check <code>xmax</code> via R6–R10</td>
+          <td>Per R6–R10</td>
+          <td>Treated as committed in the distant past; never active in any snapshot</td>
+        </tr>
+        <tr>
+          <td><strong>R1</strong></td>
+          <td><code>ABORTED</code></td>
+          <td>any</td>
+          <td><strong>invisible</strong></td>
+          <td>Creator rolled back — its tuple never logically existed</td>
+        </tr>
+        <tr>
+          <td><strong>R2</strong></td>
+          <td><code>IN_PROGRESS</code> and <code>xmin == owner</code></td>
+          <td><code>xmax == 0</code></td>
+          <td><strong>VISIBLE</strong></td>
+          <td>My own uncommitted insert, not yet deleted by me</td>
+        </tr>
+        <tr>
+          <td><strong>R3</strong></td>
+          <td><code>IN_PROGRESS</code> and <code>xmin == owner</code></td>
+          <td><code>xmax == owner</code></td>
+          <td><strong>invisible</strong></td>
+          <td>I inserted this version and then deleted/updated it myself</td>
+        </tr>
+        <tr>
+          <td><strong>R4</strong></td>
+          <td><code>IN_PROGRESS</code> and <code>xmin != owner</code></td>
+          <td>any</td>
+          <td><strong>invisible</strong></td>
+          <td>Another transaction's uncommitted insert (prevents dirty reads)</td>
+        </tr>
+        <tr>
+          <td><strong>R5</strong></td>
+          <td><code>COMMITTED</code>, active in snapshot</td>
+          <td>any</td>
+          <td><strong>invisible</strong></td>
+          <td>Creator committed <em>after</em> my snapshot was taken (in <code>active</code> or <code>≥ xmax</code>)</td>
+        </tr>
+        <tr>
+          <td><strong>R6a</strong></td>
+          <td><code>COMMITTED</code>, settled before snapshot</td>
+          <td><code>xmax == 0</code></td>
+          <td><strong>VISIBLE</strong></td>
+          <td>Committed tuple with no deleter — the common happy path</td>
+        </tr>
+        <tr>
+          <td><strong>R6b</strong></td>
+          <td><code>COMMITTED</code>, settled before snapshot</td>
+          <td><code>xmax</code> is <code>ABORTED</code></td>
+          <td><strong>VISIBLE</strong></td>
+          <td>Deleter rolled back, so the delete never took effect</td>
+        </tr>
+        <tr>
+          <td><strong>R7</strong></td>
+          <td><code>COMMITTED</code>, settled before snapshot</td>
+          <td><code>xmax == owner</code> (in progress)</td>
+          <td><strong>invisible</strong></td>
+          <td>I deleted this tuple myself inside my own transaction</td>
+        </tr>
+        <tr>
+          <td><strong>R8</strong></td>
+          <td><code>COMMITTED</code>, settled before snapshot</td>
+          <td><code>xmax</code> is other <code>IN_PROGRESS</code></td>
+          <td><strong>VISIBLE</strong></td>
+          <td>Another transaction is deleting it but hasn't committed yet</td>
+        </tr>
+        <tr>
+          <td><strong>R9</strong></td>
+          <td><code>COMMITTED</code>, settled before snapshot</td>
+          <td><code>xmax</code> is <code>COMMITTED</code>, active in snapshot</td>
+          <td><strong>VISIBLE</strong></td>
+          <td>Deleter committed <em>after</em> my snapshot — deletion lies in my future</td>
+        </tr>
+        <tr>
+          <td><strong>R10</strong></td>
+          <td><code>COMMITTED</code>, settled before snapshot</td>
+          <td><code>xmax</code> is <code>COMMITTED</code>, settled before snapshot</td>
+          <td><strong>invisible</strong></td>
+          <td>Tuple was already deleted and committed before my snapshot began</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Pause on Rules&nbsp;5 and&nbsp;9 — together, they <em>are</em> Snapshot Isolation. Rule&nbsp;5
+  blocks post-snapshot inserts from leaking into your scan; Rule&nbsp;9 freezes pre-snapshot rows in
+  place even after a concurrent transaction deletes them and commits. Notice also how clean the
+  Rust oracle signature in <code>crates/txn/src/lib.rs</code> is: because <code>is_visible</code>
+  receives only <code>committed: &amp;dyn Fn(TxnId) -&gt; bool</code>, it distinguishes "aborted"
+  from "still in progress" without needing a third state in the closure — an uncommitted
+  <code>xmin</code> (other than <code>owner</code>) is invisible either way (R1 and R4 both return
+  <code>false</code>!), and an uncommitted <code>xmax</code> (other than <code>owner</code>) leaves
+  the tuple visible either way (R6b and R8 both return <code>true</code>!). That collapse is why
+  the entire Milestone&nbsp;8 <code>Snapshot::is_visible</code> function fits in ~35 lines of pure
+  Rust.</p>
 
   <h2 id="sec-checker">The MVCC visibility checker</h2>
+  <p>This widget runs the exact scenario from <code>crates/txn/tests/txn.rs</code>
+  (<code>snapshot_100</code>): you are transaction <strong>100</strong> with snapshot
+  <code>owner=100, xmin=98, xmax=101, active={98}</code>. <code>T95</code> and <code>T96</code>
+  committed before you began; <code>T98</code> is still in flight; <code>T99</code> aborted;
+  <code>T101</code> started and committed <em>after</em> your snapshot was taken (so
+  <code>101 ≥ xmax</code>). Toggle <code>T98</code> and <code>T99</code>, then click
+  <strong>Retake snapshot</strong> to simulate Read Committed advancing to a new statement
+  snapshot.</p>
+
   <div class="widget" id="vis">
-    <p class="widget-title">MVCC visibility checker</p>
+    <p class="widget-title">MVCC visibility checker (interdb §5.6 rules R1–R10 + FerricDB frozen)</p>
     <p class="widget-sub">You are transaction <b>100</b>, running with snapshot
-    <code id="vis-snap">98:102:98,101</code> (xmin:xmax:xip). Ten tuple versions below — each is
-    judged live by rules 1–10. Commit T98, then retake the snapshot, and watch which rows change
-    their verdict and why.</p>
+    <code id="vis-snap">owner=100, xmin=98, xmax=101, active={98}</code>. Twelve tuple versions below
+    cover every single rule in the table above, live.</p>
     <div class="controls">
-      <button class="btn primary" type="button" id="vis-commit">Commit T98</button>
-      <button class="btn" type="button" id="vis-snap-btn">Retake snapshot</button>
+      <button class="btn primary" type="button" id="vis-t98">Commit T98</button>
+      <button class="btn" type="button" id="vis-t99">Toggle T99 (ABORTED ↔ COMMITTED)</button>
+      <button class="btn" type="button" id="vis-snap-btn">Retake snapshot (RC)</button>
       <button class="btn" type="button" id="vis-reset">↺ Reset</button>
     </div>
     <div class="stat-row" id="vis-txns"></div>
@@ -229,88 +720,190 @@
       <tbody id="vis-body"></tbody>
     </table></div>
   </div>
-  <p>The T98 exercise is the whole Read-Committed-vs-Repeatable-Read distinction in one click.
-  After T98 commits, tuple B's creator is COMMITTED — but rule 5 still hides it, because 98 is
-  active <em>in your snapshot</em>. Retake the snapshot (what Read Committed does before every
-  statement<sup class="cite"><a href="#ref-3">3</a></sup>) and B appears. A transaction that
-  keeps its snapshot keeps its world.</p>
 
-  <h2 id="sec-si">Snapshot isolation vs serializable</h2>
-  <p>What does one-snapshot-per-transaction MVCC plus first-committer-wins write-conflict
-  detection buy you? PostgreSQL calls this level Repeatable Read and implements it as what the
-  literature calls <strong>Snapshot Isolation</strong>;<sup class="cite"><a href="#ref-2">2</a></sup>
-  toyDB's docs state the coverage with admirable honesty, and FerricDB inherits exactly it:
-  protected from dirty writes, dirty reads, lost updates, fuzzy reads, and phantoms —
-  <em>but write skew remains possible</em>, because serializable snapshot isolation is not
-  implemented.<sup class="cite"><a href="#ref-5">5</a></sup></p>
-  <p>Write skew deserves its moment, because it breaks the intuition that "no lost updates +
-  no phantoms = safe". Two doctors are on call; the rule is at least one must remain. Both
-  transactions read the roster (two on call), each removes a <em>different</em> doctor, neither
-  writes what the other wrote — so first-committer-wins sees no conflict, both commit, and the
-  invariant is dead. Each transaction was consistent alone; the <em>pair</em> is inconsistent
-  with any serial order — a serialization anomaly.<sup class="cite"><a href="#ref-2">2</a></sup>
-  Postgres's Serializable level catches it with SSI: predicate locks that don't block anything
-  but record read/write dependencies, aborting a transaction with SQLSTATE 40001 when a
-  dangerous pattern completes — which is why serializable applications must be written to
-  retry.<sup class="cite"><a href="#ref-2">2</a></sup> Your Milestone 8 test suite includes
-  <code>ms8_write_skew_is_documented</code>, which <em>asserts the anomaly happens</em> — the
-  most honest test in the course. Stretch milestone S2 flips it.</p>
+  <p>Run the two-click Read-Committed-vs-Repeatable-Read demonstration right now: click
+  <strong>Commit T98</strong> and inspect tuples <code>B</code> and <code>F</code>. Tuple
+  <code>B</code> (<code>xmin=98</code>) changes its rule from <code>R4</code> to <code>R5</code> yet
+  stays <strong>invisible</strong>; tuple <code>F</code> (<code>xmax=98</code>) changes from
+  <code>R8</code> to <code>R9</code> yet stays <strong>VISIBLE</strong> — because <code>98</code>
+  remains in your snapshot's <code>active</code> set. Now click <strong>Retake snapshot (RC)</strong>
+  (what Read Committed performs before every statement<sup class="cite"><a href="#ref-3">3</a></sup>):
+  <code>98</code> leaves <code>active</code> and <code>xmax</code> advances past <code>101</code> to
+  <code>102</code>, so <code>B</code> and <code>K</code> suddenly appear (<code>R6a</code>) while
+  <code>F</code> and <code>J</code> vanish (<code>R10</code>). Holding one snapshot per transaction
+  keeps your world frozen.</p>
 
-  <h2 id="sec-vacuum">Vacuum: taking out the dead versions</h2>
-  <p>MVCC's price is garbage: every UPDATE and DELETE leaves a dead version behind, invisible to
-  everyone but still occupying its slot. Cleanup is bounded by the oldest snapshot still
-  running: a version deleted by transaction X can be physically removed only once <em>every</em>
-  active snapshot sees X as committed — otherwise some reader still needs it. CMU's project
-  calls this cutoff the <em>watermark</em>: the lowest read timestamp among transactions that
-  have not yet finished.<sup class="cite"><a href="#ref-8">8</a></sup> FerricDB's
-  <code>VACUUM</code> computes the same horizon (<code>oldest_visible_xid</code>) and reclaims
-  tombstoned versions older than it; Postgres's vacuum additionally fights transaction-id
-  wraparound, a production concern your u64 txids let you wave at from a
-  distance.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+  <h2 id="sec-si">Snapshot isolation, write conflicts, and write skew</h2>
+  <p>Snapshots alone protect readers; they do not by themselves prevent two concurrent writers from
+  clobbering the same row (the <strong>lost update</strong> anomaly). Preventing lost updates under
+  Snapshot Isolation requires a write-conflict rule — and there are two ways engines enforce it:</p>
+  <ul>
+    <li><strong>First-updater-wins (PostgreSQL):</strong> When transaction <code>T2</code> attempts to
+      <code>UPDATE</code> or <code>DELETE</code> a tuple version <code>v1</code> whose
+      <code>xmax</code> is already set by another concurrent transaction <code>T1</code>,
+      PostgreSQL blocks <code>T2</code> on <code>T1</code>'s transaction lock until <code>T1</code>
+      finishes. Under <code>REPEATABLE READ</code>, if <code>T1</code> commits, PostgreSQL
+      immediately aborts <code>T2</code> with <code>ERROR: could not serialize access due to
+      concurrent update</code> (<code>SQLSTATE 40001</code>); if <code>T1</code> aborts,
+      <code>T2</code> proceeds.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>First-committer-wins (FerricDB Milestone&nbsp;8):</strong> Each transaction records
+      every <code>RecordId</code> it modifies via <code>TransactionManager::record_write</code>. At
+      <code>TransactionManager::commit</code>, inside the same mutex that flips the transaction's
+      state to <code>Committed</code>, the manager checks whether any <code>RecordId</code> in its
+      write set was also written by a transaction that committed <em>after</em> this transaction's
+      snapshot was captured. If so, the second committer is marked <code>Aborted</code> and receives
+      <code>Err(Error::Serialization)</code> — FerricDB's analog of <code>SQLSTATE 40001</code>.</li>
+  </ul>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Critical subtlety: never blindly overwrite another writer's <code>xmax</code></span>
+    <p>Suppose <code>T1</code> and <code>T2</code> both run <code>DELETE FROM acct WHERE id = 1</code>
+    against the same tuple <code>v1 (xmin=95, xmax=0)</code>. <code>T1</code> stamps
+    <code>v1.xmax = T1</code>. If <code>T2</code> then blindly overwrites <code>v1.xmax = T2</code>
+    on the heap page before calling <code>commit()</code>, watch what happens when <code>T1</code>
+    commits first and <code>T2</code> aborts under first-committer-wins: <code>v1.xmax</code> now
+    holds <code>T2</code> (<code>ABORTED</code>)! Rule&nbsp;6b sees an aborted deleter and treats
+    <code>v1</code> as <strong>still alive</strong> — silently resurrecting the row <code>T1</code>
+    committed deleting! Therefore, before stamping <code>meta.xmax</code> during an
+    <code>UPDATE</code> or <code>DELETE</code>, the executor must check whether <code>meta.xmax</code>
+    is already held by another active or post-snapshot committed transaction and fail with
+    <code>Error::Serialization</code> rather than clobbering it — combining safe eager
+    <code>xmax</code> guarding with commit-time first-committer-wins.</p>
+  </div>
+
+  <p>What anomaly coverage does MVCC Snapshot Isolation plus first-committer-wins achieve?
+  Both PostgreSQL's <code>REPEATABLE READ</code> documentation<sup class="cite"><a href="#ref-2">2</a></sup>
+  and toyDB's MVCC specification<sup class="cite"><a href="#ref-5">5</a></sup> state the exact
+  boundary with total honesty: dirty writes, dirty reads, lost updates, non-repeatable reads, and
+  phantoms are all eliminated — <strong>yet write skew remains possible</strong>.</p>
+
+  <p>Write skew breaks the tempting assumption that "no lost updates + no phantoms = serializable".
+  Suppose a hospital requires at least one doctor on call, and both Alice and Bob currently have
+  <code>on_call = true</code>. Transaction <code>T1</code> checks
+  <code>SELECT COUNT(*) FROM doctors WHERE on_call</code> (sees <code>2</code>) and sets
+  <code>Alice.on_call = false</code>. Concurrently, <code>T2</code> runs the same count (also sees
+  <code>2</code> from its snapshot) and sets <code>Bob.on_call = false</code>. Because
+  <code>T1</code>'s write set <code>{Alice}</code> and <code>T2</code>'s write set
+  <code>{Bob}</code> are <em>disjoint</em>, neither first-updater-wins nor first-committer-wins
+  detects a conflict: both transactions commit, leaving zero doctors on call — a committed state
+  impossible in any serial ordering!<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <p>Closing write skew requires tracking <em>read sets</em> (or predicate locks) in addition to write
+  sets. PostgreSQL's <code>SERIALIZABLE</code> level implements <strong>Serializable Snapshot
+  Isolation (SSI)</strong>: non-blocking SIREAD predicate locks record read–write anti-dependencies
+  (<code>rw</code> edges) and abort a transaction with <code>SQLSTATE 40001</code> whenever two
+  consecutive <code>rw</code> edges form a dangerous structure, requiring applications to retry on
+  serialization errors.<sup class="cite"><a href="#ref-2">2</a></sup> In FerricDB, Milestone&nbsp;8
+  honestly documents this exact boundary with the provided test
+  <code>ms8_write_skew_is_documented</code> (which asserts that disjoint-write skew commits under
+  plain SI), and <a href="../../project/stretch-s2/index.html">Stretch Milestone S2</a> adds SSI to
+  flip that test to <code>Err(Error::Serialization)</code>.</p>
+
+  <h2 id="sec-vacuum">VACUUM and the bridge to WAL recovery</h2>
+  <p>Because MVCC never mutates tuples in place, every <code>UPDATE</code> leaves a superseded
+  version behind, every <code>DELETE</code> leaves a tombstoned version behind, and every
+  <code>ROLLBACK</code> leaves aborted-insert corpses scattered across heap pages. Without garbage
+  collection, tables and indexes grow forever even when the live row count stays constant.</p>
+
+  <p>Reclaiming dead versions safely requires knowing when <em>no running transaction can possibly
+  see them anymore</em>. CMU 15-445 calls this global cutoff the <strong>watermark</strong> — the
+  lowest read timestamp among all unfinished transactions.<sup class="cite"><a href="#ref-8">8</a></sup>
+  FerricDB computes the exact same horizon in <code>TransactionManager::oldest_visible_xid()</code>
+  (the minimum <code>xmin</code> across all active snapshots, or the next unassigned
+  <code>TxnId</code> when no transactions are active). When <code>VACUUM</code> runs, it reclaims
+  two classes of dead tuples:</p>
+  <ol>
+    <li><strong>Dead deleted/superseded versions:</strong> Any tuple whose <code>xmax != 0</code> is
+      <code>COMMITTED</code> and strictly below <code>oldest_visible_xid()</code>. Every active and
+      future snapshot sees that deletion under Rule&nbsp;10, so the old version is permanently
+      unreachable.</li>
+    <li><strong>Aborted-insert corpses:</strong> Any tuple whose <code>xmin</code> is
+      <code>ABORTED</code>. Rule&nbsp;1 makes it invisible to every transaction immediately, so it is
+      reclaimable regardless of active snapshots.</li>
+  </ol>
+
+  <p>Physical reclamation happens at two storage layers that you built earlier in the course:</p>
+  <ul>
+    <li><strong>Heap pages (<code>HeapPage::compact</code>):</strong> For each dead slot,
+      <code>VACUUM</code> marks the slot tombstoned and calls <code>HeapPage::compact()</code> to
+      pack surviving tuple payloads contiguously toward the end of the 8&nbsp;KB page, growing the
+      middle free-space region back without moving any surviving slot index — so live
+      <code>RecordId { page_id, slot }</code> pointers remain valid!</li>
+    <li><strong>Secondary B+Tree indexes:</strong> Remember why Milestone&nbsp;5 ordered B+Tree
+      entries by composite <code>(key, rid)</code> (matching PostgreSQL's heap-TID tie-breaker)?
+      Because MVCC out-of-place <code>UPDATE</code>s insert a new <code>(key, new_rid)</code> while
+      leaving <code>(key, old_rid)</code> in place for older snapshots. During <code>VACUUM</code>,
+      before freeing a dead tuple's slot, FerricDB removes its exact <code>(key, rid)</code> entry
+      from every index on the table via <code>BPlusTree::delete(key, rid)</code> so stale index
+      pointers never outlive the heap slot they reference.</li>
+  </ul>
+
+  <div class="callout tip">
+    <span class="callout-title">How Milestone 8's MVCC abort meets Milestone 9's ARIES recovery</span>
+    <p>In Milestone&nbsp;8, <code>TransactionManager::abort</code> marks the transaction
+    <code>Aborted</code> and removes it from the active set: Rule&nbsp;1 instantly hides its inserts
+    and Rule&nbsp;6b ignores its <code>xmax</code> stamps without touching a single heap page. Why
+    then does <a href="../m10-logging-recovery/index.html">Module 10</a> (Milestone&nbsp;9) introduce
+    a write-ahead log and ARIES physical undo? Because in-memory transaction-state maps vanish on a
+    crash! In Milestone&nbsp;9, FerricDB logs every mutation and commit to the WAL, runs ARIES
+    physical undo with compensation log records (CLRs) on aborts and crashes to leave on-disk pages
+    clean independently of MVCC, and calls
+    <code>TransactionManager::restore(report.max_txn_id, report.committed_txns)</code> at startup so
+    every pre-crash committed tuple remains visible after restart.</p>
+  </div>
 
   <h2 id="sec-quiz">Check your understanding</h2>
 
-  <fieldset class="quiz" data-explain="Rule 5: a committed creator that is still active in your snapshot committed after your BEGIN, so its rows are in your future — invisible. This is exactly what makes the snapshot repeatable: later commits cannot appear mid-transaction.">
-    <legend class="quiz-q">A tuple's xmin is COMMITTED but appears in your snapshot's active list. Visible?</legend>
+  <fieldset class="quiz" data-explain="Rule 5: a committed creator that still appears in your snapshot's active set (or is ≥ snapshot.xmax) committed after your BEGIN, so its inserts lie in your future — invisible. This rule is what prevents fuzzy reads and phantoms under Snapshot Isolation.">
+    <legend class="quiz-q">1. A tuple's <code>xmin</code> is <code>COMMITTED</code>, but its id is in your snapshot's <code>active</code> set. Is the tuple visible?</legend>
     <label><input type="radio" name="q1"> Yes — committed data is always visible</label>
-    <label><input type="radio" name="q1" data-correct> No — it committed after your snapshot was taken (rule 5)</label>
-    <label><input type="radio" name="q1"> Only if xmax is also set</label>
+    <label><input type="radio" name="q1" data-correct> No — it committed after your snapshot was captured (Rule 5)</label>
+    <label><input type="radio" name="q1"> Only if <code>xmax == 0</code></label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="Rule 9: the deleter committed, but it is active in your snapshot — the delete is in your future, so the row is still visible to you. Deletes, like inserts, only take effect for snapshots taken after their commit.">
-    <legend class="quiz-q">A tuple has xmin=95 (committed long ago) and xmax=101, where 101 committed but is in your snapshot's active list. Visible?</legend>
-    <label><input type="radio" name="q2" data-correct> Yes — the deleter is in your snapshot's future (rule 9)</label>
-    <label><input type="radio" name="q2"> No — committed deletes always hide the row</label>
-    <label><input type="radio" name="q2"> Only under Read Committed</label>
+  <fieldset class="quiz" data-explain="Rule 9: the deleter committed, but its id is ≥ snapshot.xmax (in your snapshot's future), so the deletion had not happened when your transaction began — the tuple stays visible to you.">
+    <legend class="quiz-q">2. Your snapshot has <code>xmin=98, xmax=101, active={98}</code>. A tuple has <code>xmin=95</code> (committed) and <code>xmax=101</code> (committed). Visible?</legend>
+    <label><input type="radio" name="q2" data-correct> Yes — <code>xmax=101 ≥ snapshot.xmax</code> means the delete happened in your future (Rule 9)</label>
+    <label><input type="radio" name="q2"> No — committed deletes immediately hide rows from all snapshots</label>
+    <label><input type="radio" name="q2"> No — Rule 10 applies because 101 is not in <code>active</code></label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="Both transactions write disjoint rows, so first-committer-wins write-conflict detection finds no overlap — both commit. The broken invariant spans the two writes. Detecting it needs read-set tracking (SSI), which is exactly what plain SI lacks.">
-    <legend class="quiz-q">Why doesn't first-committer-wins catch write skew?</legend>
-    <label><input type="radio" name="q3"> Because one of the transactions is read-only</label>
-    <label><input type="radio" name="q3" data-correct> The two transactions write different rows — their write sets don't intersect</label>
-    <label><input type="radio" name="q3"> Because write skew only happens under Read Committed</label>
+  <fieldset class="quiz" data-explain="Both doctors' transactions read overlapping rows (the roster) but update disjoint rows ({Alice} vs {Bob}). Because their write sets do not intersect, first-committer-wins sees no write–write conflict and lets both commit. Preventing write skew requires tracking read–write anti-dependencies (SSI).">
+    <legend class="quiz-q">3. Why does first-committer-wins prevent lost updates yet allow write skew?</legend>
+    <label><input type="radio" name="q3"> Because write skew involves a read-only transaction</label>
+    <label><input type="radio" name="q3" data-correct> The two transactions update disjoint rows — their write sets never intersect</label>
+    <label><input type="radio" name="q3"> Because write skew only occurs under Read Committed</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="Strict 2PL holds every lock until commit/abort, so no transaction can ever read another's uncommitted write — which is what makes cascading aborts impossible. Plain 2PL only restricts acquisition order (two phases), not early release.">
-    <legend class="quiz-q">What does strict 2PL add over plain 2PL?</legend>
-    <label><input type="radio" name="q4"> A deadlock-free guarantee</label>
-    <label><input type="radio" name="q4" data-correct> All locks held to transaction end — eliminating cascading aborts</label>
-    <label><input type="radio" name="q4"> Shared locks upgradeable to exclusive</label>
+  <fieldset class="quiz" data-explain="Plain 2PL guarantees conflict-serializability but permits early lock release during the shrinking phase; if T2 reads T1's uncommitted write after T1 unlocks it and T1 later aborts, T2 must cascade-abort. Strict 2PL holds all locks until commit/abort, making cascading aborts impossible.">
+    <legend class="quiz-q">4. What property does Strict 2PL guarantee that plain 2PL does not?</legend>
+    <label><input type="radio" name="q4"> Deadlock freedom</label>
+    <label><input type="radio" name="q4" data-correct> Holding locks until commit/abort, eliminating cascading aborts and non-recoverable schedules</label>
+    <label><input type="radio" name="q4"> Allowing readers to bypass exclusive locks</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="A version is reclaimable only when no active snapshot can still see it — i.e., its deleter is committed and below the oldest active snapshot's horizon (the watermark / oldest_visible_xid). Reclaiming earlier would yank rows out from under a running reader.">
-    <legend class="quiz-q">When may VACUUM physically remove a dead version?</legend>
-    <label><input type="radio" name="q5"> As soon as its deleter commits</label>
-    <label><input type="radio" name="q5"> After the next checkpoint</label>
-    <label><input type="radio" name="q5" data-correct> Once its deleter is committed and older than every active snapshot's horizon</label>
+  <fieldset class="quiz" data-explain="In OCC, transactions execute against shared state without locks and only validate read/write overlap at commit time. Under hot-row contention, many concurrent updaters perform full work only to fail validation and abort repeatedly; under read-heavy low-contention workloads, OCC avoids lock overhead completely.">
+    <legend class="quiz-q">5. Under what workload does Optimistic Concurrency Control (OCC) struggle most compared to S2PL?</legend>
+    <label><input type="radio" name="q5"> Read-only analytical scans with zero writers</label>
+    <label><input type="radio" name="q5" data-correct> High write contention on hot rows, causing repeated commit-time validation aborts and wasted work</label>
+    <label><input type="radio" name="q5"> Single-threaded batch inserts</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="A deleted version is safe to physically remove only when no active snapshot can still see it — meaning its deleter is committed and strictly below oldest_visible_xid() (the watermark). Aborted-insert corpses (xmin aborted) are invisible to everyone immediately via Rule 1 and are also safe to reclaim.">
+    <legend class="quiz-q">6. When may <code>VACUUM</code> physically remove a tuple version deleted by transaction <code>X</code>?</legend>
+    <label><input type="radio" name="q6"> The instant <code>X</code> commits</label>
+    <label><input type="radio" name="q6"> Whenever <code>X</code> is still in progress, as long as no index points to it</label>
+    <label><input type="radio" name="q6" data-correct> Once <code>X</code> is committed and strictly older than <code>oldest_visible_xid()</code> (every active snapshot's horizon)</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
@@ -320,35 +913,40 @@
     <div class="refs">
       <ol>
         <li id="ref-1">Hironobu Suzuki, The Internals of PostgreSQL, Ch. 5 introduction —
-          the three concurrency-control families and MVCC's readers-don't-block-writers
-          property.
+          the three concurrency-control families (MVCC, S2PL, OCC) and MVCC's
+          readers-don't-block-writers property.
           <a href="https://www.interdb.jp/pg/pgsql05.html" rel="external">https://www.interdb.jp/pg/pgsql05.html</a></li>
         <li id="ref-2">PostgreSQL Documentation, "Transaction Isolation" — the four phenomena,
-          Read Committed as default, Repeatable Read as Snapshot Isolation, SSI predicate
-          locking, and SQLSTATE 40001 retry guidance.
+          SQL-standard vs PostgreSQL isolation matrix (RU→RC, RR as Snapshot Isolation),
+          first-updater-wins, SSI predicate locking, and <code>SQLSTATE 40001</code> retry guidance.
           <a href="https://www.postgresql.org/docs/current/transaction-iso.html" rel="external">https://www.postgresql.org/docs/current/transaction-iso.html</a></li>
         <li id="ref-3">Hironobu Suzuki, The Internals of PostgreSQL, §5.5 — transaction
-          snapshots: the xmin:xmax:xip_list format and per-statement (RC) vs per-transaction
+          snapshots: <code>xmin:xmax:xip_list</code> and per-statement (RC) vs per-transaction
           (RR/Serializable) snapshot timing.
           <a href="https://www.interdb.jp/pg/pgsql05/05.html" rel="external">https://www.interdb.jp/pg/pgsql05/05.html</a></li>
         <li id="ref-4">Hironobu Suzuki, The Internals of PostgreSQL, §5.6 and §5.10 — the ten
-          visibility check rules, and vacuum/wraparound maintenance.
+          visibility check rules, dead-tuple cleanup, and transaction-id wraparound freezing.
           <a href="https://www.interdb.jp/pg/pgsql05/06.html" rel="external">https://www.interdb.jp/pg/pgsql05/06.html</a></li>
         <li id="ref-5">erikgrinaker/toydb, SQL documentation, "Transactions" — MVCC snapshot
-          isolation's documented anomaly coverage, write skew explicitly possible without SSI.
+          isolation's documented anomaly coverage, with write skew explicitly possible without SSI.
           <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/sql.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/sql.md</a>
           (design walkthrough: <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md" rel="external">docs/architecture/mvcc.md</a>)</li>
-        <li id="ref-6">Berkeley CS186 Notes, "Transactions &amp; Concurrency I" — conflicting
-          operations and conflict serializability.
+        <li id="ref-6">Berkeley CS186 Notes, "Transactions &amp; Concurrency I" — schedules,
+          conflicting operations, precedence graphs, conflict serializability, and view
+          serializability with blind writes.
           <a href="https://cs186berkeley.net/notes/note11/" rel="external">https://cs186berkeley.net/notes/note11/</a></li>
         <li id="ref-7">Berkeley CS186 Notes, "Transactions &amp; Concurrency II" — 2PL, strict
           2PL and cascading aborts, the lock manager, deadlock detection via waits-for graphs,
-          wait-die/wound-wait.
+          and wait-die / wound-wait prevention.
           <a href="https://cs186berkeley.net/notes/note12/" rel="external">https://cs186berkeley.net/notes/note12/</a></li>
         <li id="ref-8">CMU 15-445/645 (Fall 2025), Project #4 — MVCC with snapshot isolation
           and the watermark (lowest read timestamp among unfinished transactions) as the GC
           horizon.
           <a href="https://15445.courses.cs.cmu.edu/fall2025/project4/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project4/</a></li>
+        <li id="ref-9">PostgreSQL Documentation, "Database Page Layout" — the 23-byte
+          <code>HeapTupleHeaderData</code> carrying 32-bit <code>t_xmin</code> and
+          <code>t_xmax</code> transaction ids.
+          <a href="https://www.postgresql.org/docs/current/storage-page-layout.html" rel="external">https://www.postgresql.org/docs/current/storage-page-layout.html</a></li>
       </ol>
     </div>
 
@@ -357,18 +955,18 @@
       <li>The Internals of PostgreSQL, §5.7 — the visibility check applied to a worked
         Read-Committed vs Repeatable-Read example, plus hint bits.
         <a href="https://www.interdb.jp/pg/pgsql05/07.html" rel="external">interdb.jp/pg/pgsql05/07.html</a></li>
-      <li>toyDB's MVCC walkthrough — a complete, readable Rust implementation of everything this
-        page described, ~1000 lines.
-        <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md" rel="external">github.com/erikgrinaker/toydb/docs/architecture/mvcc.md</a></li>
-      <li>PostgreSQL docs, "Routine Vacuuming" — autovacuum, freezing, and the wraparound
-        machinery production Postgres runs so users never think about xids.
+      <li>toyDB's MVCC walkthrough — a complete, readable Rust implementation of snapshot
+        isolation and version keys, ~1,000 lines.
+        <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md" rel="external">github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md</a></li>
+      <li>PostgreSQL docs, "Routine Vacuuming" — autovacuum, visibility maps, freezing, and
+        preventing 32-bit transaction-id wraparound in production.
         <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html" rel="external">postgresql.org/docs/current/routine-vacuuming.html</a></li>
     </ul>
 
     <h2 id="sec-milestone">Milestone link</h2>
     <p>What to build now: <a href="../../project/milestone-08/index.html">Milestone 8 —
     Transactions and MVCC Snapshot Isolation</a>: transaction ids, snapshots, the ten visibility
-    rules, first-committer-wins, COMMIT/ROLLBACK, and VACUUM.</p>
+    rules, first-committer-wins, <code>COMMIT</code>/<code>ROLLBACK</code>, and <code>VACUUM</code>.</p>
 
     <nav class="prevnext">
       <a href="../../project/milestone-07/index.html"><span class="dir">← Previous</span> Milestone 7 · Query Optimization</a>
@@ -380,54 +978,55 @@
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
 
-  /* ================= anomaly zoo ================= */
+  /* ================= 1. anomaly zoo (off-by-1 fixed: total === steps.length, s <= i) ================= */
   var SCEN = {
     lost: {
       steps: [
-        ["BEGIN; SELECT balance → 100", ""],
-        ["", "BEGIN; SELECT balance → 100"],
-        ["UPDATE balance = 100 + 20", ""],
-        ["COMMIT ✓", ""],
-        ["", "UPDATE balance = 100 + 50"],
-        ["", "COMMIT?"]
+        { t1: "BEGIN; SELECT balance → 100", t2: "" },
+        { t1: "", t2: "BEGIN; SELECT balance → 100" },
+        { t1: "UPDATE balance = 100 + 20 (= 120)", t2: "" },
+        { t1: "COMMIT ✓", t2: "" },
+        { t1: "", t2: "UPDATE balance = 100 + 50 (= 150)" },
+        { t1: "", t2_rc: "COMMIT ✓ (balance = 150 — T1's +20 lost!)", t2_si: "COMMIT → ABORT (Error::Serialization 40001; eager first-updater-wins aborts at t5)" }
       ],
-      rc: { verdict: "ANOMALY: T2's update writes 150 based on the stale read of 100 — T1's +20 is silently lost. Final balance 150, not 170.", cls: "pitfall" },
-      si: { verdict: "PREVENTED: first-committer-wins sees T2 writing a row version that T1 (a concurrent transaction) already wrote and committed. T2 aborts with a serialization error and retries with the fresh value.", cls: "tip" }
+      rc: { verdict: "ANOMALY (Lost Update): T2 writes 150 computed from its stale read of 100 and commits — T1's committed +20 vanishes. Final balance is 150 instead of 170.", cls: "pitfall" },
+      si: { verdict: "PREVENTED: Pure commit-time first-committer-wins catches the conflict at COMMIT (while PostgreSQL and FerricDB's MS8 eager meta.xmax check abort T2 even earlier, at t5's UPDATE). T2 aborts with Error::Serialization (40001) and retries against 120 to write 170.", cls: "tip" }
     },
     fuzzy: {
       steps: [
-        ["BEGIN; SELECT price → 10", ""],
-        ["", "BEGIN; UPDATE price = 99"],
-        ["", "COMMIT ✓"],
-        ["SELECT price again → ?", ""],
-        ["COMMIT", ""]
+        { t1: "BEGIN; SELECT price → 10", t2: "" },
+        { t1: "", t2: "BEGIN; UPDATE price = 99" },
+        { t1: "", t2: "COMMIT ✓" },
+        { t1_rc: "SELECT price again → 99 (!)", t1_si: "SELECT price again → 10 (snapshot)", t2: "" },
+        { t1: "COMMIT ✓", t2: "" }
       ],
-      rc: { verdict: "ANOMALY: Read Committed takes a fresh snapshot per statement, so T1's second read sees 99 — the same row changed mid-transaction (nonrepeatable read).", cls: "pitfall" },
-      si: { verdict: "PREVENTED: T1 keeps its BEGIN snapshot; rule 5 hides T2's later commit. Both reads return 10.", cls: "tip" }
+      rc: { verdict: "ANOMALY (Non-Repeatable / Fuzzy Read): Read Committed takes a fresh snapshot before every statement, so T1's second read observes 99 — the same row changed mid-transaction.", cls: "pitfall" },
+      si: { verdict: "PREVENTED: T1 keeps its BEGIN snapshot; Rule 5 hides T2's new version (99) and Rule 9 keeps the old version (10) visible. Both reads return 10.", cls: "tip" }
     },
     phantom: {
       steps: [
-        ["BEGIN; SELECT COUNT(*) WHERE dept=7 → 2", ""],
-        ["", "BEGIN; INSERT row with dept=7"],
-        ["", "COMMIT ✓"],
-        ["SELECT COUNT(*) WHERE dept=7 again → ?", ""],
-        ["COMMIT", ""]
+        { t1: "BEGIN; SELECT COUNT(*) WHERE dept=7 → 2", t2: "" },
+        { t1: "", t2: "BEGIN; INSERT (dept=7)" },
+        { t1: "", t2: "COMMIT ✓" },
+        { t1_rc: "SELECT COUNT(*) WHERE dept=7 → 3 (phantom!)", t1_si: "SELECT COUNT(*) WHERE dept=7 → 2 (snapshot)", t2: "" },
+        { t1: "COMMIT ✓", t2: "" }
       ],
-      rc: { verdict: "ANOMALY: the second count returns 3 — a phantom row appeared in the predicate's result set between two identical queries.", cls: "pitfall" },
-      si: { verdict: "PREVENTED: the new row's xmin is active in T1's snapshot (rule 5), so both counts return 2. Snapshots handle phantoms without predicate locks.", cls: "tip" }
+      rc: { verdict: "ANOMALY (Phantom Read): The fresh statement snapshot exposes T2's newly inserted row, so the second count returns 3 — a phantom appeared in the predicate's result set.", cls: "pitfall" },
+      si: { verdict: "PREVENTED: T2's inserted tuple has xmin active/future in T1's BEGIN snapshot (Rule 5), so both counts return 2 — MVCC prevents phantoms without range locks.", cls: "tip" }
     },
     skew: {
       steps: [
-        ["BEGIN; SELECT on-call doctors → {Alice, Bob}", ""],
-        ["", "BEGIN; SELECT on-call doctors → {Alice, Bob}"],
-        ["UPDATE Alice: on_call = false", ""],
-        ["", "UPDATE Bob: on_call = false"],
-        ["COMMIT ✓", ""],
-        ["", "COMMIT?"]
+        { t1: "BEGIN; SELECT on_call → {Alice, Bob}", t2: "" },
+        { t1: "", t2: "BEGIN; SELECT on_call → {Alice, Bob}" },
+        { t1: "UPDATE Alice SET on_call = false", t2: "" },
+        { t1: "", t2: "UPDATE Bob SET on_call = false" },
+        { t1: "COMMIT ✓", t2: "" },
+        { t1: "", t2_rc: "COMMIT ✓ (0 doctors on call!)", t2_si: "COMMIT ✓ (disjoint writes — 0 doctors on call!)" }
       ],
-      rc: { verdict: "ANOMALY: both commit — each checked “at least one other doctor is on call” against a state the other was destroying. Invariant broken; no serial order produces this result.", cls: "pitfall" },
-      si: { verdict: "STILL AN ANOMALY: the write sets {Alice} and {Bob} don't intersect, so first-committer-wins finds no conflict. Both commit. This is write skew — the documented hole in snapshot isolation; closing it takes SSI (stretch S2).", cls: "pitfall" }
+      rc: { verdict: "ANOMALY (Write Skew): Both transactions checked the invariant against stale state and committed disjoint updates — leaving zero doctors on call.", cls: "pitfall" },
+      si: { verdict: "STILL AN ANOMALY (Write Skew): Write sets {Alice} and {Bob} do not intersect, so first-committer-wins sees no conflict and both commit. Closing write skew requires SSI read-set tracking (Stretch S2).", cls: "pitfall" }
     }
   };
 
@@ -438,34 +1037,45 @@ document.addEventListener("DOMContentLoaded", function () {
   var zooVerdict = document.getElementById("zoo-verdict");
   var zooVerdictText = document.getElementById("zoo-verdict-text");
 
+  function cellText(step, who, iso) {
+    var keyed = step[who + "_" + iso];
+    return keyed != null ? keyed : (step[who] || "");
+  }
+
   function zooRender() {
     var sc = SCEN[zooAnom.value];
     var iso = zooIso.value;
+    var n = sc.steps.length;
+    var captions = sc.steps.map(function (st, idx) {
+      var a = cellText(st, "t1", iso);
+      var b = cellText(st, "t2", iso);
+      return "t" + (idx + 1) + ": " + (a ? "T1 — " + a : "T2 — " + b);
+    });
     zooStepHost.textContent = "";
     Course.stepper(zooStepHost, {
-      total: sc.steps.length + 1,
-      captions: sc.steps.map(function (s, i) {
-        return "t" + (i + 1) + ": " + (s[0] ? "T1 — " + s[0] : "T2 — " + s[1]);
-      }).concat(["End of schedule — verdict below."]),
+      total: n,
+      captions: captions,
       render: function (i) {
         zooBody.textContent = "";
-        for (var s = 0; s < Math.min(i, sc.steps.length); s++) {
+        for (var s = 0; s <= i; s++) {
           var tr = Course.el("tr");
+          if (s === i) tr.style.background = "var(--accent-soft)";
           tr.appendChild(Course.el("td", null, "t" + (s + 1)));
-          var td1 = Course.el("td", null, sc.steps[s][0]);
-          var td2 = Course.el("td", null, sc.steps[s][1]);
+          var td1 = Course.el("td", null, cellText(sc.steps[s], "t1", iso));
+          var td2 = Course.el("td", null, cellText(sc.steps[s], "t2", iso));
           td1.style.fontFamily = td2.style.fontFamily = "var(--mono)";
           td1.style.fontSize = td2.style.fontSize = "0.82rem";
-          tr.appendChild(td1); tr.appendChild(td2);
+          tr.appendChild(td1);
+          tr.appendChild(td2);
           zooBody.appendChild(tr);
         }
-        if (i >= sc.steps.length) {
+        if (i === n - 1) {
           var v = sc[iso];
           zooVerdict.className = "callout " + v.cls;
           zooVerdictText.textContent = v.verdict;
         } else {
           zooVerdict.className = "callout note";
-          zooVerdictText.textContent = "Step through to the end.";
+          zooVerdictText.textContent = "Step " + (i + 1) + " of " + n + " — step to t" + n + " for the final verdict.";
         }
       }
     });
@@ -474,105 +1084,181 @@ document.addEventListener("DOMContentLoaded", function () {
   zooIso.addEventListener("change", zooRender);
   zooRender();
 
-  /* ================= 2PL checker ================= */
-  var SCHEDULES = {
-    ok: [
-      "T1: lock-X(A)            | phase: T1 growing",
-      "T1: write(A)             | ok — holds X(A)",
-      "T2: lock-S(B)            | phase: T2 growing",
-      "T2: read(B)              | ok — holds S(B)",
-      "T1: lock-X(B)?           | conflict with T2's S(B) → T1 WAITS (waits-for: T1→T2)",
-      "T2: read(B)              | ok",
-      "T2: commit → release S(B)| strict 2PL: all locks released at commit",
-      "T1: lock-X(B) granted    | wait over; waits-for edge removed",
-      "T1: write(B)             | ok",
-      "T1: commit → release all | VERDICT: valid strict 2PL — serializable as T2, T1"
+  /* ================= 2. 2PL schedule checker (structured phase + lock table + waits-for) ================= */
+  var TPL_SCHEDULES = {
+    strict: [
+      { op: "T1: lock-X(A)", caption: "T1 acquires exclusive lock X(A). T1 is in its GROWING phase.",
+        phases: { T1: "GROWING", T2: "IDLE" }, locks: { A: "held [T1(X)]", B: "free" }, wfg: "(empty)" },
+      { op: "T1: write(A)", caption: "T1 writes A safely while holding X(A).",
+        phases: { T1: "GROWING", T2: "IDLE" }, locks: { A: "held [T1(X)]", B: "free" }, wfg: "(empty)" },
+      { op: "T2: lock-S(B)", caption: "T2 acquires shared lock S(B). T2 enters its GROWING phase.",
+        phases: { T1: "GROWING", T2: "GROWING" }, locks: { A: "held [T1(X)]", B: "held [T2(S)]" }, wfg: "(empty)" },
+      { op: "T2: read(B)", caption: "T2 reads B safely while holding S(B).",
+        phases: { T1: "GROWING", T2: "GROWING" }, locks: { A: "held [T1(X)]", B: "held [T2(S)]" }, wfg: "(empty)" },
+      { op: "T1: lock-X(B)?  [BLOCKED]", caption: "Conflict: X(B) is incompatible with T2's S(B). T1 blocks and adds waits-for edge T1 → T2.",
+        phases: { T1: "GROWING (waiting)", T2: "GROWING" }, locks: { A: "held [T1(X)]", B: "held [T2(S)] · wait [T1(X)]" }, wfg: "T1 → T2" },
+      { op: "T2: commit → release S(B)", caption: "Strict 2PL: T2 holds all locks until commit, then releases S(B) atomically.",
+        phases: { T1: "GROWING (unblocked)", T2: "COMMITTED" }, locks: { A: "held [T1(X)]", B: "free (granting T1)" }, wfg: "(empty)" },
+      { op: "T1: lock-X(B) granted; write(B)", caption: "T1 wakes up, acquires X(B) while still in its GROWING phase, and writes B.",
+        phases: { T1: "GROWING", T2: "COMMITTED" }, locks: { A: "held [T1(X)]", B: "held [T1(X)]" }, wfg: "(empty)" },
+      { op: "T1: commit → release X(A), X(B)", caption: "VERDICT: Valid Strict 2PL. Conflict-serializable as T2 → T1, with zero cascading aborts.",
+        phases: { T1: "COMMITTED", T2: "COMMITTED" }, locks: { A: "free", B: "free" }, wfg: "(empty)" }
     ],
-    bad: [
-      "T1: lock-X(A)            | phase: T1 growing",
-      "T1: write(A)             | ok",
-      "T1: unlock(A)            | phase: T1 SHRINKING begins",
-      "T2: lock-X(A)            | granted — T1 released it",
-      "T2: write(A), commit     | T2 read/overwrote data from uncommitted T1",
-      "T1: lock-X(B)?           | VIOLATION: acquiring after releasing breaks two-phase",
-      "—                        | VERDICT: not 2PL. Also unsafe: if T1 now aborts, T2 already used its dirty write (cascading abort)"
+    cascade: [
+      { op: "T1: lock-X(A); write(A)", caption: "T1 acquires X(A) and writes A (GROWING phase).",
+        phases: { T1: "GROWING", T2: "IDLE" }, locks: { A: "held [T1(X)]", B: "free" }, wfg: "(empty)" },
+      { op: "T1: lock-X(B); write(B)", caption: "T1 acquires its final lock X(B) BEFORE releasing anything — plain 2PL growing phase completes.",
+        phases: { T1: "GROWING (lock point)", T2: "IDLE" }, locks: { A: "held [T1(X)]", B: "held [T1(X)]" }, wfg: "(empty)" },
+      { op: "T1: unlock(A)  [early release]", caption: "T1 enters its SHRINKING phase early (still uncommitted!). Valid plain 2PL, NOT Strict 2PL.",
+        phases: { T1: "SHRINKING", T2: "IDLE" }, locks: { A: "free", B: "held [T1(X)]" }, wfg: "(empty)" },
+      { op: "T2: lock-S(A); read(A)", caption: "T2 acquires S(A) and reads T1's uncommitted write to A (dirty read!). T2 has not committed yet.",
+        phases: { T1: "SHRINKING", T2: "GROWING (read dirty A)" }, locks: { A: "held [T2(S)]", B: "held [T1(X)]" }, wfg: "(empty)" },
+      { op: "T1: ABORT → release X(B)", caption: "T1 hits an error and aborts, rolling back A — invalidating the value T2 already read!",
+        phases: { T1: "ABORTED", T2: "MUST ABORT (dirty read)" }, locks: { A: "held [T2(S)]", B: "free" }, wfg: "(empty)" },
+      { op: "T2: CASCADING ABORT → release S(A)", caption: "VERDICT: Valid plain 2PL, yet it caused a CASCADING ABORT. Holding X(A) until commit (Strict 2PL) prevents this.",
+        phases: { T1: "ABORTED", T2: "ABORTED (cascaded)" }, locks: { A: "free", B: "free" }, wfg: "(empty)" }
     ],
-    dead: [
-      "T1: lock-S(A)            | granted",
-      "T2: lock-S(A)            | granted — S locks are compatible",
-      "T1: lock-X(A)?           | upgrade blocked by T2's S(A) → T1 waits (T1→T2)",
-      "T2: lock-X(A)?           | upgrade blocked by T1's S(A) → T2 waits (T2→T1)",
-      "—                        | waits-for graph: T1→T2→T1 — CYCLE",
-      "—                        | VERDICT: deadlock. Detector aborts a victim (say T2); T1's upgrade proceeds"
+    violation: [
+      { op: "T1: lock-X(A); write(A)", caption: "T1 acquires X(A) and writes A (GROWING phase).",
+        phases: { T1: "GROWING", T2: "IDLE" }, locks: { A: "held [T1(X)]", B: "free" }, wfg: "(empty)" },
+      { op: "T1: unlock(A)  [early release]", caption: "T1 releases X(A) while uncommitted — T1 is now in its SHRINKING phase.",
+        phases: { T1: "SHRINKING", T2: "IDLE" }, locks: { A: "free", B: "free" }, wfg: "(empty)" },
+      { op: "T2: lock-X(A); write(A)", caption: "DIRTY WRITE: T2 acquires X(A) and overwrites uncommitted T1's value on A.",
+        phases: { T1: "SHRINKING", T2: "GROWING (dirty write!)" }, locks: { A: "held [T2(X)]", B: "free" }, wfg: "(empty)" },
+      { op: "T2: COMMIT → release X(A)", caption: "DIRTY WRITE / NON-STRICT SCHEDULE: T2 committed after overwriting uncommitted T1's write on A. If T1 later aborts, physical before-image undo cannot restore A without erasing T2's committed value!",
+        phases: { T1: "SHRINKING", T2: "COMMITTED (non-strict!)" }, locks: { A: "free", B: "free" }, wfg: "(empty)" },
+      { op: "T1: lock-X(B)?  [2PL VIOLATION]", caption: "VERDICT: Two distinct failures — (1) acquiring X(B) after unlock(A) violates 2PL; (2) T2's commit after overwriting uncommitted A is a dirty write (violating strictness).",
+        phases: { T1: "VIOLATION (acquire in shrinking)", T2: "COMMITTED" }, locks: { A: "free", B: "REJECTED" }, wfg: "(empty)" }
+    ],
+    deadlock: [
+      { op: "T1: lock-S(A)", caption: "T1 acquires shared lock S(A) (GROWING).",
+        phases: { T1: "GROWING", T2: "IDLE" }, locks: { A: "held [T1(S)]" }, wfg: "(empty)" },
+      { op: "T2: lock-S(A)", caption: "T2 also acquires S(A) — shared locks are compatible.",
+        phases: { T1: "GROWING", T2: "GROWING" }, locks: { A: "held [T1(S), T2(S)]" }, wfg: "(empty)" },
+      { op: "T1: upgrade S(A)→X(A)?  [BLOCKED]", caption: "T1 cannot upgrade while T2 holds S(A). T1 waits → edge T1 → T2.",
+        phases: { T1: "GROWING (waiting)", T2: "GROWING" }, locks: { A: "held [T1(S), T2(S)] · wait [T1(X)]" }, wfg: "T1 → T2" },
+      { op: "T2: upgrade S(A)→X(A)?  [DEADLOCK]", caption: "T2 cannot upgrade while T1 holds S(A). Edge T2 → T1 closes cycle T1 → T2 → T1!",
+        phases: { T1: "WAITING (deadlocked)", T2: "WAITING (deadlocked)" }, locks: { A: "held [T1(S), T2(S)] · wait [T1(X), T2(X)]" }, wfg: "CYCLE: T1 → T2 → T1" },
+      { op: "Detector aborts victim T2 → release S(A)", caption: "Deadlock detector breaks the cycle by aborting T2 and releasing T2's S(A).",
+        phases: { T1: "GROWING (unblocked)", T2: "ABORTED (victim)" }, locks: { A: "held [T1(S)] · granting T1(X)" }, wfg: "(empty)" },
+      { op: "T1: X(A) granted; write(A); commit", caption: "VERDICT: Deadlock resolved cleanly. T1 finishes its upgrade, commits, and T2 can retry.",
+        phases: { T1: "COMMITTED", T2: "ABORTED (victim)" }, locks: { A: "free" }, wfg: "(empty)" }
     ]
   };
+
   var tplSel = document.getElementById("tpl-sched");
   var tplLog = document.getElementById("tpl-log");
+  var tplPhases = document.getElementById("tpl-phases");
+  var tplLocks = document.getElementById("tpl-locks");
+  var tplWfg = document.getElementById("tpl-wfg");
   var tplHost = document.getElementById("tpl-stepper");
+
   function tplRender() {
-    var lines = SCHEDULES[tplSel.value];
+    var steps = TPL_SCHEDULES[tplSel.value];
     tplHost.textContent = "";
     Course.stepper(tplHost, {
-      total: lines.length,
-      captions: lines.map(function (l) { return l.split("|")[1].trim(); }),
+      total: steps.length,
+      captions: steps.map(function (s) { return s.caption; }),
       render: function (i) {
-        tplLog.textContent = lines.slice(0, i + 1)
-          .map(function (l) { return l.split("|")[0].trim(); }).join("\n");
+        var cur = steps[i];
+        tplLog.textContent = steps.slice(0, i + 1).map(function (s, idx) {
+          return (idx === i ? "▶ " : "  ") + String(idx + 1) + ". " + s.op;
+        }).join("\n");
+        tplPhases.textContent = "PHASES\n" + Object.keys(cur.phases).map(function (t) {
+          return "  " + t + ": " + cur.phases[t];
+        }).join("\n");
+        tplLocks.textContent = "LOCK TABLE\n" + Object.keys(cur.locks).map(function (obj) {
+          return "  " + obj + ": " + cur.locks[obj];
+        }).join("\n");
+        tplWfg.textContent = "WAITS-FOR GRAPH\n  " + cur.wfg;
       }
     });
   }
   tplSel.addEventListener("change", tplRender);
   tplRender();
 
-  /* ================= MVCC visibility checker ================= */
-  var CURRENT = 100;
-  var initState = function () {
+  /* ================= 3. MVCC visibility checker (matches crates/txn/tests/txn.rs snapshot_100) ================= */
+  var OWNER = 100;
+  function initVisState() {
     return {
-      status: { 95: "COMMITTED", 96: "COMMITTED", 98: "IN_PROGRESS", 99: "ABORTED",
-                100: "IN_PROGRESS", 101: "COMMITTED" },
-      snap: { xmin: 98, xmax: 102, xip: [98, 100, 101] }
+      status: {
+        95: "COMMITTED",
+        96: "COMMITTED",
+        98: "IN_PROGRESS",
+        99: "ABORTED",
+        100: "IN_PROGRESS",
+        101: "COMMITTED"
+      },
+      snap: { owner: OWNER, xmin: 98, xmax: 101, active: [98] }
     };
-  };
-  var st = initState();
+  }
+  var st = initVisState();
   var TUPLES = [
-    ["A", 95, 0], ["B", 98, 0], ["C", 100, 0], ["D", 100, 100], ["E", 99, 0],
-    ["F", 95, 98], ["G", 95, 100], ["H", 95, 96], ["I", 95, 101], ["J", 101, 0]
+    ["v0", 0, 0],
+    ["A", 95, 0],
+    ["B", 98, 0],
+    ["C", 100, 0],
+    ["D", 100, 100],
+    ["E", 99, 0],
+    ["F", 95, 98],
+    ["G", 95, 99],
+    ["H", 95, 100],
+    ["I", 95, 96],
+    ["J", 95, 101],
+    ["K", 101, 0]
   ];
 
   function activeInSnap(xid) {
-    return st.snap.xip.indexOf(xid) !== -1 || xid >= st.snap.xmax;
+    return st.snap.active.indexOf(xid) !== -1 || xid >= st.snap.xmax;
   }
-  // interdb §5.6 rules 1–10, verbatim structure
+
+  // interdb §5.6 rules 1–10 + FerricDB frozen xmin == 0
   function judge(xmin, xmax) {
-    var sMin = st.status[xmin] || "IN_PROGRESS";
-    if (sMin === "ABORTED") return [false, 1, "creator aborted"];
-    if (sMin === "IN_PROGRESS") {
-      if (xmin === CURRENT) {
-        if (xmax === 0) return [true, 2, "my own insert, not deleted"];
-        return [false, 3, "I inserted it but then deleted it myself"];
+    if (xmin !== 0) {
+      var sMin = st.status[xmin] || "IN_PROGRESS";
+      if (sMin === "ABORTED") return [false, "R1", "creator T" + xmin + " aborted"];
+      if (sMin === "IN_PROGRESS") {
+        if (xmin === st.snap.owner) {
+          if (xmax === 0) return [true, "R2", "my own insert, not deleted"];
+          return [false, "R3", "I inserted and deleted it myself"];
+        }
+        return [false, "R4", "creator T" + xmin + " is another in-progress txn"];
       }
-      return [false, 4, "creator (T" + xmin + ") is another in-progress transaction"];
+      // committed creator
+      if (activeInSnap(xmin)) {
+        return [false, "R5", xmin >= st.snap.xmax
+          ? "creator T" + xmin + " ≥ snap.xmax (" + st.snap.xmax + ") — future"
+          : "creator T" + xmin + " committed after my snapshot (in active)"];
+      }
     }
-    // committed creator
-    if (activeInSnap(xmin)) return [false, 5, "creator committed AFTER my snapshot (active in xip)"];
-    if (xmax === 0 || (st.status[xmax] === "ABORTED"))
-      return [true, 6, "no deleter (or deleter aborted)"];
+    var prefix = xmin === 0 ? "frozen (xmin=0); " : "";
+    if (xmax === 0) return [true, xmin === 0 ? "Frozen/R6a" : "R6a", prefix + "no deleter"];
     var sMax = st.status[xmax] || "IN_PROGRESS";
+    if (sMax === "ABORTED") return [true, "R6b", prefix + "deleter T" + xmax + " aborted"];
     if (sMax === "IN_PROGRESS") {
-      if (xmax === CURRENT) return [false, 7, "I deleted it myself"];
-      return [true, 8, "deleter (T" + xmax + ") still in progress — delete not real yet"];
+      if (xmax === st.snap.owner) return [false, "R7", prefix + "I deleted it myself"];
+      return [true, "R8", prefix + "deleter T" + xmax + " still in progress"];
     }
-    // deleter committed
-    if (activeInSnap(xmax)) return [true, 9, "deleter committed after my snapshot — delete is in my future"];
-    return [false, 10, "deleter committed before my snapshot"];
+    // committed deleter
+    if (activeInSnap(xmax)) {
+      return [true, "R9", prefix + (xmax >= st.snap.xmax
+        ? "deleter T" + xmax + " ≥ snap.xmax (" + st.snap.xmax + ") — delete in future"
+        : "deleter T" + xmax + " committed after my snapshot (in active)")];
+    }
+    return [false, "R10", prefix + "deleter T" + xmax + " committed before my snapshot"];
   }
 
   var visBody = document.getElementById("vis-body");
   var visTxns = document.getElementById("vis-txns");
   var visSnap = document.getElementById("vis-snap");
+  var btnT98 = document.getElementById("vis-t98");
 
   function visRender() {
-    visSnap.textContent = st.snap.xmin + ":" + st.snap.xmax + ":" + st.snap.xip.join(",");
+    var actStr = "{" + st.snap.active.join(", ") + "}";
+    visSnap.textContent = "owner=" + st.snap.owner + ", xmin=" + st.snap.xmin +
+      ", xmax=" + st.snap.xmax + ", active=" + actStr;
+    btnT98.textContent = st.status[98] === "IN_PROGRESS" ? "Commit T98" : "Uncommit T98";
+
     visTxns.textContent = "";
     Object.keys(st.status).forEach(function (xid) {
       var span = Course.el("span", { "class": "stat" }, "T" + xid + " ");
@@ -580,38 +1266,46 @@ document.addEventListener("DOMContentLoaded", function () {
       span.appendChild(b);
       visTxns.appendChild(span);
     });
+
     visBody.textContent = "";
     TUPLES.forEach(function (t) {
       var v = judge(t[1], t[2]);
       var tr = Course.el("tr");
       tr.appendChild(Course.el("td", null, t[0]));
-      tr.appendChild(Course.el("td", null, String(t[1])));
-      tr.appendChild(Course.el("td", null, t[2] === 0 ? "—" : String(t[2])));
+      tr.appendChild(Course.el("td", null, t[1] === 0 ? "0 (frozen)" : String(t[1])));
+      tr.appendChild(Course.el("td", null, t[2] === 0 ? "0 (—)" : String(t[2])));
       var verdict = Course.el("td", null, v[0] ? "VISIBLE" : "invisible");
       verdict.style.fontWeight = "700";
       verdict.style.color = v[0] ? "var(--good)" : "var(--bad)";
       tr.appendChild(verdict);
-      tr.appendChild(Course.el("td", null, "R" + v[1]));
+      tr.appendChild(Course.el("td", null, v[1]));
       tr.appendChild(Course.el("td", null, v[2]));
       visBody.appendChild(tr);
     });
   }
-  document.getElementById("vis-commit").addEventListener("click", function () {
-    if (st.status[98] === "IN_PROGRESS") st.status[98] = "COMMITTED";
+
+  btnT98.addEventListener("click", function () {
+    st.status[98] = st.status[98] === "IN_PROGRESS" ? "COMMITTED" : "IN_PROGRESS";
+    visRender();
+  });
+  document.getElementById("vis-t99").addEventListener("click", function () {
+    st.status[99] = st.status[99] === "ABORTED" ? "COMMITTED" : "ABORTED";
     visRender();
   });
   document.getElementById("vis-snap-btn").addEventListener("click", function () {
-    // retake: active list = transactions still in progress (other than settled ones)
-    var xip = [];
+    // Retake snapshot (Read Committed style): active = other IN_PROGRESS txns; xmax advances past T101 to 102
+    var active = [];
     Object.keys(st.status).forEach(function (xid) {
-      if (st.status[xid] === "IN_PROGRESS") xip.push(+xid);
+      var id = +xid;
+      if (id !== OWNER && st.status[id] === "IN_PROGRESS") active.push(id);
     });
-    xip.sort(function (a, b) { return a - b; });
-    st.snap = { xmin: xip.length ? xip[0] : 102, xmax: 102, xip: xip };
+    active.sort(function (a, b) { return a - b; });
+    var xmin = active.length ? Math.min(active[0], OWNER) : OWNER;
+    st.snap = { owner: OWNER, xmin: xmin, xmax: 102, active: active };
     visRender();
   });
   document.getElementById("vis-reset").addEventListener("click", function () {
-    st = initState();
+    st = initVisState();
     visRender();
   });
   visRender();

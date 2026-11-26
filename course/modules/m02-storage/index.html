@@ -233,12 +233,16 @@
   <p>FerricDB's heap page is a deliberate near-copy. The <code>Page</code> type in
   <code>course/ferricdb/crates/storage</code> reserves its first 16 bytes for a page LSN
   (<code>u64</code>), a page-type tag (<code>u32</code>), and a reserved word (<code>u32</code>);
-  the <code>HeapPage</code> view adds <code>lower</code>, <code>upper</code>, a slot count, and flags,
-  bringing the heap header to the same 24 bytes as Postgres:</p>
+  the mutable <code>HeapPage</code> view (paired with the read-only <code>HeapPageRef</code> view
+  used inside <code>PageStore::with_page</code> so reads never dirty buffer-pool frames) adds a
+  4-byte <code>next_page: PageId</code> link for the heap chain plus 2-byte <code>lower</code>,
+  <code>upper</code>, <code>slot_count</code>, and <code>flags</code> fields — a <strong>28-byte</strong>
+  heap header (a course choice, 4 bytes longer than PostgreSQL's 24-byte header because FerricDB
+  links a table's pages inside one shared file):</p>
 
   <figure>
-    <svg viewBox="0 0 940 320" role="img">
-      <title>A FerricDB heap page: 24-byte header, slot array growing forward, free space, and tuple data growing backward from byte 8192. A zoomed strip shows the header fields with byte offsets.</title>
+    <svg viewBox="0 0 940 330" role="img">
+      <title>A FerricDB heap page: 28-byte header, slot array growing forward, free space, and tuple data growing backward from byte 8192. A zoomed strip shows all eight header fields with exact byte offsets.</title>
       <path d="M150 26 h90 m0 0 l-10 -6 m10 6 l-10 6" class="d-line-hl"/>
       <text x="152" y="18" class="d-text-sm">slot array grows →</text>
       <path d="M880 26 h-90 m0 0 l10 -6 m-10 6 l10 6" class="d-line-hl"/>
@@ -255,49 +259,55 @@
       <rect x="630" y="40" width="280" height="58" class="d-box-good"/>
       <text x="770" y="66" text-anchor="middle" class="d-text-sm">tuple data</text>
       <text x="770" y="82" text-anchor="middle" class="d-mono-sm">newest tuple lowest</text>
-      <text x="30" y="118" class="d-mono-sm">0</text>
-      <text x="120" y="118" text-anchor="middle" class="d-mono-sm">24</text>
-      <text x="300" y="118" text-anchor="middle" class="d-mono-sm">lower</text>
-      <text x="630" y="118" text-anchor="middle" class="d-mono-sm">upper</text>
-      <text x="910" y="118" text-anchor="end" class="d-mono-sm">8192</text>
-      <line x1="30" y1="98" x2="30" y2="170" class="d-line" stroke-dasharray="3 4"/>
-      <line x1="120" y1="98" x2="910" y2="170" class="d-line" stroke-dasharray="3 4"/>
-      <text x="30" y="162" class="d-text-sm">zoom: the 24-byte FerricDB heap page header</text>
-      <rect x="30" y="176" width="220" height="56" class="d-box-warn"/>
-      <text x="140" y="200" text-anchor="middle" class="d-mono-sm">page_lsn: u64</text>
-      <text x="140" y="218" text-anchor="middle" class="d-text-sm">written by the WAL (M10)</text>
-      <rect x="250" y="176" width="120" height="56" class="d-box"/>
-      <text x="310" y="200" text-anchor="middle" class="d-mono-sm">page_type</text>
-      <text x="310" y="218" text-anchor="middle" class="d-mono-sm">u32</text>
-      <rect x="370" y="176" width="120" height="56" class="d-box"/>
-      <text x="430" y="200" text-anchor="middle" class="d-mono-sm">reserved</text>
-      <text x="430" y="218" text-anchor="middle" class="d-mono-sm">u32</text>
-      <rect x="490" y="176" width="90" height="56" class="d-box-hl"/>
-      <text x="535" y="200" text-anchor="middle" class="d-mono-sm">lower</text>
-      <text x="535" y="218" text-anchor="middle" class="d-mono-sm">u16</text>
-      <rect x="580" y="176" width="90" height="56" class="d-box-hl"/>
-      <text x="625" y="200" text-anchor="middle" class="d-mono-sm">upper</text>
-      <text x="625" y="218" text-anchor="middle" class="d-mono-sm">u16</text>
-      <rect x="670" y="176" width="110" height="56" class="d-box"/>
-      <text x="725" y="200" text-anchor="middle" class="d-mono-sm">slot_count</text>
-      <text x="725" y="218" text-anchor="middle" class="d-mono-sm">u16</text>
-      <rect x="780" y="176" width="130" height="56" class="d-box"/>
-      <text x="845" y="200" text-anchor="middle" class="d-mono-sm">flags: u16</text>
-      <text x="30" y="256" class="d-mono-sm">0</text>
-      <text x="250" y="256" text-anchor="middle" class="d-mono-sm">8</text>
-      <text x="370" y="256" text-anchor="middle" class="d-mono-sm">12</text>
-      <text x="490" y="256" text-anchor="middle" class="d-mono-sm">16</text>
-      <text x="580" y="256" text-anchor="middle" class="d-mono-sm">18</text>
-      <text x="670" y="256" text-anchor="middle" class="d-mono-sm">20</text>
-      <text x="780" y="256" text-anchor="middle" class="d-mono-sm">22</text>
-      <text x="910" y="256" text-anchor="end" class="d-mono-sm">24</text>
-      <text x="30" y="292" class="d-text-sm">Slot states: live (points at a tuple) · dead (tombstone) · unused (reusable). Postgres packs offset,</text>
-      <text x="30" y="310" class="d-text-sm">flags and length into each 4-byte ItemIdData the same way.</text>
+      <text x="30" y="116" class="d-mono-sm">0</text>
+      <text x="120" y="116" text-anchor="middle" class="d-mono-sm">28</text>
+      <text x="300" y="116" text-anchor="middle" class="d-mono-sm">lower</text>
+      <text x="630" y="116" text-anchor="middle" class="d-mono-sm">upper</text>
+      <text x="910" y="116" text-anchor="end" class="d-mono-sm">8192</text>
+      <line x1="30" y1="124" x2="30" y2="186" class="d-line" stroke-dasharray="3 4"/>
+      <line x1="120" y1="124" x2="910" y2="186" class="d-line" stroke-dasharray="3 4"/>
+      <text x="42" y="178" class="d-text-sm">zoom: the 28-byte FerricDB heap page header</text>
+      <rect x="30" y="186" width="170" height="56" class="d-box-warn"/>
+      <text x="115" y="210" text-anchor="middle" class="d-mono-sm">page_lsn: u64</text>
+      <text x="115" y="228" text-anchor="middle" class="d-text-sm">WAL (M10)</text>
+      <rect x="200" y="186" width="105" height="56" class="d-box"/>
+      <text x="252" y="210" text-anchor="middle" class="d-mono-sm">page_type</text>
+      <text x="252" y="228" text-anchor="middle" class="d-mono-sm">u32</text>
+      <rect x="305" y="186" width="95" height="56" class="d-box"/>
+      <text x="352" y="210" text-anchor="middle" class="d-mono-sm">reserved</text>
+      <text x="352" y="228" text-anchor="middle" class="d-mono-sm">u32</text>
+      <rect x="400" y="186" width="115" height="56" class="d-box-good"/>
+      <text x="457" y="210" text-anchor="middle" class="d-mono-sm">next_page</text>
+      <text x="457" y="228" text-anchor="middle" class="d-mono-sm">PageId (u32)</text>
+      <rect x="515" y="186" width="90" height="56" class="d-box-hl"/>
+      <text x="560" y="210" text-anchor="middle" class="d-mono-sm">lower</text>
+      <text x="560" y="228" text-anchor="middle" class="d-mono-sm">u16</text>
+      <rect x="605" y="186" width="90" height="56" class="d-box-hl"/>
+      <text x="650" y="210" text-anchor="middle" class="d-mono-sm">upper</text>
+      <text x="650" y="228" text-anchor="middle" class="d-mono-sm">u16</text>
+      <rect x="695" y="186" width="115" height="56" class="d-box"/>
+      <text x="752" y="210" text-anchor="middle" class="d-mono-sm">slot_count</text>
+      <text x="752" y="228" text-anchor="middle" class="d-mono-sm">u16</text>
+      <rect x="810" y="186" width="100" height="56" class="d-box"/>
+      <text x="860" y="210" text-anchor="middle" class="d-mono-sm">flags</text>
+      <text x="860" y="228" text-anchor="middle" class="d-mono-sm">u16</text>
+      <text x="30" y="262" class="d-mono-sm">0</text>
+      <text x="200" y="262" text-anchor="middle" class="d-mono-sm">8</text>
+      <text x="305" y="262" text-anchor="middle" class="d-mono-sm">12</text>
+      <text x="400" y="262" text-anchor="middle" class="d-mono-sm">16</text>
+      <text x="515" y="262" text-anchor="middle" class="d-mono-sm">20</text>
+      <text x="605" y="262" text-anchor="middle" class="d-mono-sm">22</text>
+      <text x="695" y="262" text-anchor="middle" class="d-mono-sm">24</text>
+      <text x="810" y="262" text-anchor="middle" class="d-mono-sm">26</text>
+      <text x="910" y="262" text-anchor="end" class="d-mono-sm">28</text>
+      <text x="30" y="296" class="d-text-sm">Slot states: live (points at a tuple) · dead (tombstone). Postgres packs offset, flags, and</text>
+      <text x="30" y="314" class="d-text-sm">length into each 4-byte ItemIdData and also tracks reusable unused line pointers.</text>
     </svg>
     <figcaption>Figure 2 — The FerricDB heap page (byte offsets exact, widths not to scale). The
-    layout mirrors PostgreSQL's: a 24-byte header with free-space fences <code>pd_lower</code> /
-    <code>pd_upper</code>, 4-byte line pointers growing forward, tuples stacked from byte 8192
-    backward.<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-7">7</a></sup></figcaption>
+    layout mirrors PostgreSQL's slotted page — free-space fences <code>lower</code> /
+    <code>upper</code>, 4-byte line pointers growing forward, tuples stacked from byte 8192
+    backward — with a 28-byte header that adds a 4-byte <code>next_page</code> chain link to
+    PostgreSQL's 24-byte header design.<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-7">7</a></sup></figcaption>
   </figure>
 
   <p>Why this mirror-image arrangement? Because neither side knows in advance how many entries it will
@@ -351,8 +361,11 @@
   <p>Play with the failure mode: fill the page, tombstone two tuples, and try to insert again. The
   insert still fails — deleting only marks slots dead; the bytes sit where they were, and the hole
   between <code>lower</code> and <code>upper</code> has not grown. Only compaction slides the survivors
-  back against the end of the page and turns dead slots into reusable ones. PostgreSQL behaves the same
-  way: space from deleted tuples is reclaimed lazily (by pruning and vacuum, guided by header fields
+  back against the end of the page — and in PostgreSQL (modeled by the widget above), vacuum also
+  turns dead line pointers (<code>LP_DEAD</code>) into reusable <code>LP_UNUSED</code> slots,
+  whereas FerricDB's <code>HeapPage::compact</code> reclaims tuple body bytes while leaving dead
+  slots tombstoned and <code>slot_count</code> unchanged for a leaner implementation. PostgreSQL
+  likewise reclaims space lazily (by pruning and vacuum, guided by header fields
   like <code>pd_prune_xid</code>), not at <code>DELETE</code> time.<sup class="cite"><a href="#ref-7">7</a></sup></p>
 
   <h2 id="sec-tuples">Inside a tuple</h2>
@@ -374,85 +387,88 @@
 
   <p>FerricDB keeps the ideas and drops the ballast. A stored tuple is
   <code>TupleMeta</code> — <code>xmin: u64</code>, <code>xmax: u64</code>, 16 bytes — followed by the
-  serialized payload: a null bitmap (one bit per column, rounded up to whole bytes), then the values
-  in schema order, with <code>TEXT</code> encoded as a <code>u32</code> length prefix plus UTF-8
-  bytes. Three simplifications, all course choices: 64-bit transaction IDs sidestep the wraparound
-  machinery that 4-byte XIDs force on Postgres;<sup class="cite"><a href="#ref-7">7</a></sup> there is
-  no alignment padding because FerricDB decodes bytes into <code>Value</code>s rather than casting
-  pointers at them; and there is no <code>ctid</code> chain or command ID until you need them. The
-  <code>xmin</code>/<code>xmax</code> fields are written as 0 from Milestone 1 onward and simply ride
-  along — they come alive in <a href="../m09-transactions-mvcc/index.html">M09</a>, when Milestone 8
-  starts stamping them to decide which transactions can see which tuple versions.</p>
+  serialized payload produced by <code>tuple::serialize</code>: a null bitmap
+  (<code>ceil(n / 8)</code> bytes, one bit per column, where <strong>bit 1 = NULL</strong> — an
+  explicit course choice, opposite PostgreSQL's <code>1 = present (not-null)</code> polarity above),
+  then the non-NULL values in schema order, with <code>TEXT</code> encoded as a <code>u32</code>
+  length prefix plus UTF-8 bytes. Three simplifications, all course choices: 64-bit transaction IDs
+  sidestep the wraparound machinery that 4-byte XIDs force on
+  Postgres;<sup class="cite"><a href="#ref-7">7</a></sup> there is no alignment padding because
+  FerricDB decodes bytes into <code>Value</code>s rather than casting pointers at them; and there is
+  no <code>ctid</code> chain or command ID until you need them. The
+  <code>xmin</code>/<code>xmax</code> fields are written as 0 from Milestone 1 onward and ride along
+  untouched — they come alive in <a href="../m09-transactions-mvcc/index.html">M09</a>, when
+  Milestone 8 starts stamping them to decide which transactions can see which tuple versions.</p>
 
   <figure>
-    <svg viewBox="0 0 940 310" role="img">
+    <svg viewBox="0 0 940 322" role="img">
       <title>Byte layout of a FerricDB stored tuple for a three-column accounts row, 48 bytes total, above the PostgreSQL HeapTupleHeaderData that inspired it.</title>
-      <text x="30" y="24" class="d-text">FerricDB stored tuple (course format) — accounts row, 48 B total</text>
-      <rect x="30" y="38" width="147" height="52" class="d-box-warn"/>
-      <text x="103" y="60" text-anchor="middle" class="d-mono-sm">xmin: u64</text>
-      <text x="103" y="78" text-anchor="middle" class="d-text-sm">0 until M09</text>
-      <rect x="177" y="38" width="147" height="52" class="d-box-warn"/>
-      <text x="250" y="60" text-anchor="middle" class="d-mono-sm">xmax: u64</text>
-      <text x="250" y="78" text-anchor="middle" class="d-text-sm">0 = live</text>
-      <rect x="324" y="38" width="18" height="52" class="d-box-hl"/>
-      <rect x="342" y="38" width="147" height="52" class="d-box"/>
-      <text x="415" y="60" text-anchor="middle" class="d-mono-sm">id: i64</text>
-      <rect x="489" y="38" width="73" height="52" class="d-box"/>
-      <text x="525" y="60" text-anchor="middle" class="d-mono-sm">len: u32</text>
-      <text x="525" y="78" text-anchor="middle" class="d-mono-sm">= 11</text>
-      <rect x="562" y="38" width="202" height="52" class="d-box"/>
-      <text x="663" y="60" text-anchor="middle" class="d-mono-sm">owner · 11 B UTF-8</text>
-      <rect x="764" y="38" width="147" height="52" class="d-box"/>
-      <text x="837" y="60" text-anchor="middle" class="d-mono-sm">balance: i64</text>
-      <line x1="333" y1="38" x2="300" y2="16" class="d-line"/>
-      <text x="296" y="12" text-anchor="end" class="d-text-sm">null bitmap: 1 bit per column, 1 byte here</text>
-      <text x="30" y="110" class="d-mono-sm">0</text>
-      <text x="177" y="110" text-anchor="middle" class="d-mono-sm">8</text>
-      <text x="324" y="110" text-anchor="middle" class="d-mono-sm">16</text>
-      <text x="342" y="110" text-anchor="middle" class="d-mono-sm">17</text>
-      <text x="489" y="110" text-anchor="middle" class="d-mono-sm">25</text>
-      <text x="562" y="110" text-anchor="middle" class="d-mono-sm">29</text>
-      <text x="764" y="110" text-anchor="middle" class="d-mono-sm">40</text>
-      <text x="911" y="110" text-anchor="end" class="d-mono-sm">48</text>
-      <text x="30" y="160" class="d-text">PostgreSQL HeapTupleHeaderData — the cited inspiration (23 B fixed header)</text>
-      <rect x="30" y="174" width="108" height="52" class="d-box-warn"/>
-      <text x="84" y="196" text-anchor="middle" class="d-mono-sm">t_xmin</text>
-      <text x="84" y="214" text-anchor="middle" class="d-mono-sm">4 B</text>
-      <rect x="138" y="174" width="108" height="52" class="d-box-warn"/>
-      <text x="192" y="196" text-anchor="middle" class="d-mono-sm">t_xmax</text>
-      <text x="192" y="214" text-anchor="middle" class="d-mono-sm">4 B</text>
-      <rect x="246" y="174" width="108" height="52" class="d-box"/>
-      <text x="300" y="196" text-anchor="middle" class="d-mono-sm">t_cid</text>
-      <text x="300" y="214" text-anchor="middle" class="d-mono-sm">4 B</text>
-      <rect x="354" y="174" width="162" height="52" class="d-box"/>
-      <text x="435" y="196" text-anchor="middle" class="d-mono-sm">t_ctid</text>
-      <text x="435" y="214" text-anchor="middle" class="d-mono-sm">6 B (block, offset)</text>
-      <rect x="516" y="174" width="54" height="52" class="d-box"/>
-      <text x="543" y="196" text-anchor="middle" class="d-mono-sm">mask2</text>
-      <text x="543" y="214" text-anchor="middle" class="d-mono-sm">2 B</text>
-      <rect x="570" y="174" width="54" height="52" class="d-box"/>
-      <text x="597" y="196" text-anchor="middle" class="d-mono-sm">mask</text>
-      <text x="597" y="214" text-anchor="middle" class="d-mono-sm">2 B</text>
-      <rect x="624" y="174" width="27" height="52" class="d-box-hl"/>
-      <rect x="651" y="174" width="80" height="52" class="d-box-hl"/>
-      <text x="691" y="196" text-anchor="middle" class="d-mono-sm">null</text>
-      <text x="691" y="214" text-anchor="middle" class="d-mono-sm">bitmap</text>
-      <rect x="731" y="174" width="60" height="52" class="d-box"/>
-      <text x="761" y="196" text-anchor="middle" class="d-mono-sm">pad</text>
-      <rect x="791" y="174" width="120" height="52" class="d-box-good"/>
-      <text x="851" y="196" text-anchor="middle" class="d-mono-sm">user data</text>
-      <text x="851" y="214" text-anchor="middle" class="d-mono-sm">@ t_hoff</text>
-      <line x1="637" y1="226" x2="620" y2="252" class="d-line"/>
-      <text x="616" y="268" class="d-mono-sm">t_hoff: 1 B</text>
-      <text x="30" y="246" class="d-mono-sm">0</text>
-      <text x="138" y="246" text-anchor="middle" class="d-mono-sm">4</text>
-      <text x="246" y="246" text-anchor="middle" class="d-mono-sm">8</text>
-      <text x="354" y="246" text-anchor="middle" class="d-mono-sm">12</text>
-      <text x="516" y="246" text-anchor="middle" class="d-mono-sm">18</text>
-      <text x="570" y="246" text-anchor="middle" class="d-mono-sm">20</text>
-      <text x="624" y="246" text-anchor="middle" class="d-mono-sm">22</text>
-      <text x="651" y="246" text-anchor="middle" class="d-mono-sm">23</text>
-      <text x="30" y="300" class="d-text-sm">pad aligns t_hoff to MAXALIGN; the bitmap exists only when the HEAP_HASNULL flag is set.</text>
+      <text x="30" y="22" class="d-text">FerricDB stored tuple (course format) — accounts row, 48 B total</text>
+      <line x1="333" y1="60" x2="348" y2="43" class="d-line"/>
+      <text x="354" y="46" class="d-text-sm">null bitmap: 1 B (bit 1 = NULL)</text>
+      <rect x="30" y="60" width="147" height="52" class="d-box-warn"/>
+      <text x="103" y="82" text-anchor="middle" class="d-mono-sm">xmin: u64</text>
+      <text x="103" y="100" text-anchor="middle" class="d-text-sm">0 until M09</text>
+      <rect x="177" y="60" width="147" height="52" class="d-box-warn"/>
+      <text x="250" y="82" text-anchor="middle" class="d-mono-sm">xmax: u64</text>
+      <text x="250" y="100" text-anchor="middle" class="d-text-sm">0 = live</text>
+      <rect x="324" y="60" width="18" height="52" class="d-box-hl"/>
+      <rect x="342" y="60" width="147" height="52" class="d-box"/>
+      <text x="415" y="82" text-anchor="middle" class="d-mono-sm">id: i64</text>
+      <rect x="489" y="60" width="73" height="52" class="d-box"/>
+      <text x="525" y="82" text-anchor="middle" class="d-mono-sm">len: u32</text>
+      <text x="525" y="100" text-anchor="middle" class="d-mono-sm">= 11</text>
+      <rect x="562" y="60" width="202" height="52" class="d-box"/>
+      <text x="663" y="82" text-anchor="middle" class="d-mono-sm">owner · 11 B UTF-8</text>
+      <rect x="764" y="60" width="147" height="52" class="d-box"/>
+      <text x="837" y="82" text-anchor="middle" class="d-mono-sm">balance: i64</text>
+      <text x="30" y="130" class="d-mono-sm">0</text>
+      <text x="177" y="130" text-anchor="middle" class="d-mono-sm">8</text>
+      <text x="322" y="130" text-anchor="end" class="d-mono-sm">16</text>
+      <text x="344" y="130" text-anchor="start" class="d-mono-sm">17</text>
+      <text x="489" y="130" text-anchor="middle" class="d-mono-sm">25</text>
+      <text x="562" y="130" text-anchor="middle" class="d-mono-sm">29</text>
+      <text x="764" y="130" text-anchor="middle" class="d-mono-sm">40</text>
+      <text x="911" y="130" text-anchor="end" class="d-mono-sm">48</text>
+      <text x="30" y="172" class="d-text">PostgreSQL HeapTupleHeaderData — the cited inspiration (23 B fixed header)</text>
+      <line x1="637" y1="206" x2="654" y2="190" class="d-line"/>
+      <text x="660" y="193" class="d-mono-sm">t_hoff: 1 B (data offset)</text>
+      <rect x="30" y="206" width="108" height="52" class="d-box-warn"/>
+      <text x="84" y="228" text-anchor="middle" class="d-mono-sm">t_xmin</text>
+      <text x="84" y="246" text-anchor="middle" class="d-mono-sm">4 B</text>
+      <rect x="138" y="206" width="108" height="52" class="d-box-warn"/>
+      <text x="192" y="228" text-anchor="middle" class="d-mono-sm">t_xmax</text>
+      <text x="192" y="246" text-anchor="middle" class="d-mono-sm">4 B</text>
+      <rect x="246" y="206" width="108" height="52" class="d-box"/>
+      <text x="300" y="228" text-anchor="middle" class="d-mono-sm">t_cid</text>
+      <text x="300" y="246" text-anchor="middle" class="d-mono-sm">4 B</text>
+      <rect x="354" y="206" width="162" height="52" class="d-box"/>
+      <text x="435" y="228" text-anchor="middle" class="d-mono-sm">t_ctid</text>
+      <text x="435" y="246" text-anchor="middle" class="d-mono-sm">6 B (block, offset)</text>
+      <rect x="516" y="206" width="54" height="52" class="d-box"/>
+      <text x="543" y="228" text-anchor="middle" class="d-mono-sm">mask2</text>
+      <text x="543" y="246" text-anchor="middle" class="d-mono-sm">2 B</text>
+      <rect x="570" y="206" width="54" height="52" class="d-box"/>
+      <text x="597" y="228" text-anchor="middle" class="d-mono-sm">mask</text>
+      <text x="597" y="246" text-anchor="middle" class="d-mono-sm">2 B</text>
+      <rect x="624" y="206" width="27" height="52" class="d-box-hl"/>
+      <rect x="651" y="206" width="80" height="52" class="d-box-hl"/>
+      <text x="691" y="228" text-anchor="middle" class="d-mono-sm">null</text>
+      <text x="691" y="246" text-anchor="middle" class="d-mono-sm">bitmap</text>
+      <rect x="731" y="206" width="60" height="52" class="d-box"/>
+      <text x="761" y="228" text-anchor="middle" class="d-mono-sm">pad</text>
+      <rect x="791" y="206" width="120" height="52" class="d-box-good"/>
+      <text x="851" y="228" text-anchor="middle" class="d-mono-sm">user data</text>
+      <text x="851" y="246" text-anchor="middle" class="d-mono-sm">@ t_hoff</text>
+      <text x="30" y="276" class="d-mono-sm">0</text>
+      <text x="138" y="276" text-anchor="middle" class="d-mono-sm">4</text>
+      <text x="246" y="276" text-anchor="middle" class="d-mono-sm">8</text>
+      <text x="354" y="276" text-anchor="middle" class="d-mono-sm">12</text>
+      <text x="516" y="276" text-anchor="middle" class="d-mono-sm">18</text>
+      <text x="570" y="276" text-anchor="middle" class="d-mono-sm">20</text>
+      <text x="624" y="276" text-anchor="middle" class="d-mono-sm">22</text>
+      <text x="651" y="276" text-anchor="middle" class="d-mono-sm">23</text>
+      <text x="30" y="308" class="d-text-sm">pad aligns t_hoff to MAXALIGN; Postgres null bitmap uses bit 1 = present and exists only when HEAP_HASNULL is set.</text>
     </svg>
     <figcaption>Figure 3 — Top: the FerricDB tuple format for
     <code>accounts(id INTEGER, owner TEXT, balance INTEGER)</code> with an 11-byte owner string.
@@ -506,8 +522,8 @@
     <li>page cost per row = 48&nbsp;B + one 4&nbsp;B slot = <strong>52&nbsp;B</strong>.</li>
   </ul>
 
-  <p>A page offers 8192 − 24 = 8168 usable bytes, so ⌊8168 / 52⌋ = <strong>157 rows per page</strong>
-  (157 × 52 = 8164, leaving a 4-byte hole — too small for anything, and that's fine). One million rows
+  <p>A page offers 8192 − 28 = 8164 usable bytes, so ⌊8164 / 52⌋ = <strong>157 rows per page</strong>
+  (157 × 52 = 8164, filling the page down to the last byte). One million rows
   need ⌈1,000,000 / 157⌉ = <strong>6,370 pages ≈ 49.8&nbsp;MiB</strong>. Now price a full scan with
   CS186's ballpark disk numbers:<sup class="cite"><a href="#ref-11">11</a></sup> read sequentially,
   you pay one arm movement (≈ 4.5&nbsp;ms) plus transfer: 49.8&nbsp;MiB at 0.25&nbsp;ms per 64&nbsp;KB
@@ -585,10 +601,12 @@
     </div>
   </div>
 
-  <p>FerricDB's Milestone-1 course choice is stricter than either: a tuple must fit in one page, and
-  <code>HeapPage::insert</code> simply refuses oversized rows (<code>Error::PageFull</code>). You will
-  feel the ceiling the first time you store a long string — a TOAST-style companion table is a lovely
-  stretch project once the heap works.</p>
+  <p>FerricDB's Milestone-1 course choice is stricter than either: a tuple must fit in one page.
+  <code>HeapPage::insert</code> returns <code>Option&lt;u16&gt;</code> (<code>None</code> when a
+  page has insufficient room, signaling the caller to try another page), and
+  <code>HeapFile::insert</code> returns <code>Err(Error::PageFull)</code> only when a tuple cannot
+  fit even on a freshly formatted page. You will feel the ceiling the first time you store a long
+  string — a TOAST-style companion table is a worthwhile stretch project once the heap works.</p>
 
   <h2 id="sec-sqlite">Contrast: SQLite's single-file world</h2>
 
@@ -674,7 +692,7 @@
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="Delete is a tombstone: the slot is marked dead (in MVCC terms, xmax is stamped) and the bytes stay put, because concurrent transactions may still be entitled to see the old version — the M09 story. Space returns later, when pruning/vacuum (Postgres) or compaction (your widget, your Milestone 1 code) defragments the page.">
+  <fieldset class="quiz" data-explain="Delete is a tombstone: the slot is marked dead (in MVCC terms, xmax is stamped) and the bytes stay put, because concurrent transactions may still be entitled to see the old version — the M09 story. Milestone 1 does tombstone-only delete without compaction; tuple body space returns later when pruning/vacuum (Postgres, which also reuses dead line pointers as shown in the widget above) or HeapPage::compact (Milestone 8 VACUUM, which packs live tuple bytes while keeping dead slots tombstoned) defragments the page.">
     <legend class="quiz-q">Immediately after <code>DELETE</code> removes one row, what has changed on its heap page?</legend>
     <label><input type="radio" name="q-del"> The tuple's bytes are zeroed and the hole grows by the tuple's size</label>
     <label><input type="radio" name="q-del"> The page is rewritten without the tuple, and all later tuples shift</label>
@@ -748,7 +766,7 @@ document.addEventListener("DOMContentLoaded", function () {
     var root = document.getElementById("widget-slotted");
     if (!root || !window.Course) return;
 
-    var PAGE = 8192, HDR = 24, SLOTB = 4;
+    var PAGE = 8192, HDR = 28, SLOTB = 4;
     var M = 28, PLOT = 904, SX = PLOT / PAGE;
 
     var canvas = document.getElementById("sp-canvas");
@@ -845,15 +863,37 @@ document.addEventListener("DOMContentLoaded", function () {
       var lower = lowerOff();
       var barY = 30, barH = 56;
 
-      /* free-space fences above the bar */
+      /* free-space fences above the bar (clamped so header/slots never invert past upper,
+         and labels stay inside [M, 960 - M] without colliding) */
+      var xUp = M + upper * SX;
+      var maxLeftW = Math.max(xUp - M, 0);
       var hw = Math.max(HDR * SX, 8);
       var ws = slots.length ? Math.max(SLOTB * slots.length * SX, 6) : 0;
+      if (hw + ws > maxLeftW && (hw + ws) > 0) {
+        var scale = maxLeftW / (hw + ws);
+        hw *= scale;
+        ws *= scale;
+      }
       var xLow = M + hw + ws;
-      var xUp = M + upper * SX;
+      var lowText = "lower=" + lower;
+      var upText = "upper=" + upper;
+      var lowW = lowText.length * 6.8;
+      var upW = upText.length * 6.8;
+      var gap = 14;
+      var minX = M, maxX = 960 - M;
+      var lowX = Math.max(minX, Math.min(xLow - lowW - 3, maxX - lowW - upW - gap));
+      var upX = Math.min(maxX - upW, Math.max(xUp + 3, minX + lowW + gap));
+      if (lowX + lowW + gap > upX) {
+        if (lowX + lowW + gap + upW <= maxX) {
+          upX = lowX + lowW + gap;
+        } else {
+          lowX = Math.max(minX, upX - gap - lowW);
+        }
+      }
       svg.appendChild(svgEl("line", { x1: xLow, y1: 18, x2: xLow, y2: barY, "class": "d-line-hl" }));
-      svg.appendChild(svgEl("text", { x: xLow - 3, y: 14, "text-anchor": "end", "class": "d-mono-sm" }, "lower=" + lower));
+      svg.appendChild(svgEl("text", { x: lowX, y: 14, "text-anchor": "start", "class": "d-mono-sm" }, lowText));
       svg.appendChild(svgEl("line", { x1: xUp, y1: 18, x2: xUp, y2: barY, "class": "d-line-hl" }));
-      svg.appendChild(svgEl("text", { x: xUp + 3, y: 14, "class": "d-mono-sm" }, "upper=" + upper));
+      svg.appendChild(svgEl("text", { x: upX, y: 14, "text-anchor": "start", "class": "d-mono-sm" }, upText));
 
       /* page header */
       svg.appendChild(svgEl("rect", { x: M, y: barY, width: hw, height: barH, "class": "d-box-hl" }));
@@ -910,7 +950,7 @@ document.addEventListener("DOMContentLoaded", function () {
       /* slot directory strip */
       svg.appendChild(svgEl("text", { x: M, y: 138, "class": "d-text-sm" },
         "slot directory (4 B per slot; numbers are slot indices):"));
-      var maxCells = 44;
+      var maxCells = 40;
       var shown = Math.min(slots.length, maxCells);
       for (i = 0; i < shown; i++) {
         s = slots[i];

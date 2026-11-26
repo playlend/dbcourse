@@ -25,11 +25,12 @@
 
 <main>
   <h1>Milestone 7 · Query Optimization</h1>
-  <p class="subtitle">Give FerricDB judgment: rewrite rules, ANALYZE statistics, a Postgres-style
-  cost model, cost-based access paths, join ordering, and EXPLAIN to show its work.</p>
+  <p class="subtitle">Give FerricDB judgment: SQL parsing for ANALYZE and EXPLAIN, rule-based
+  rewrites, persisted table statistics, a PostgreSQL-inspired cost model, cost-based access
+  paths, Selinger join ordering, and EXPLAIN output that shows its work.</p>
 
   <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
-  all specification content is readable without it.</p></noscript>
+  all specification content and SVG figures are readable without it.</p></noscript>
 
   <div class="toc">
     <strong>On this page</strong>
@@ -38,6 +39,7 @@
       <li><a href="#sec-reading">Required reading</a></li>
       <li><a href="#sec-arch">Where this fits</a></li>
       <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-worked">Worked selectivity and cost example</a></li>
       <li><a href="#sec-guidance">Step-by-step guidance</a></li>
       <li><a href="#sec-tests">Test plan</a></li>
       <li><a href="#sec-pitfalls">Common pitfalls</a></li>
@@ -48,203 +50,940 @@
     </ol>
   </div>
 
-  <p>Until now your planner has been a stenographer: it transcribes the bound statement into the
-  one plan shape it knows. This milestone makes it opinionated. The work divides into three
-  independent layers — rewrites (no statistics needed), statistics (ANALYZE), and cost-based
-  choice (access paths, join order) — and each layer is testable on its own before the next
-  exists. Build them in that order and the milestone stays calm.</p>
+  <p>Until now, <code>Planner::optimize</code> has been the identity function: whatever tree
+  <code>Planner::plan</code> transcribed from the bound query went straight to execution, and
+  Milestone 5's rule picked an index blindly whenever one matched a predicate. On a tiny table
+  that habit hides in the noise. On a multi-table join or a non-selective range filter over
+  thousands of rows, the difference between a good plan and a naive one is orders of magnitude
+  in page reads.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a
+  href="#ref-5">5</a></sup></p>
+
+  <p>This milestone gives your planner a real optimizer modeled on System R and PostgreSQL. The
+  work decomposes cleanly into four independent layers that you can build and verify in order:
+  (1)&nbsp;parser and catalog plumbing for <code>ANALYZE</code>, <code>EXPLAIN</code>, and
+  persisted statistics; (2)&nbsp;semantics-preserving logical rewrites that need no statistics at
+  all; (3)&nbsp;selectivity estimation and a dimensionless cost model; and (4)&nbsp;cost-based
+  access-path selection, join strategy and ordering, and the <code>EXPLAIN</code> /
+  <code>EXPLAIN ANALYZE</code> renderer. Build and test each layer before moving to the next,
+  and the optimizer stays understandable from top to bottom.</p>
 
   <h2 id="sec-objectives">Learning objectives</h2>
   <ul>
-    <li><strong>Implement</strong> plan rewrites as tree-to-tree transformations: predicate
-      pushdown, projection pruning, constant folding.</li>
-    <li><strong>Implement</strong> ANALYZE: row counts, per-column min/max, distinct and null
-      estimates, persisted through the catalog.</li>
-    <li><strong>Implement</strong> a cost model in the spirit of Postgres's — page I/O plus
-      per-tuple CPU, with the documented default constants.<sup class="cite"><a href="#ref-2">2</a></sup></li>
-    <li><strong>Implement</strong> Selinger-style selectivity estimation and cost-based
-      seq-vs-index access path selection.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Implement</strong> join ordering — greedy or subset-DP — for up to ~6 tables,
-      left-deep.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Implement</strong> EXPLAIN and EXPLAIN ANALYZE.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong>Extend</strong> the SQL parser in <code>crates/sql</code> to accept
+      <code>ANALYZE [table]</code> and <code>EXPLAIN [ANALYZE] &lt;statement&gt;</code>, and
+      wire both through the binder and dispatcher in <code>crates/exec</code>.</li>
+    <li><strong>Implement</strong> durable table and column statistics in
+      <code>crates/catalog</code> (<code>row_count</code>, <code>page_count</code>, per-column
+      <code>min</code>, <code>max</code>, <code>distinct_estimate</code>, and
+      <code>null_count</code>) gathered by <code>ANALYZE</code>.</li>
+    <li><strong>Implement</strong> rule-based logical plan rewrites: constant folding (honoring
+      SQL three-valued logic and NULL propagation), predicate pushdown across joins using
+      <code>table_idx</code> containment, and redundant-projection cleanup.</li>
+    <li><strong>Implement</strong> Selinger-style selectivity estimation and a PostgreSQL-style
+      cost model (<code>SEQ_PAGE_COST</code>, <code>RANDOM_PAGE_COST</code>,
+      <code>CPU_TUPLE_COST</code>) in <code>crates/exec/src/cost.rs</code>.<sup class="cite"><a
+      href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Replace</strong> Milestone 5's always-index heuristic with cost-based
+      <code>SeqScan</code> vs. <code>IndexScan</code> selection, and choose between
+      <code>HashJoin</code> (building on the smaller left input) and <code>NestedLoopJoin</code>
+      within a left-deep join orderer.<sup class="cite"><a href="#ref-1">1</a></sup><sup
+      class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>Implement</strong> <code>EXPLAIN</code> (plan-only, zero side effects) and
+      <code>EXPLAIN ANALYZE</code> (real execution with actual row counts and timing).<sup
+      class="cite"><a href="#ref-4">4</a></sup></li>
   </ul>
 
   <h2 id="sec-reading">Required reading</h2>
   <ul>
     <li><a href="../../modules/m08-query-optimization/index.html">M08 · Query Optimization</a> —
-      the concept module; its cost calculator and DP explorer are executable versions of what
-      you build here.</li>
-    <li>Selinger et al. 1979 — the cost model and DP sections; your join ordering follows this
-      paper. <a href="https://web.stanford.edu/class/cs345d-01/rl/selinger.pdf" rel="external">web.stanford.edu/class/cs345d-01/rl/selinger.pdf</a></li>
-    <li>The Internals of PostgreSQL, §3.2 — worked cost arithmetic to sanity-check your model
-      against. <a href="https://www.interdb.jp/pg/pgsql03/02.html" rel="external">interdb.jp/pg/pgsql03/02.html</a></li>
-    <li>Red Book Ch. 7 commentary — perspective before you start.
+      the concept module; its interactive cost-crossover calculator and Selinger DP explorer
+      mirror the exact math and state transitions you implement here.</li>
+    <li>Selinger et al. (SIGMOD 1979), <em>Access Path Selection in a Relational Database
+      Management System</em> — selectivity factors, the cost formula, and subset-based dynamic
+      programming.<sup class="cite"><a href="#ref-1">1</a></sup>
+      <a href="https://dl.acm.org/doi/10.1145/582095.582099" rel="external">dl.acm.org/doi/10.1145/582095.582099</a></li>
+    <li>Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, §3.2 — worked sequential-scan and
+      index-scan cost arithmetic using the exact default constants FerricDB adopts.<sup
+      class="cite"><a href="#ref-2">2</a></sup>
+      <a href="https://www.interdb.jp/pg/pgsql03/02.html" rel="external">interdb.jp/pg/pgsql03/02.html</a></li>
+    <li>PostgreSQL Documentation, <em>Using EXPLAIN</em> — how cost units, estimated rows, and
+      <code>EXPLAIN ANALYZE</code> side effects work.<sup class="cite"><a href="#ref-4">4</a></sup>
+      <a href="https://www.postgresql.org/docs/current/using-explain.html" rel="external">postgresql.org/docs/current/using-explain.html</a></li>
+    <li><em>Readings in Database Systems</em> (5th ed.), Ch. 7 commentary — perspective on why
+      cardinality estimation errors dominate real-world optimizer behavior.<sup class="cite"><a
+      href="#ref-5">5</a></sup>
       <a href="http://www.redbook.io/ch7-queryoptimization.html" rel="external">redbook.io/ch7-queryoptimization.html</a></li>
   </ul>
 
   <h2 id="sec-arch">Where this fits</h2>
   <figure>
     <div id="arch-diagram"></div>
-    <figcaption>Figure 1 — the planner is re-lit: same box as Milestone 4, new brain. Every
-    component it needs — catalog statistics, both scan operators, all three join algorithms —
-    already exists.</figcaption>
+    <figcaption>Figure 1 — FerricDB architecture. The planner lights up again: same box as
+    Milestone 4, now armed with rule-based rewrites, catalog statistics from <code>ANALYZE</code>,
+    and a cost model choosing across both scan operators (<code>SeqScan</code>,
+    <code>IndexScan</code>) and both join operators (<code>NestedLoopJoin</code>,
+    <code>HashJoin</code>).</figcaption>
   </figure>
 
-  <h2 id="sec-spec">Specification</h2>
-  <p>New surface in <code>crates/exec</code> and <code>crates/catalog</code>:</p>
+  <p>Every physical building block the optimizer needs is already implemented below it:
+  <code>HeapFile</code> and <code>BPlusTree</code> give you two access paths per indexed table,
+  and Milestone 6 gave you two join operators — <code>NestedLoopJoin</code> (which accepts any
+  join predicate or cross product) and <code>HashJoin</code> (which executes equi-joins by
+  building a hash table on its <strong>left</strong> child and probing with its
+  <strong>right</strong> child). Notice that FerricDB's <code>LogicalPlan</code> intentionally
+  omits sort-merge join, so your optimizer has a tight, concrete physical search space: two scan
+  methods and two join methods, priced against statistics stored in the catalog.</p>
 
-  <pre><code>// crates/exec
-impl&lt;'a&gt; Planner&lt;'a&gt; {
-    /// MS7: rewrite rules (predicate pushdown, projection pruning,
-    /// constant folding) then cost-based access path + join order.
-    pub fn optimize(&amp;self, plan: plan::LogicalPlan) -&gt; Result&lt;plan::LogicalPlan&gt;;
+  <h2 id="sec-spec">Specification</h2>
+
+  <h3 id="spec-sql">1. SQL parser extensions (<code>crates/sql</code>)</h3>
+  <p>The keywords <code>Keyword::Analyze</code> and <code>Keyword::Explain</code> and the two AST
+  variants already exist in <code>course/ferricdb/crates/sql/src/ast.rs</code>, but Milestone 3
+  did not parse them yet. Extend <code>Parser::parse</code> in
+  <code>course/ferricdb/crates/sql/src/lib.rs</code> to recognize these two productions:</p>
+  <pre><code>// crates/sql/src/ast.rs — already declared; wire into Parser::parse in MS7:
+Analyze { table: Option&lt;String&gt; },                                  // MS7
+Explain { analyze: bool, inner: Box&lt;Statement&gt; },                   // MS7
+
+// Grammar in crates/sql/src/lib.rs:
+//   analyze := "ANALYZE" [ ident ]
+//   explain := "EXPLAIN" [ "ANALYZE" ] statement</code></pre>
+  <p><code>ANALYZE</code> with no table name parses as <code>Analyze { table: None }</code>
+  (meaning analyze every user table); <code>ANALYZE users</code> parses as
+  <code>Analyze { table: Some("users".into()) }</code>. <code>EXPLAIN</code> parses an optional
+  <code>ANALYZE</code> keyword and then recursively parses the inner statement (any valid
+  statement, such as <code>SELECT</code>, <code>UPDATE</code>, or <code>DELETE</code>). In
+  <code>crates/exec/src/binder.rs</code>, bind <code>Statement::Analyze</code> into
+  <code>BoundStatement::Analyze { table: Option&lt;TableInfo&gt; }</code> (rejecting an unknown
+  table name with <code>Error::Bind</code>) and <code>Statement::Explain</code> into
+  <code>BoundStatement::Explain { analyze, inner }</code> by recursively binding the inner
+  statement.</p>
+
+  <h3 id="spec-catalog">2. Persisted statistics (<code>crates/catalog</code>)</h3>
+  <p>From <code>course/ferricdb/docs/api-spec.md</code> and
+  <code>course/ferricdb/crates/catalog/src/lib.rs</code>, implement the statistics persistence
+  surface:</p>
+  <pre><code>// crates/catalog/src/lib.rs — verbatim public surface for Milestone 7
+
+/// Per-column statistics gathered by ANALYZE (Milestone 7).
+#[derive(Clone, Debug, Default)]
+pub struct ColumnStats {
+    pub min: Option&lt;Value&gt;,
+    pub max: Option&lt;Value&gt;,
+    pub distinct_estimate: u64,
+    pub null_count: u64,
 }
 
-pub mod cost {
+#[derive(Clone, Debug, Default)]
+pub struct TableStats {
+    pub row_count: u64,
+    pub page_count: u32,
+    pub columns: Vec&lt;ColumnStats&gt;,
+}
+
+impl Catalog {
+    pub fn stats(&amp;self, table: &amp;str) -&gt; Result&lt;Option&lt;TableStats&gt;&gt;;         // MS7
+    pub fn set_stats(&amp;self, table: &amp;str, stats: TableStats) -&gt; Result&lt;()&gt;;  // MS7
+}</code></pre>
+  <p>Behavioral contract for catalog statistics:</p>
+  <ul>
+    <li><strong>Existing, never-analyzed table:</strong> <code>catalog.stats("users")</code>
+      returns <code>Ok(None)</code>. Analyzing one table must never synthesize statistics for any
+      other table.</li>
+    <li><strong>Unknown table:</strong> both <code>stats("ghost")</code> and
+      <code>set_stats("ghost", ...)</code> return <code>Err(Error::Catalog(_))</code>, never
+      <code>Ok(None)</code>.</li>
+    <li><strong>Overwrite semantics:</strong> a subsequent <code>set_stats</code> for the same
+      table replaces the previous statistics cleanly (both in the in-memory cache and on disk).</li>
+    <li><strong>Durability across reopen:</strong> persist statistics in the catalog's own heap
+      storage (for example, a dedicated fixed-page <code>__stats</code> system table bootstrapped
+      alongside <code>__tables</code> and <code>__columns</code>, or a stats-root pointer in your
+      catalog header) so closing and reopening the database via <code>Catalog::bootstrap</code>
+      restores <code>row_count</code>, <code>page_count</code>, and every column's
+      <code>min</code>, <code>max</code>, <code>distinct_estimate</code>, and
+      <code>null_count</code> verbatim.</li>
+  </ul>
+
+  <h3 id="spec-cost">3. Cost model &amp; optimizer (<code>crates/exec</code>)</h3>
+  <p>From <code>course/ferricdb/docs/api-spec.md</code>,
+  <code>course/ferricdb/crates/exec/src/cost.rs</code>, and
+  <code>course/ferricdb/crates/exec/src/lib.rs</code>:</p>
+  <pre><code>// crates/exec/src/cost.rs — verbatim public surface
+pub mod cost {                                                 // MS7
     pub const SEQ_PAGE_COST: f64 = 1.0;      // matches Postgres defaults
     pub const RANDOM_PAGE_COST: f64 = 4.0;
     pub const CPU_TUPLE_COST: f64 = 0.01;
     pub struct CostModel&lt;'a&gt; { /* &amp;'a Catalog */ }
     impl&lt;'a&gt; CostModel&lt;'a&gt; {
+        pub fn new(catalog: &amp;'a Catalog) -&gt; Self;
         pub fn plan_cost(&amp;self, plan: &amp;LogicalPlan) -&gt; f64;
         pub fn selectivity(&amp;self, table: &amp;TableInfo, pred: &amp;BoundExpr) -&gt; f64;
     }
 }
 
-// crates/catalog
-pub struct ColumnStats { pub min: Option&lt;Value&gt;, pub max: Option&lt;Value&gt;,
-                         pub distinct_estimate: u64, pub null_count: u64 }
-pub struct TableStats { pub row_count: u64, pub page_count: u32,
-                        pub columns: Vec&lt;ColumnStats&gt; }
-impl Catalog {
-    pub fn stats(&amp;self, table: &amp;str) -&gt; Result&lt;Option&lt;TableStats&gt;&gt;;         // MS7
-    pub fn set_stats(&amp;self, table: &amp;str, stats: TableStats) -&gt; Result&lt;()&gt;;  // MS7
-}
+// crates/exec/src/lib.rs — verbatim public surface
+impl&lt;'a&gt; Planner&lt;'a&gt; {
+    pub fn new(ctx: &amp;'a ExecContext) -&gt; Self;
+    pub fn plan(&amp;self, stmt: binder::BoundStatement) -&gt; Result&lt;plan::LogicalPlan&gt;;
+    /// MS4: identity; MS7: rewrite rules + cost-based access path &amp; join order.
+    pub fn optimize(&amp;self, plan: plan::LogicalPlan) -&gt; Result&lt;plan::LogicalPlan&gt;;
+    pub fn create_executor(&amp;self, plan: &amp;plan::LogicalPlan) -&gt; Result&lt;Box&lt;dyn Executor&gt;&gt;;
+}</code></pre>
 
-// crates/sql — already parsed since MS3/MS6 grammar growth:
-//   Analyze { table: Option&lt;String&gt; }
-//   Explain { analyze: bool, inner: Box&lt;Statement&gt; }</code></pre>
-
-  <p>Behavioral contract:</p>
+  <p>The optimizer's behavioral contract:</p>
   <ul>
-    <li><strong>Rewrites are semantics-preserving</strong> and run before costing. Pushdown may
-      move a predicate below an operator only if every column it references is available there.</li>
-    <li><strong>Selectivity</strong> follows the Selinger defaults where statistics exist:
-      equality ⇒ 1/distinct; range ⇒ linear interpolation between min and max; fall back to the
-      paper's honest guesses (1/10, 1/3) where they don't.<sup class="cite"><a href="#ref-1">1</a></sup>
-      Document the uniformity and independence assumptions in the rustdoc.</li>
-    <li><strong>Access path:</strong> for each base table with a usable index predicate, cost
-      both scans and keep the cheaper — replacing the Milestone 5 always-index rule.</li>
-    <li><strong>Join order:</strong> left-deep; either greedy (smallest estimated intermediate
-      result first) or the Selinger subset-DP. The DP earns you the crossed-out cross products
-      in the M08 explorer; greedy passes the tests with a documented caveat.</li>
-    <li><strong>EXPLAIN</strong> prints the optimized plan tree, one node per line with
-      estimated cost and rows; <strong>EXPLAIN ANALYZE</strong> executes it and adds actual rows
-      and wall time per node — and, like the real one, performs the statement's side effects, so
-      the REPL warns on data-modifying statements.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong>Constant folding:</strong> evaluate constant subexpressions inside
+      <code>BoundExpr</code> down to <code>BoundExpr::Literal</code> at plan time (e.g.,
+      <code>2 * (3 + 4)</code> becomes <code>Literal(Integer(14))</code>), propagating SQL
+      <code>NULL</code> according to three-valued logic (<code>NULL + 1 -&gt; NULL</code>,
+      <code>false AND NULL -&gt; false</code>, <code>true OR NULL -&gt; true</code>). Do not
+      panic on constant division or modulo by zero during optimization — leave it unfolded so the
+      executor raises the runtime error if that expression is actually evaluated. Folding must
+      preserve the surrounding plan node (a <code>Projection</code> remains a
+      <code>Projection</code>).</li>
+    <li><strong>Predicate pushdown:</strong> split conjunctive <code>AND</code> predicates into
+      individual conjuncts and push each conjunct as far down the plan tree as is semantically
+      legal. A conjunct may move below a join into its left or right child only if
+      <em>every</em> <code>BoundExpr::Column { table, .. }</code> it references belongs to a scan
+      inside that child. A single-table conjunct reaching a <code>SeqScan</code> lands either
+      fused into <code>SeqScan::filter</code> or in a <code>Filter</code> node directly above that
+      <code>SeqScan</code>; a conjunct referencing columns from both join sides stays at the join
+      (or above it).</li>
+    <li><strong>Selectivity estimation:</strong> <code>CostModel::selectivity(table, pred)</code>
+      returns a finite <code>f64</code> clamped to <code>[0.0, 1.0]</code>. Use System R's
+      formulas when catalog statistics exist and fall back to Selinger's documented guesses when
+      <code>Catalog::stats</code> returns <code>Ok(None)</code> or a column is not
+      interpolatable:<sup class="cite"><a href="#ref-1">1</a></sup>
+      <ul>
+        <li>Equality <code>col = lit</code>: <code>1.0 / distinct_estimate</code> when
+          <code>distinct_estimate &gt; 0</code>; fallback <code>0.1</code> (1/10) without stats.</li>
+        <li>Inequality <code>col != lit</code>: <code>1.0 - sel(col = lit)</code>.</li>
+        <li>Range <code>col &gt; lit</code> / <code>col &gt;= lit</code>:
+          <code>(max - lit) / (max - min)</code> for numeric columns when <code>max &gt; min</code>;
+          symmetric <code>(lit - min) / (max - min)</code> for <code>&lt;</code> /
+          <code>&lt;=</code>; fallback <code>1.0 / 3.0</code> when stats are absent or the column
+          is <code>Text</code>. Handle degenerate bounds cleanly (if <code>lit &lt;= min</code>
+          for <code>&gt;</code>, return <code>1.0</code>; if <code>lit &gt;= max</code>, return a
+          tiny floor or <code>0.0</code>; if <code>min == max</code>, avoid dividing by zero!).</li>
+        <li>Null checks: <code>col IS NULL</code> ⇒ <code>null_count / row_count</code> (fallback
+          <code>0.05</code>); <code>col IS NOT NULL</code> ⇒ complement.</li>
+        <li>Boolean connectives: <code>A AND B</code> ⇒ <code>sel(A) * sel(B)</code>
+          (independence assumption); <code>A OR B</code> ⇒
+          <code>sel(A) + sel(B) - sel(A) * sel(B)</code>; <code>NOT A</code> ⇒
+          <code>1.0 - sel(A)</code>.</li>
+        <li>Document the uniformity and independence assumptions explicitly in your rustdoc for
+          <code>CostModel</code>, because violating them on skewed or correlated columns is the
+          exact phenomenon <code>EXPLAIN ANALYZE</code> exposes.<sup class="cite"><a
+          href="#ref-5">5</a></sup></li>
+      </ul>
+    </li>
+    <li><strong>Access-path selection:</strong> for each base scan whose filter yields usable
+      bounds on an indexed column in <code>table.indexes</code>, construct both candidate plans
+      (<code>SeqScan</code> with the filter, and <code>IndexScan</code> plus any residual
+      <code>Filter</code> for predicates not enforced by the index bounds), price both with
+      <code>CostModel::plan_cost</code>, and keep the cheaper plan. This replaces Milestone 5's
+      always-use-index rule.</li>
+    <li><strong>Join method and ordering:</strong> choose <code>HashJoin</code> whenever an
+      equi-join predicate connects two join inputs — placing the <strong>smaller estimated input
+      on the left (build) side</strong> and the larger input on the right (probe) side — and
+      <code>NestedLoopJoin</code> for non-equi or cross joins. For queries joining multiple
+      tables, order them as a left-deep tree via Selinger subset dynamic programming (or greedy
+      for &gt; 8 tables), preferring connected pairs with a join predicate over cross
+      products.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a
+      href="#ref-3">3</a></sup></li>
   </ul>
 
+  <h3 id="spec-explain">4. Exact <code>EXPLAIN</code> and <code>EXPLAIN ANALYZE</code> contract</h3>
+  <p>The provided test suite inspects <code>QueryResult::explain</code> directly. Match the exact
+  contract documented in <code>course/ferricdb/crates/exec/src/lib.rs</code>:</p>
+  <ul>
+    <li><strong>Line-oriented structural format:</strong> render the optimized
+      <code>LogicalPlan</code> tree with <strong>one plan node per line</strong>, indented by
+      tree depth (two spaces per level is clean and readable). Each line must start (immediately
+      after indentation) with the <strong>verbatim <code>LogicalPlan</code> variant name</strong>
+      — <code>Projection</code>, <code>Filter</code>, <code>SeqScan</code>,
+      <code>IndexScan</code>, <code>HashJoin</code>, <code>NestedLoopJoin</code>,
+      <code>Aggregate</code>, <code>Sort</code>, <code>Limit</code>, <code>Insert</code>,
+      <code>Update</code>, <code>Delete</code>, <code>Values</code> — followed by helpful details
+      such as table name, index name, estimated cost, and estimated row count. Example shape:
+      <pre><code>Projection (cost=16.02 rows=1)
+  IndexScan on t using t_id (cost=16.01 rows=1)</code></pre>
+    </li>
+    <li><strong><code>EXPLAIN &lt;stmt&gt;</code> does NOT execute <code>&lt;stmt&gt;</code>:</strong>
+      plan and optimize the inner statement, render the plan string into
+      <code>QueryResult::explain = Some(text)</code>, leave <code>rows</code> empty and
+      <code>affected = 0</code>, and set <code>tag = "EXPLAIN".into()</code>. Running
+      <code>EXPLAIN DELETE FROM t</code> must leave every row of <code>t</code> untouched.<sup
+      class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong><code>EXPLAIN ANALYZE &lt;stmt&gt;</code> DOES execute <code>&lt;stmt&gt;</code>:</strong>
+      lower the optimized plan to executors wrapped in a lightweight timing-and-counting
+      instrumented executor, run the tree to completion (performing all side effects on
+      <code>INSERT</code>/<code>UPDATE</code>/<code>DELETE</code>, just as PostgreSQL does<sup
+      class="cite"><a href="#ref-4">4</a></sup>), discard the result rows (keeping
+      <code>QueryResult::rows</code> empty), and return the rendered tree in
+      <code>QueryResult::explain = Some(text)</code> annotated with each node's actual row count
+      and elapsed time in milliseconds. Print a clear reminder in the REPL whenever a user runs
+      <code>EXPLAIN ANALYZE</code> on a data-modifying statement.</li>
+  </ul>
+
+  <h2 id="sec-worked">Worked selectivity and cost example</h2>
+  <p>Before writing code, trace the exact scenario tested by
+  <code>ms7_analyze_then_explain_picks_access_path</code> in
+  <code>crates/exec/tests/exec.rs</code> by hand. Doing the arithmetic once guarantees your
+  constants, page counts, and crossover point agree with reality.<sup class="cite"><a
+  href="#ref-2">2</a></sup></p>
+
+  <p>Suppose table <code>t (id INTEGER PRIMARY KEY, grp INTEGER)</code> holds
+  <code>N = 2,000</code> rows with <code>id ∈ [0, 1999]</code> and <code>grp = id % 4</code>,
+  with B+Tree index <code>t_id</code> on <code>id</code>. Each heap tuple carries a 16-byte
+  <code>TupleMeta</code> header, a 1-byte null bitmap, and two 8-byte <code>INTEGER</code>
+  values (33 bytes) plus a 4–6 byte line pointer — about 39 bytes per row. Inside an 8,192-byte
+  heap page (minus 28 bytes of header), roughly 205 rows fit per page, so the heap spans
+  <code>P = 10</code> pages. Running <code>ANALYZE t</code> stores:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Statistic</th><th>Table <code>t</code></th><th>Column <code>id</code> (col 0)</th><th>Column <code>grp</code> (col 1)</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>row_count</code> / <code>page_count</code></td><td><code>2000</code> rows / <code>10</code> pages</td><td>—</td><td>—</td></tr>
+        <tr><td><code>min</code> / <code>max</code></td><td>—</td><td><code>0</code> / <code>1999</code></td><td><code>0</code> / <code>3</code></td></tr>
+        <tr><td><code>distinct_estimate</code> / <code>null_count</code></td><td>—</td><td><code>2000</code> / <code>0</code></td><td><code>4</code> / <code>0</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Now price the two queries from the test suite using FerricDB's course constants (chosen to
+  match PostgreSQL's defaults:<sup class="cite"><a href="#ref-2">2</a></sup>
+  <code>SEQ_PAGE_COST = 1.0</code>, <code>RANDOM_PAGE_COST = 4.0</code>,
+  <code>CPU_TUPLE_COST = 0.01</code>). For a sequential scan, every page and every tuple is
+  visited regardless of selectivity:
+  <code>cost(SeqScan) = SEQ_PAGE_COST · P + CPU_TUPLE_COST · N = 1.0 · 10 + 0.01 · 2000 = 30.0</code>.
+  For an unclustered B+Tree index scan of height <code>h ≈ 2</code> over an index of roughly
+  <code>L ≈ 4</code> leaf pages (510 integer entries per leaf), matching <code>M = s · N</code>
+  rows requires descending <code>h</code> internal levels, reading
+  <code>⌈s · L⌉</code> leaf pages, and performing up to <code>M</code> random heap fetches:
+  <code>cost(IndexScan) = RANDOM_PAGE_COST · (h + ⌈s · L⌉ + M) + CPU_TUPLE_COST · M</code>.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Query predicate</th><th>Selectivity <code>s</code></th><th>Est. rows <code>M</code></th><th><code>SeqScan</code> cost</th><th><code>IndexScan</code> cost</th><th>Winner</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>WHERE id = 42</code></td>
+          <td><code>1 / 2000 = 0.0005</code></td>
+          <td><code>1</code></td>
+          <td><code>1.0·10 + 0.01·2000 = 30.0</code></td>
+          <td><code>4.0·(2 + 1 + 1) + 0.01·1 = 16.01</code></td>
+          <td><strong><code>IndexScan</code></strong></td>
+        </tr>
+        <tr>
+          <td><code>WHERE id &gt; 2</code></td>
+          <td><code>(1999 − 2) / 1999 ≈ 0.999</code></td>
+          <td><code>1998</code></td>
+          <td><code>1.0·10 + 0.01·2000 = 30.0</code></td>
+          <td><code>4.0·(2 + 4 + 1998) + 0.01·1998 ≈ 8,036</code></td>
+          <td><strong><code>SeqScan</code></strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Even if you cap heap fetches at <code>min(M, P) = 10</code> pages (assuming a lucky buffer
+  pool), <code>IndexScan</code> for <code>id &gt; 2</code> still pays
+  <code>4.0 · (2 + 4 + 10) + 19.98 = 83.98 &gt; 30.0</code> because random I/O costs 4× sequential
+  I/O and the scan also reads the index leaves. Notice where the crossover lies: setting
+  <code>4.0 · (3 + M) + 0.01 · M = 30.0</code> solves to <code>M ≈ 4.5</code> rows
+  (<code>s ≈ 0.22%</code>) on a 10-page table. On a 1,000-page table the crossover shifts higher,
+  but the shape is identical: a flat sequential line intersected by a steep index line (Figure 2).</p>
+
+  <figure>
+    <svg viewBox="0 0 920 350" role="img">
+      <title>Phase 1 rule-based rewrites (constant folding, single-side predicate pushdown using
+      table_idx, and equi-join promotion to HashJoin) beside Phase 2 access-path cost crossover
+      between flat SeqScan and steeply rising IndexScan on a 2000-row table.</title>
+      <defs>
+        <marker id="ms7-f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"></path>
+        </marker>
+      </defs>
+
+      <!-- Left panel: Rewrites -->
+      <text x="252" y="24" class="d-text" font-weight="600" text-anchor="middle">Phase 1: Rule-Based Rewrites</text>
+
+      <!-- Before column -->
+      <text x="125" y="46" class="d-text-sm" text-anchor="middle">Before optimize()</text>
+      <rect x="20" y="56" width="210" height="40" rx="5" class="d-box-warn"></rect>
+      <text x="125" y="73" class="d-mono-sm" text-anchor="middle">Projection</text>
+      <text x="125" y="88" class="d-mono-sm" text-anchor="middle">2 * (3 + 4), t0.a</text>
+      <path d="M 125 96 V 114" class="d-line" marker-end="url(#ms7-f2-arr)"></path>
+
+      <rect x="20" y="116" width="210" height="44" rx="5" class="d-box-warn"></rect>
+      <text x="125" y="133" class="d-mono-sm" text-anchor="middle">Filter</text>
+      <text x="125" y="149" class="d-mono-sm" text-anchor="middle">t0.a = 5 AND t0.b = t1.b</text>
+      <path d="M 125 160 V 178" class="d-line" marker-end="url(#ms7-f2-arr)"></path>
+
+      <rect x="20" y="180" width="210" height="38" rx="5" class="d-box"></rect>
+      <text x="125" y="203" class="d-mono-sm" text-anchor="middle">NestedLoopJoin (on: None)</text>
+      <path d="M 85 218 L 70 246" class="d-line" marker-end="url(#ms7-f2-arr)"></path>
+      <path d="M 165 218 L 180 246" class="d-line" marker-end="url(#ms7-f2-arr)"></path>
+
+      <rect x="20" y="248" width="100" height="42" rx="5" class="d-box"></rect>
+      <text x="70" y="266" class="d-mono-sm" text-anchor="middle">SeqScan t0</text>
+      <text x="70" y="281" class="d-mono-sm" text-anchor="middle">filter: None</text>
+
+      <rect x="130" y="248" width="100" height="42" rx="5" class="d-box"></rect>
+      <text x="180" y="266" class="d-mono-sm" text-anchor="middle">SeqScan t1</text>
+      <text x="180" y="281" class="d-mono-sm" text-anchor="middle">filter: None</text>
+
+      <text x="125" y="314" class="d-text-sm" text-anchor="middle">Cross join runs before filter</text>
+
+      <!-- Transition arrow -->
+      <text x="254" y="150" class="d-text-sm" text-anchor="middle">fold +</text>
+      <text x="254" y="164" class="d-text-sm" text-anchor="middle">push</text>
+      <path d="M 235 176 H 272" class="d-line-hl" marker-end="url(#ms7-f2-arr)"></path>
+
+      <!-- After column -->
+      <text x="384" y="46" class="d-text-sm" text-anchor="middle">After rewrites + join choice</text>
+      <rect x="278" y="56" width="212" height="40" rx="5" class="d-box-good"></rect>
+      <text x="384" y="73" class="d-mono-sm" text-anchor="middle">Projection</text>
+      <text x="384" y="88" class="d-mono-sm" text-anchor="middle">14, t0.a  (folded)</text>
+      <path d="M 384 96 V 124" class="d-line-hl" marker-end="url(#ms7-f2-arr)"></path>
+
+      <rect x="278" y="126" width="212" height="48" rx="5" class="d-box-hl"></rect>
+      <text x="384" y="145" class="d-mono-sm" text-anchor="middle">HashJoin (build left)</text>
+      <text x="384" y="162" class="d-mono-sm" text-anchor="middle">left: t0.b  =  right: t1.b</text>
+      <path d="M 344 174 L 329 208" class="d-line-hl" marker-end="url(#ms7-f2-arr)"></path>
+      <path d="M 424 174 L 439 208" class="d-line" marker-end="url(#ms7-f2-arr)"></path>
+
+      <rect x="278" y="210" width="102" height="48" rx="5" class="d-box-good"></rect>
+      <text x="329" y="229" class="d-mono-sm" text-anchor="middle">SeqScan t0</text>
+      <text x="329" y="246" class="d-mono-sm" text-anchor="middle">t0.a = 5</text>
+
+      <rect x="388" y="210" width="102" height="48" rx="5" class="d-box"></rect>
+      <text x="439" y="229" class="d-mono-sm" text-anchor="middle">SeqScan t1</text>
+      <text x="439" y="246" class="d-mono-sm" text-anchor="middle">filter: None</text>
+
+      <text x="384" y="294" class="d-text-sm" text-anchor="middle">Single-side pred pushed via table_idx=0;</text>
+      <text x="384" y="310" class="d-text-sm" text-anchor="middle">equi-pred promotes join to HashJoin</text>
+
+      <!-- Divider -->
+      <path d="M 505 18 V 332" class="d-line" stroke-dasharray="5 4"></path>
+
+      <!-- Right panel: Cost Crossover -->
+      <text x="714" y="24" class="d-text" font-weight="600" text-anchor="middle">Phase 2: Scan Cost Crossover (N=2000, P=10)</text>
+
+      <!-- Axes -->
+      <path d="M 566 270 V 58" class="d-line" marker-end="url(#ms7-f2-arr)"></path>
+      <path d="M 566 270 H 892" class="d-line" marker-end="url(#ms7-f2-arr)"></path>
+      <text x="556" y="64" class="d-text-sm" text-anchor="end">cost</text>
+      <text x="558" y="216" class="d-mono-sm" text-anchor="end">30</text>
+      <text x="558" y="136" class="d-mono-sm" text-anchor="end">70</text>
+      <text x="558" y="76" class="d-mono-sm" text-anchor="end">100</text>
+      <text x="566" y="286" class="d-mono-sm" text-anchor="middle">0</text>
+      <text x="699" y="286" class="d-mono-sm" text-anchor="middle">0.005</text>
+      <text x="832" y="286" class="d-mono-sm" text-anchor="middle">0.010</text>
+      <text x="729" y="304" class="d-text-sm" text-anchor="middle">selectivity s (zoomed near crossover)</text>
+
+      <!-- SeqScan flat line at cost 30 (y=210) -->
+      <path d="M 566 210 H 886" class="d-line" stroke-width="2"></path>
+      <text x="884" y="202" class="d-mono-sm" text-anchor="end">SeqScan = 30.0 (flat)</text>
+
+      <!-- IndexScan steep line: cost = 12 + 8020*s; 2px per unit cost from y=270 -->
+      <!-- s=0: y=246; s=0.00224: x=626, y=210; s=0.011: x=859, y=70 -->
+      <path d="M 566 246 L 859 70" class="d-line-hl"></path>
+      <text x="810" y="82" class="d-mono-sm" text-anchor="end">IndexScan</text>
+
+      <!-- Crossover vertical marker -->
+      <path d="M 626 210 V 270" class="d-line" stroke-dasharray="4 3"></path>
+      <circle cx="626" cy="210" r="4" class="d-box-hl"></circle>
+      <text x="634" y="182" class="d-text-sm">crossover s ≈ 0.0022</text>
+      <path d="M 634 186 L 628 205" class="d-line"></path>
+
+      <!-- id = 42 point (s=0.0005 -> x=579, y=238) -->
+      <circle cx="579" cy="238" r="4" class="d-box-good"></circle>
+      <rect x="646" y="222" width="144" height="38" rx="4" class="d-box-good"></rect>
+      <text x="718" y="238" class="d-mono-sm" text-anchor="middle">id = 42 (s=0.0005)</text>
+      <text x="718" y="253" class="d-mono-sm" text-anchor="middle">cost 16.0 → IndexScan</text>
+      <path d="M 646 240 L 585 238" class="d-line-hl" marker-end="url(#ms7-f2-arr)"></path>
+
+      <!-- id > 2 callout -->
+      <rect x="708" y="114" width="184" height="44" rx="4" class="d-box-warn"></rect>
+      <text x="800" y="132" class="d-mono-sm" text-anchor="middle">id &gt; 2 (s ≈ 0.999)</text>
+      <text x="800" y="148" class="d-mono-sm" text-anchor="middle">Index ≈ 8,036 → SeqScan</text>
+
+      <text x="714" y="330" class="d-text-sm" text-anchor="middle">SEQ=1.0, RAND=4.0, CPU=0.01 (unclustered heap model)</text>
+    </svg>
+    <figcaption>Figure 2 — Left: rule-based rewrites fold constants, push single-table predicates
+    down using <code>table_idx</code>, and turn equi-predicates into <code>HashJoin</code>. Right:
+    the cost crossover on the 2,000-row <code>ms7_</code> test table.<sup class="cite"><a
+    href="#ref-2">2</a></sup></figcaption>
+  </figure>
+
   <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <p>Work through these steps in sequence. Each step unlocks a specific subset of the provided
+  tests before you build the next layer on top of it.</p>
+
   <ol>
-    <li><strong>Rewrites first — they need no statistics.</strong> Write each rule as a function
-      <code>LogicalPlan -&gt; LogicalPlan</code> and a driver that applies rules bottom-up until
-      a fixpoint. Constant folding is a good warm-up (fold inside <code>BoundExpr</code>);
-      pushdown is the one with the correctness rule — test it on a predicate referencing both
-      join sides (must NOT push) and one side (must push).</li>
-    <li><strong>ANALYZE next.</strong> One pass per table through your own SeqScan: count rows
-      and pages, track min/max per column, estimate distincts. For distinct estimation a
-      HashSet is fine at course scale; note in the rustdoc that real systems sample and use
-      sketches (HyperLogLog) instead. Persist with <code>set_stats</code>; verify with the
-      catalog round-trip test.</li>
-    <li><strong>Selectivity, then cost.</strong> Implement <code>selectivity()</code> as a match
-      over the predicate shape, then <code>plan_cost()</code> recursively: SeqScan =
-      <code>SEQ_PAGE_COST·pages + CPU_TUPLE_COST·rows</code>; IndexScan =
-      <code>RANDOM_PAGE_COST·(height + matching leaves + matching heap fetches) + cpu</code>
-      (state your clustering assumption — all-random is honest and simple); joins from the M07
-      formulas over estimated input cardinalities. Check your arithmetic against interdb §3.2's
-      worked examples with the same constants.<sup class="cite"><a href="#ref-2">2</a></sup></li>
-    <li><strong>Access path selection.</strong> Where a filter predicate hits an indexed column
-      with <code>=</code> or a range, build both candidate scans, cost them, keep the winner.
-      This is ten lines once the cost model exists — the leverage is all in step 3.</li>
-    <li><strong>Join ordering.</strong> Greedy: start from the pair with the smallest estimated
-      output, attach the table producing the smallest next output, repeat. DP: memo from
-      table-bitmask to best (plan, cost, rows) per subset, built by subset size, exactly the M08
-      explorer.<sup class="cite"><a href="#ref-1">1</a></sup> Either way, join <em>inputs</em>
-      keep their chosen access paths from step 4.</li>
-    <li><strong>EXPLAIN last.</strong> A pretty-printer over the optimized plan plus per-node
-      estimates you already computed; ANALYZE mode wraps each executor with counters and a
-      timer. Keep the format line-oriented and stable — the tests match structural markers
-      (operator names, indentation), not exact costs.</li>
+    <li>
+      <p><strong>Parse <code>ANALYZE</code> and <code>EXPLAIN</code>, and persist catalog
+      stats.</strong> Start in <code>crates/sql/src/lib.rs</code>: dispatch on
+      <code>Keyword::Analyze</code> (optional identifier → <code>Statement::Analyze</code>) and
+      <code>Keyword::Explain</code> (optional <code>Keyword::Analyze</code>, then recursive
+      statement parse → <code>Statement::Explain</code>). Run
+      <code>cargo test -p ferricdb-sql -- --include-ignored ms7_</code> until
+      <code>ms7_analyze_and_explain_parse</code> passes. Next, wire <code>Binder::bind</code> for
+      both statements in <code>crates/exec/src/binder.rs</code>.</p>
+      <p>Then implement <code>Catalog::stats</code> and <code>Catalog::set_stats</code> in
+      <code>crates/catalog/src/lib.rs</code>. Store statistics in your catalog's own page-backed
+      storage — for example, a fixed-page <code>__stats</code> heap file allocated at bootstrap
+      alongside <code>__tables</code> and <code>__columns</code> (or chained off your catalog
+      metadata page if your bootstrap already allocated fixed page IDs 0..N; if you add a new
+      page on an existing database file, handle stores created before stats existed cleanly).
+      Serialize <code>TableStats</code> (table name, <code>row_count</code>,
+      <code>page_count</code>, column count, and each <code>ColumnStats</code> with tagged
+      <code>Option&lt;Value&gt;</code> min/max). On overwrite, tombstone the old stats row and
+      insert the new one, and update the in-memory <code>CatalogCache::stats</code> map. Verify
+      with <code>cargo test -p ferricdb-catalog -- --include-ignored ms7_</code>.</p>
+    </li>
+
+    <li>
+      <p><strong>Implement <code>ANALYZE</code> execution.</strong> In
+      <code>crates/exec/src/lib.rs</code>, dispatch <code>BoundStatement::Analyze { table }</code>
+      directly inside <code>execute()</code> (bypassing <code>Planner::plan</code>). Resolve the
+      target list: either <code>vec![table_info]</code> or all tables from
+      <code>ctx.catalog.tables()?</code>. For each table, scan its <code>HeapFile</code> once,
+      counting live rows and distinct heap pages visited (walking the page chain via
+      <code>HeapPageRef::next_page</code> so even an empty table reports
+      <code>page_count &gt;= 1</code>). Per column, track <code>null_count</code>, running
+      <code>min</code> and <code>max</code> via <code>Value::sql_cmp</code>, and distinct
+      non-NULL values. At course scale, an exact <code>HashSet</code> (normalizing
+      <code>Float</code> via <code>to_bits()</code> or converting to a comparable key) is fast
+      and exact; note in a doc comment that production systems sample blocks and use sketches
+      such as HyperLogLog to bound memory. Persist with <code>ctx.catalog.set_stats</code> and
+      return <code>QueryResult</code> with <code>tag = "ANALYZE".into()</code>.</p>
+    </li>
+
+    <li>
+      <p><strong>Build rule-based rewrites before touching costs.</strong> Organize
+      <code>Planner::optimize</code> as an explicit multi-pass pipeline over
+      <code>LogicalPlan</code>:</p>
+      <ol>
+        <li><em>Constant folding:</em> write a recursive helper <code>fold_expr(expr: BoundExpr) -&gt; BoundExpr</code>
+          that folds children first and evaluates <code>Unary</code>, <code>Binary</code>,
+          <code>IsNull</code>, and <code>Cast</code> nodes whose operands are all
+          <code>BoundExpr::Literal</code>. Reuse your Milestone 4 expression evaluator so NULL
+          propagation and SQL three-valued logic stay identical in one place. Apply
+          <code>fold_expr</code> across every expression in every <code>LogicalPlan</code>
+          variant without changing node kinds (so <code>ms7_constant_folding</code> sees its
+          <code>Projection</code> intact).</li>
+        <li><em>Predicate pushdown:</em> write a helper <code>referenced_tables(expr: &amp;BoundExpr) -&gt; BTreeSet&lt;usize&gt;</code>
+          collecting every <code>BoundExpr::Column { table, .. }</code>, and a companion
+          <code>output_tables(plan: &amp;LogicalPlan) -&gt; BTreeSet&lt;usize&gt;</code>
+          collecting the <code>table_idx</code> of every <code>SeqScan</code> /
+          <code>IndexScan</code> in a subtree. Split a <code>Filter</code>'s predicate on top-level
+          <code>AND</code> into a list of conjuncts. When pushing a conjunct down through a
+          <code>NestedLoopJoin</code> or <code>HashJoin</code>: if its referenced tables are a
+          subset of <code>output_tables(left)</code>, push it onto <code>left</code>; if a subset
+          of <code>output_tables(right)</code>, push it onto <code>right</code>; otherwise keep it
+          at the join (for <code>NestedLoopJoin</code>, you may merge it into <code>on</code>).
+          When a conjunct reaches a <code>SeqScan</code>, combine it into
+          <code>SeqScan::filter</code> (or leave a <code>Filter</code> right above the scan). Never
+          push a predicate containing <code>BoundExpr::InputRef</code> below an
+          <code>Aggregate</code> or <code>Projection</code> that produces that ref.</li>
+        <li><em>Projection cleanup:</em> if your planner ever stacks redundant pass-through
+          <code>Projection</code> nodes, collapse them; otherwise keep the top-level
+          <code>Projection</code> schema untouched so column names and aliases remain exact.</li>
+      </ol>
+      <p>Verify right now with <code>ms7_constant_folding</code> and
+      <code>ms7_predicate_pushdown_single_side</code>.</p>
+    </li>
+
+    <li>
+      <p><strong>Implement <code>CostModel::selectivity</code> and <code>CostModel::plan_cost</code>.</strong>
+      In <code>crates/exec/src/cost.rs</code>, build <code>selectivity(table, pred)</code> first
+      as a recursive match on <code>BoundExpr</code>:</p>
+      <ul>
+        <li>Handle normalized column-literal comparisons regardless of operand order (rewrite
+          <code>42 = id</code> to <code>id = 42</code> by flipping the comparison operator).</li>
+        <li>Look up <code>self.catalog.stats(&amp;table.name)</code>; if <code>Ok(Some(stats))</code>
+          and <code>stats.row_count &gt; 0</code>, compute exact Selinger fractions from
+          <code>stats.columns[col_idx]</code>; otherwise use the honest fallback guesses
+          (<code>0.1</code> for <code>=</code>, <code>1.0 / 3.0</code> for ranges,
+          <code>0.05</code> for <code>IS NULL</code>).</li>
+        <li>Guard every denominator: if <code>distinct_estimate == 0</code>, fall back to
+          <code>0.1</code>; if <code>min == max</code> in range interpolation, return
+          <code>1.0</code> or <code>0.0</code> by comparing the literal directly against
+          <code>min</code>; and clamp the final return value with <code>.clamp(0.0, 1.0)</code>
+          so <code>NaN</code> or negative values can never poison downstream costs.</li>
+      </ul>
+      <p>Next, write an internal helper <code>estimate(&amp;self, plan: &amp;LogicalPlan) -&gt; (f64 /*cost*/, f64 /*rows*/)</code>
+      that <code>plan_cost</code> delegates to. Price every node recursively:</p>
+      <ul>
+        <li><code>SeqScan { table, filter, .. }</code>: fetch <code>(rows, pages)</code> from
+          catalog stats (fallback e.g. <code>1000</code> rows, <code>10</code> pages when
+          unanalyzed); cost = <code>SEQ_PAGE_COST * pages + CPU_TUPLE_COST * rows</code>;
+          output rows = <code>(rows * filter_sel).max(1.0)</code> (or <code>0.0</code> if
+          <code>rows == 0</code>).</li>
+        <li><code>IndexScan { table, lower, upper, .. }</code>: convert the <code>lower</code> /
+          <code>upper</code> bounds back into a selectivity <code>s</code> (using
+          <code>1/distinct</code> when <code>lower == upper</code> is an equality point lookup, or
+          range interpolation for open/closed intervals); matching rows
+          <code>M = (rows * s).max(1.0)</code>; approximate B+Tree height
+          <code>h = (rows.max(2.0).log(256.0)).ceil().max(1.0)</code> and leaf pages
+          <code>L = (rows / 256.0).ceil().max(1.0)</code>; cost =
+          <code>RANDOM_PAGE_COST * (h + (s * L).ceil() + M) + CPU_TUPLE_COST * M</code>. State
+          your unclustered-heap assumption in the rustdoc.<sup class="cite"><a
+          href="#ref-2">2</a></sup></li>
+        <li><code>Filter { input, predicate }</code>: child cost + <code>CPU_TUPLE_COST * child_rows</code>;
+          output rows scaled by selectivity.</li>
+        <li><code>NestedLoopJoin { left, right, on }</code>:
+          <code>left_cost + left_rows * right_cost + CPU_TUPLE_COST * left_rows * right_rows</code>
+          (reflecting the outer loop re-scanning the inner relation per outer row).</li>
+        <li><code>HashJoin { left, right, .. }</code>:
+          <code>left_cost + right_cost + CPU_TUPLE_COST * (2.0 * left_rows + right_rows)</code>
+          plus a small build-side penalty (e.g., <code>1.5 * CPU_TUPLE_COST * left_rows</code>) so
+          the cost model strictly prefers placing the smaller relation on the left build side!</li>
+        <li><code>Projection</code>, <code>Sort</code> (<code>N log₂ N · CPU_TUPLE_COST</code>),
+          <code>Aggregate</code>, <code>Limit</code>: child cost plus linear/log CPU work.</li>
+      </ul>
+    </li>
+
+    <li>
+      <p><strong>Cost-based access path selection.</strong> First, remove Milestone&nbsp;5's
+      unconditional <code>IndexScan</code> branch from <code>Planner::plan</code> (so
+      <code>plan()</code> always emits <code>SeqScan</code> + <code>Filter</code>, letting
+      <code>optimize()</code> own every access-path decision; alternatively, also evaluate
+      <code>SeqScan</code> whenever <code>optimize()</code> visits an existing
+      <code>IndexScan</code>). Otherwise selective-vs-unselective tests like
+      <code>ms7_analyze_then_explain_picks_access_path</code> (<code>WHERE id &gt; 2</code>) will stay
+      pinned on <code>IndexScan</code>. Next, walk the rewritten plan bottom-up.
+      Whenever you visit a <code>SeqScan { table_idx, table, filter: Some(pred) }</code> (or a
+      <code>Filter</code> directly above a <code>SeqScan</code>), inspect each index in
+      <code>table.indexes</code>. Extract the tightest <code>(lower, upper)</code> bounds on that
+      index's column from the conjunctive terms of <code>pred</code>, keeping any remaining
+      conjuncts as a residual filter. Build the candidate
+      <code>IndexScan { table_idx, table, index, lower, upper }</code> (wrapped in a
+      <code>Filter</code> if residual conjuncts remain), compare
+      <code>cost_model.plan_cost(&amp;idx_candidate)</code> against
+      <code>cost_model.plan_cost(&amp;seq_candidate)</code>, and keep whichever has the lower
+      cost. Remember to guard against <code>Value::Null</code> and <code>Float(NaN)</code> bounds
+      (B+Tree rejects them, so those predicates stay on <code>SeqScan</code>).</p>
+    </li>
+
+    <li>
+      <p><strong>Join strategy selection and Selinger left-deep join ordering.</strong> First,
+      handle single joins cleanly: given a join of <code>left</code> and <code>right</code> with
+      predicate <code>on</code>, extract equi-join conjuncts of the form
+      <code>left_col = right_col</code> (where one side references only <code>left</code>'s
+      <code>table_idx</code>s and the other only <code>right</code>'s). If at least one
+      equi-pair exists, build <code>HashJoin</code> with the smaller estimated child on the
+      <strong>left</strong> (build side) and the larger on the <strong>right</strong> (probe side),
+      wrapping any leftover non-equi conjuncts in a <code>Filter</code> above the join; otherwise
+      keep <code>NestedLoopJoin</code>.</p>
+      <p>Next, generalize to multi-table inner/cross join trees (up to ~8 tables) using Selinger
+      subset dynamic programming (Figure 3).<sup class="cite"><a href="#ref-1">1</a></sup>
+      Flatten contiguous inner/cross joins into a vector of base scan plans
+      <code>scans[0..n]</code> (each already carrying its winning single-table access path and its
+      original <code>table_idx</code>!) plus the list of all inter-table join conjuncts. Because
+      every <code>SeqScan</code> and <code>IndexScan</code> carries its own
+      <code>table_idx</code>, reordering tables inside the join tree never breaks
+      <code>BoundExpr::Column { table, column }</code> — <code>Planner::create_executor</code>
+      resolves column offsets dynamically from each subtree's <code>table_idx</code> layout! Here
+      is the published System R subset-DP structure in pseudocode:<sup class="cite"><a
+      href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-3">3</a></sup></p>
+      <pre><code>// Published System R subset-DP (Selinger et al. 1979) — left-deep join order
+memo: Map&lt;Bitmask, (LogicalPlan, cost: f64, est_rows: f64)&gt;
+for i in 0..n:
+    memo[1 &lt;&lt; i] = (best_scan[i], plan_cost(best_scan[i]), est_rows(best_scan[i]))
+
+for subset_size in 2..=n:
+    for each mask with popcount(mask) == subset_size:
+        best = None
+        for each i in mask:                        // try adding base table i last
+            prev = mask ^ (1 &lt;&lt; i)
+            let (prev_plan, _, prev_rows) = memo[prev]
+            let (scan_plan, _, scan_rows) = memo[1 &lt;&lt; i]
+            connecting_preds = preds touching BOTH prev and {i} (and nothing outside mask)
+            // Keep cross-product candidates priced honestly (or only skip i when some
+            // other j ∉ prev still has a predicate connecting to prev) so disconnected
+            // queries like `(a JOIN b) CROSS JOIN c` still explore `(a ⋈ b) × c`.
+            candidate = build_best_join(prev_plan, scan_plan, connecting_preds)
+            // Inside build_best_join: if equi-preds exist, emit HashJoin with
+            // min(prev_rows, scan_rows) on the LEFT build side; else NestedLoopJoin.
+            c = plan_cost(candidate)
+            if best is None or c &lt; best.cost:
+                best = Some((candidate, c, est_join_rows(prev_rows, scan_rows, connecting_preds)))
+        memo[mask] = best
+
+return memo[(1 &lt;&lt; n) - 1].plan</code></pre>
+      <p>Notice one subtle detail in the pseudocode: inside <code>build_best_join</code>,
+      <code>HashJoin</code> builds its hash table on the <code>left</code> child, so when
+      <code>scan_rows &lt; prev_rows</code> you may place <code>scan_plan</code> on the left and
+      <code>prev_plan</code> on the right (turning that single step into a smaller hash build) —
+      or if you keep strictly left-deep shape where <code>prev_plan</code> stays on the left,
+      still compare both orientations at size 2 so the smaller base table builds the first hash
+      table. For queries with more than ~10 tables, fall back to a greedy loop that repeatedly
+      attaches the remaining table producing the smallest estimated intermediate result.</p>
+    </li>
+
+    <li>
+      <p><strong>Wire <code>EXPLAIN</code> and <code>EXPLAIN ANALYZE</code>.</strong> In
+      <code>execute()</code>, handle <code>BoundStatement::Explain { analyze, inner }</code>:
+      plan and optimize <code>*inner</code> via <code>planner.plan</code> →
+      <code>planner.optimize</code>. Write a recursive formatter over <code>&amp;LogicalPlan</code>
+      that prints two spaces per depth level, the exact <code>LogicalPlan</code> variant name,
+      target table/index/keys, and <code>cost</code> + estimated <code>rows</code> from
+      <code>CostModel</code>. When <code>analyze == false</code>, return immediately without
+      calling <code>create_executor</code>. When <code>analyze == true</code>, wrap each lowered
+      <code>Box&lt;dyn Executor&gt;</code> in a tiny <code>InstrumentedExecutor</code> struct
+      holding a shared <code>Arc&lt;Mutex&lt;NodeStats&gt;&gt;</code> (<code>actual_rows: u64</code>,
+      <code>elapsed: Duration</code>) that times <code>open</code>/<code>next</code>/<code>close</code>
+      and increments <code>actual_rows</code> on every <code>Ok(Some(_))</code>; drain the root
+      executor to completion, then format the plan tree with both estimates and actuals side by
+      side.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+    </li>
   </ol>
 
+  <figure>
+    <svg viewBox="0 0 920 330" role="img">
+      <title>Selinger dynamic programming subset lattice for a three-table join of C (1k rows),
+      O (10k rows), and L (40k rows), showing bitmask memo entries at levels 1, 2, and 3, cross
+      product avoidance for {C, L}, loser pruning, and placing the smaller intermediate on the
+      HashJoin build side.</title>
+      <defs>
+        <marker id="ms7-f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"></path>
+        </marker>
+      </defs>
+
+      <!-- Column headings -->
+      <text x="117" y="24" class="d-text" font-weight="600" text-anchor="middle">Level 1: Single Tables</text>
+      <text x="440" y="24" class="d-text" font-weight="600" text-anchor="middle">Level 2: Pairs (prune losers)</text>
+      <text x="781" y="24" class="d-text" font-weight="600" text-anchor="middle">Level 3: Full Join</text>
+
+      <!-- Level 1 boxes -->
+      <rect x="20" y="46" width="195" height="58" rx="5" class="d-box"></rect>
+      <text x="117" y="69" class="d-mono" text-anchor="middle">{C}  mask 001</text>
+      <text x="117" y="88" class="d-mono-sm" text-anchor="middle">SeqScan C · 1,000 rows</text>
+
+      <rect x="20" y="130" width="195" height="58" rx="5" class="d-box"></rect>
+      <text x="117" y="153" class="d-mono" text-anchor="middle">{O}  mask 010</text>
+      <text x="117" y="172" class="d-mono-sm" text-anchor="middle">SeqScan O · 10,000 rows</text>
+
+      <rect x="20" y="214" width="195" height="58" rx="5" class="d-box"></rect>
+      <text x="117" y="237" class="d-mono" text-anchor="middle">{L}  mask 100</text>
+      <text x="117" y="256" class="d-mono-sm" text-anchor="middle">SeqScan L · 40,000 rows</text>
+
+      <!-- Level 2 boxes -->
+      <rect x="315" y="40" width="250" height="72" rx="5" class="d-box-good"></rect>
+      <text x="440" y="60" class="d-mono" text-anchor="middle">{C, O}  011 · est 10k</text>
+      <text x="440" y="79" class="d-mono-sm" text-anchor="middle">keep: HashJoin(build C, probe O)</text>
+      <text x="440" y="97" class="d-text-sm" text-anchor="middle">pruned: HashJoin(O, C), NLJ</text>
+
+      <rect x="315" y="128" width="250" height="72" rx="5" class="d-box"></rect>
+      <text x="440" y="148" class="d-mono" text-anchor="middle">{O, L}  110 · est 40k</text>
+      <text x="440" y="167" class="d-mono-sm" text-anchor="middle">keep: HashJoin(build O, probe L)</text>
+      <text x="440" y="185" class="d-text-sm" text-anchor="middle">pruned: HashJoin(L, O), NLJ</text>
+
+      <rect x="315" y="218" width="250" height="60" rx="5" class="d-box-bad" stroke-dasharray="5 4"></rect>
+      <text x="440" y="241" class="d-mono" text-anchor="middle">{C, L}  101 — cross product</text>
+      <text x="440" y="261" class="d-text-sm" text-anchor="middle">no join pred (40M rows) → skipped</text>
+
+      <!-- Level 3 box -->
+      <rect x="660" y="82" width="242" height="148" rx="6" class="d-box-hl"></rect>
+      <text x="781" y="106" class="d-mono" font-weight="600" text-anchor="middle">{C, O, L}  111 — Winner</text>
+      <text x="781" y="130" class="d-mono-sm" text-anchor="middle">HashJoin</text>
+      <text x="781" y="148" class="d-mono-sm" text-anchor="middle">build left:  (C ⋈ O) [10k]</text>
+      <text x="781" y="166" class="d-mono-sm" text-anchor="middle">probe right: L [40k]</text>
+      <line x1="678" y1="180" x2="884" y2="180" class="d-line" stroke-dasharray="3 3"></line>
+      <text x="781" y="198" class="d-text-sm" text-anchor="middle">pruned: (O ⋈ L) ⋈ C</text>
+      <text x="781" y="214" class="d-text-sm" text-anchor="middle">(4× larger intermediate: 40k)</text>
+
+      <!-- Arrows L1 -> L2 -->
+      <path d="M 215 66 L 312 66" class="d-line-hl" marker-end="url(#ms7-f3-arr)"></path>
+      <path d="M 215 148 L 312 88" class="d-line-hl" marker-end="url(#ms7-f3-arr)"></path>
+      <path d="M 215 166 L 312 164" class="d-line" marker-end="url(#ms7-f3-arr)"></path>
+      <path d="M 215 232 L 312 182" class="d-line" marker-end="url(#ms7-f3-arr)"></path>
+      <path d="M 215 88 L 312 238" class="d-line" stroke-dasharray="4 4" opacity="0.45" marker-end="url(#ms7-f3-arr)"></path>
+      <path d="M 215 254 L 312 254" class="d-line" stroke-dasharray="4 4" opacity="0.45" marker-end="url(#ms7-f3-arr)"></path>
+
+      <!-- Arrows L2 -> L3 -->
+      <path d="M 565 76 L 657 126" class="d-line-hl" marker-end="url(#ms7-f3-arr)"></path>
+      <text x="615" y="90" class="d-text-sm" text-anchor="middle">+ L</text>
+      <path d="M 565 164 L 657 164" class="d-line" stroke-dasharray="4 3" marker-end="url(#ms7-f3-arr)"></path>
+      <text x="612" y="184" class="d-text-sm" text-anchor="middle">+ C (pruned)</text>
+
+      <!-- Footer caption inside SVG -->
+      <text x="460" y="312" class="d-text-sm" text-anchor="middle">Memo keyed by subset bitmask S: at most 2ⁿ − 1 entries instead of n! permutations; smaller side builds HashJoin.</text>
+    </svg>
+    <figcaption>Figure 3 — Selinger subset-DP lattice for a 3-table join.<sup class="cite"><a
+    href="#ref-1">1</a></sup> Each subset bitmask retains only its cheapest plan; disconnected
+    pairs avoid cross products when join predicates exist, and <code>HashJoin</code> places the
+    smaller estimated relation on its left build input.</figcaption>
+  </figure>
+
   <h2 id="sec-tests">Test plan</h2>
-  <pre><code>cargo test -p ferricdb-exec    -- --include-ignored ms7_
-cargo test -p ferricdb-catalog -- --include-ignored ms7_</code></pre>
-  <p>The exec group: rewrite unit tests on plan trees (pushdown legality both ways, folding);
-  the crossover test — after ANALYZE, EXPLAIN must choose IndexScan for a selective predicate
-  and SeqScan for a non-selective one on the same table; join-order tests asserting the chosen
-  order's estimated cost, not its text. The catalog group: stats round-trip and the
-  never-analyzed <code>None</code> case. Regressions: the whole <code>slt_all</code> suite must
-  still pass — an optimizer that changes results has a bug worth finding today, not in
-  Milestone 8.</p>
+  <p>Milestone 7 spans three crates plus end-to-end regressions. Run all three provided
+  <code>ms7_</code> test groups from <code>course/ferricdb/</code>:</p>
+  <pre><code># 1. SQL parser: ANALYZE [table] and EXPLAIN [ANALYZE] &lt;stmt&gt;
+cargo test -p ferricdb-sql     -- --include-ignored ms7_
+
+# 2. Catalog stats: round-trip, never-analyzed None, and reopen persistence
+cargo test -p ferricdb-catalog -- --include-ignored ms7_
+
+# 3. Optimizer &amp; EXPLAIN: folding, pushdown, access-path crossover, EXPLAIN semantics
+cargo test -p ferricdb-exec    -- --include-ignored ms7_
+
+# 4. End-to-end regressions — an optimizer must NEVER change query results
+cargo test -p ferricdb         -- --include-ignored slt_all</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Crate</th><th>Provided <code>ms7_</code> tests</th><th>What they verify</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ferricdb-sql</code></td>
+          <td><code>ms7_analyze_and_explain_parse</code></td>
+          <td><code>ANALYZE users</code>, bare <code>ANALYZE</code>, <code>EXPLAIN SELECT ...</code>, and <code>EXPLAIN ANALYZE DELETE ...</code> produce exact AST variants.</td>
+        </tr>
+        <tr>
+          <td><code>ferricdb-catalog</code></td>
+          <td><code>ms7_set_stats_stats_roundtrip</code>, <code>ms7_stats_none_for_never_analyzed_table</code>, <code>ms7_stats_persist_across_reopen</code></td>
+          <td>Setting/replacing stats, erroring on unknown tables, returning <code>Ok(None)</code> for unanalyzed tables, and surviving a close + <code>Catalog::bootstrap</code> reopen.</td>
+        </tr>
+        <tr>
+          <td><code>ferricdb-exec</code></td>
+          <td><code>ms7_constant_folding</code>, <code>ms7_predicate_pushdown_single_side</code>, <code>ms7_analyze_then_explain_picks_access_path</code>, <code>ms7_explain_does_not_execute_but_analyze_does</code></td>
+          <td><code>2 * (3 + 4)</code> folds to <code>14</code> inside <code>Projection</code>; single-side join filter lands below the join; <code>id = 42</code> chooses <code>IndexScan</code> while <code>id &gt; 2</code> chooses <code>SeqScan</code>; <code>EXPLAIN DELETE</code> leaves rows intact while <code>EXPLAIN ANALYZE DELETE</code> deletes them.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Tests you should write yourself:</strong> the provided suite deliberately leaves
+  four critical edge cases for your own unit tests — add them to <code>crates/exec</code> while
+  building so bugs surface early:</p>
+  <ul>
+    <li><strong><code>ANALYZE</code> on an empty table and a constant column:</strong> verify
+      <code>row_count == 0</code>, <code>min == max == None</code>, and a column where every row
+      has value <code>7</code> (<code>min == max</code>) never produces <code>NaN</code> or
+      <code>inf</code> in <code>CostModel::selectivity</code> or <code>plan_cost</code>.</li>
+    <li><strong>Cross-side predicate non-pushdown:</strong> assert that
+      <code>Filter(t0.a + t1.b = 10)</code> above a join stays at or above the join rather than
+      being pushed into either child.</li>
+    <li><strong>Multi-table join ordering:</strong> seed three or four tables with skewed sizes
+      (e.g., 100 / 1,000 / 5,000 rows) and assert that <code>Planner::optimize</code> produces a
+      strictly lower <code>CostModel::plan_cost</code> than the naive left-to-right cross/join
+      plan, and that executing both plans returns identical sorted rows.</li>
+    <li><strong>NULL constant folding:</strong> verify <code>1 + NULL</code> folds to
+      <code>Literal(Null)</code>, <code>false AND NULL</code> folds to
+      <code>Literal(Boolean(false))</code>, and <code>true OR NULL</code> folds to
+      <code>Literal(Boolean(true))</code>.</li>
+  </ul>
 
   <h2 id="sec-pitfalls">Common pitfalls</h2>
   <div class="callout pitfall">
-    <span class="callout-title">Pushdown across the wrong boundary</span>
-    <p><em>Symptom:</em> "column not found" panics at execution, or silently wrong join results.
-    <em>Cause:</em> pushing a predicate below the operator that produces one of its columns
-    (classically: below the join whose output it references from both sides). The legality check
-    is column-set containment — compute each node's output columns once and consult it.</p>
+    <span class="callout-title">Pitfall — pushing a predicate across the wrong boundary</span>
+    <p><em>Symptom:</em> runtime index-out-of-bounds panics in expression evaluation, or silently
+    wrong join answers. <em>Cause:</em> pushing a predicate below an operator whose subtree does
+    not contain every <code>table_idx</code> referenced by the predicate (most commonly pushing a
+    two-table predicate like <code>t0.x = t1.y</code> into one child, or pushing a post-aggregate
+    filter below <code>Aggregate</code>). Compute <code>output_tables(child)</code> from each
+    scan's <code>table_idx</code> and push only when
+    <code>referenced_tables(conjunct).is_subset(&amp;output_tables(child))</code>.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Selectivity of an empty or constant column</span>
-    <p><em>Symptom:</em> NaN costs, or division by zero on <code>min == max</code>.
-    <em>Cause:</em> interpolation over a zero-width range or stats from an empty table. Clamp
-    selectivity to [0, 1] at the end of <code>selectivity()</code> and special-case empty
-    tables — the ms7_ suite includes an ANALYZE-on-empty test for exactly this.</p>
+    <span class="callout-title">Pitfall — <code>NaN</code> or division by zero on empty or constant columns</span>
+    <p><em>Symptom:</em> the planner picks arbitrary plans because every <code>NaN &lt; cost</code>
+    comparison evaluates to <code>false</code>. <em>Cause:</em> interpolating
+    <code>(max - lit) / (max - min)</code> when <code>min == max</code>, dividing
+    <code>1.0 / distinct_estimate</code> when <code>distinct_estimate == 0</code>, or dividing
+    <code>null_count / row_count</code> on an empty table. Guard every denominator, treat
+    <code>min == max</code> explicitly, and clamp selectivity to <code>[0.0, 1.0]</code>.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Enumerating permutations instead of subsets</span>
-    <p><em>Symptom:</em> planning time explodes at 6 tables. <em>Cause:</em> memoizing on
-    ordered sequences. The Selinger insight is that the memo key is the <em>set</em> — for any
-    order of the same set, the ways to extend it are identical.<sup class="cite"><a href="#ref-1">1</a></sup>
-    Use a bitmask key and the space is 2⁶, not 6!.</p>
+    <span class="callout-title">Pitfall — forgetting residual predicates on <code>IndexScan</code></span>
+    <p><em>Symptom:</em> <code>slt_all</code> fails after enabling cost-based index scans.
+    <em>Cause:</em> replacing <code>SeqScan(filter: id &gt; 10 AND grp = 2)</code> with
+    <code>IndexScan(id &gt; 10)</code> and dropping <code>grp = 2</code>! Only the bounds
+    enforced by the index belong in <code>IndexScan::{lower, upper}</code>; every other conjunct
+    must stay wrapped in a <code>Filter</code> node above the <code>IndexScan</code>.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Brittle EXPLAIN tests</span>
-    <p><em>Symptom:</em> every cost-model tweak breaks a dozen tests. <em>Cause:</em> asserting
-    exact EXPLAIN text. Assert structure (which scan, which join, nesting) and let numbers
-    float — the provided tests model this; keep your own tests to the same discipline.</p>
+    <span class="callout-title">Pitfall — building <code>HashJoin</code> on the larger side or enumerating permutations</span>
+    <p><em>Symptom:</em> join planning blows up on 6+ tables, or <code>HashJoin</code> builds a
+    huge hash table when a tiny table was available. <em>Cause:</em> memoizing on ordered
+    sequences (<code>n!</code>) instead of subset bitmasks (<code>2ⁿ</code>),<sup class="cite"><a
+    href="#ref-1">1</a></sup> or forgetting that FerricDB's <code>HashJoin</code> builds on
+    <code>left</code> and probes with <code>right</code>. Key the DP table by bitmask, and swap
+    <code>left</code>/<code>right</code> (along with <code>left_keys</code>/<code>right_keys</code>)
+    whenever the right child has fewer estimated rows.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — fragile <code>EXPLAIN</code> assertions or wrong variant names</span>
+    <p><em>Symptom:</em> <code>ms7_analyze_then_explain_picks_access_path</code> fails even though
+    your optimizer chose the right scan. <em>Cause:</em> printing Postgres-style spaced names
+    like <code>"Index Scan"</code> or <code>"Seq Scan"</code> instead of FerricDB's verbatim
+    <code>LogicalPlan</code> variant names (<code>IndexScan</code>, <code>SeqScan</code>,
+    <code>HashJoin</code>). Match the variant names in <code>crates/exec/src/lib.rs</code>, and
+    in your own tests assert structural markers rather than exact floating-point cost strings.</p>
   </div>
 
   <h2 id="sec-done">Definition of done</h2>
   <ul>
-    <li><code>ms7_</code> groups pass in both crates; <code>slt_all</code> and all earlier
-      groups still pass.</li>
-    <li>In the REPL, on a 10k-row table with an index: <code>EXPLAIN SELECT … WHERE id = k</code>
-      shows IndexScan; <code>WHERE id &gt; tiny_value</code> (matching ~everything) shows
-      SeqScan; dropping the index flips the first to SeqScan; running ANALYZE after bulk
-      changes updates the choice.</li>
-    <li><code>EXPLAIN ANALYZE</code> shows estimated vs actual rows, and you can point at a
-      query where they diverge and say why (skew or correlation).</li>
-    <li>A 4-table join query's EXPLAIN shows an order that starts from the most selective join
-      — and you can defend it with the estimated cardinalities.</li>
+    <li>All three <code>ms7_</code> test groups pass (<code>ferricdb-sql</code>,
+      <code>ferricdb-catalog</code>, <code>ferricdb-exec</code>), and <code>slt_all</code> plus
+      all earlier milestone suites remain green.</li>
+    <li>In the REPL, on a 2,000+ row table with an index on <code>id</code>: after
+      <code>ANALYZE</code>, <code>EXPLAIN SELECT ... WHERE id = 42</code> prints
+      <code>IndexScan</code>, while <code>EXPLAIN SELECT ... WHERE id &gt; 2</code> prints
+      <code>SeqScan</code>; closing and reopening the database preserves those statistics and
+      choices without re-running <code>ANALYZE</code>.</li>
+    <li><code>EXPLAIN DELETE FROM t</code> leaves <code>t</code> unchanged;
+      <code>EXPLAIN ANALYZE SELECT ...</code> prints both estimated and actual row counts plus
+      elapsed time per node, and you can construct one skewed or correlated query where estimated
+      and actual rows diverge and explain why.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li>A 3- or 4-table equi-join query's <code>EXPLAIN</code> shows <code>HashJoin</code> nodes
+      avoiding unnecessary cross products and placing the smaller estimated input on the left
+      build side, returning the exact same rows as an unoptimized nested-loop plan.</li>
   </ul>
 
   <h2 id="sec-quiz">Check your understanding</h2>
-  <fieldset class="quiz" data-explain="Rewrites are cost-independent — always-wins transformations that need no statistics — so they run first and simplify the tree the cost-based phases then price. Costing un-rewritten plans wastes the search on shapes pushdown would have eliminated.">
-    <legend class="quiz-q">Why do rewrites run before cost-based optimization rather than inside it?</legend>
-    <label><input type="radio" name="q1" data-correct> They are always-beneficial and statistics-free; running them first shrinks what the costed search must consider</label>
-    <label><input type="radio" name="q1"> Because the cost model cannot price filtered plans</label>
-    <label><input type="radio" name="q1"> Tradition from System R, with no technical reason</label>
+  <fieldset class="quiz" data-explain="Rule-based rewrites are cost-independent, always-beneficial transformations that require no statistics. Running constant folding and predicate pushdown first shrinks intermediate cardinalities and simplifies the plan shapes that the cost-based access-path and join-order search must evaluate.">
+    <legend class="quiz-q">1. Why do rule-based rewrites run before cost-based optimization rather than inside it?</legend>
+    <label><input type="radio" name="q-ms7-1" data-correct> They are always-beneficial and statistics-free; running them first shrinks what the costed search must consider</label>
+    <label><input type="radio" name="q-ms7-1"> Because <code>CostModel::plan_cost</code> cannot price plans that contain a <code>Filter</code> node</label>
+    <label><input type="radio" name="q-ms7-1"> Because catalog statistics are deleted whenever a rewrite runs</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
-  <fieldset class="quiz" data-explain="ANALYZE writes fresh statistics; without re-running it, the planner still sees the old row counts and min/max, so its selectivity estimates — and therefore plan choices — reflect the table as it was. Stale stats are the number-one real-world cause of plan regressions.">
-    <legend class="quiz-q">You bulk-load 1M rows into a table analyzed when it had 100. What does the planner see?</legend>
-    <label><input type="radio" name="q2"> The new size — statistics update on every insert</label>
-    <label><input type="radio" name="q2" data-correct> The old statistics: 100 rows — until ANALYZE runs again</label>
-    <label><input type="radio" name="q2"> An error, because statistics are invalidated by writes</label>
+
+  <fieldset class="quiz" data-explain="ANALYZE updates persisted TableStats on demand; normal INSERT/UPDATE/DELETE statements do not recompute min/max or distinct estimates on every write. Until ANALYZE runs again, CostModel continues pricing plans using the stale 100-row stats — a leading real-world cause of plan regressions.">
+    <legend class="quiz-q">2. You bulk-load 100,000 rows into a table that was last analyzed when it held 100 rows. What does <code>CostModel</code> see?</legend>
+    <label><input type="radio" name="q-ms7-2"> The updated 100,000-row count, because <code>Insert</code> refreshes catalog statistics automatically</label>
+    <label><input type="radio" name="q-ms7-2" data-correct> The stale 100-row statistics until <code>ANALYZE</code> runs again</label>
+    <label><input type="radio" name="q-ms7-2"> <code>Ok(None)</code>, because bulk writes invalidate stored statistics</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Every SeqScan and IndexScan stores its original FROM-list ordinal in table_idx, and BoundExpr::Column references (table, column) by that ordinal. When Selinger DP reorders tables or swaps the smaller relation onto HashJoin's left build input, create_executor dynamically maps each subtree's table_idx layout to flat row offsets — so expressions stay valid without rewriting column ordinals.">
+    <legend class="quiz-q">3. When Selinger DP reorders a 3-table join and places the smaller child on the left of <code>HashJoin</code>, why do <code>BoundExpr::Column</code> references still resolve accurately?</legend>
+    <label><input type="radio" name="q-ms7-3"> Because the optimizer can only reorder tables whose columns have identical types</label>
+    <label><input type="radio" name="q-ms7-3" data-correct> Because each scan carries its bound <code>table_idx</code>, which <code>create_executor</code> uses to compute flat offsets for the reordered join tree</label>
+    <label><input type="radio" name="q-ms7-3"> Because <code>HashJoin</code> always requires tables to remain in original SQL <code>FROM</code> order</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
@@ -256,17 +995,19 @@ cargo test -p ferricdb-catalog -- --include-ignored ms7_</code></pre>
         <li id="ref-1">Selinger et al., "Access Path Selection in a Relational Database
           Management System", SIGMOD 1979 — selectivity factors, the cost formula, and DP over
           subsets with interesting orders.
-          <a href="https://web.stanford.edu/class/cs345d-01/rl/selinger.pdf" rel="external">https://web.stanford.edu/class/cs345d-01/rl/selinger.pdf</a></li>
-        <li id="ref-2">Hironobu Suzuki, The Internals of PostgreSQL, §3.2 — the seq/index scan
-          cost formulas and the default constants your model adopts.
+          <a href="https://dl.acm.org/doi/10.1145/582095.582099" rel="external">https://dl.acm.org/doi/10.1145/582095.582099</a></li>
+        <li id="ref-2">Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, §3.2 — the seq/index
+          scan cost formulas and the default constants your model adopts.
           <a href="https://www.interdb.jp/pg/pgsql03/02.html" rel="external">https://www.interdb.jp/pg/pgsql03/02.html</a></li>
         <li id="ref-3">PostgreSQL Documentation, "Planner/Optimizer" — near-exhaustive search
-          below geqo_threshold and join-clause-driven pair selection.
+          below <code>geqo_threshold</code> and join-clause-driven pair selection.
           <a href="https://www.postgresql.org/docs/current/planner-optimizer.html" rel="external">https://www.postgresql.org/docs/current/planner-optimizer.html</a></li>
-        <li id="ref-4">PostgreSQL Documentation, "Using EXPLAIN" — the output fields and
-          EXPLAIN ANALYZE's real execution semantics.
+        <li id="ref-4">PostgreSQL Documentation, "Using EXPLAIN" — output fields and
+          <code>EXPLAIN ANALYZE</code>'s real execution semantics.
           <a href="https://www.postgresql.org/docs/current/using-explain.html" rel="external">https://www.postgresql.org/docs/current/using-explain.html</a></li>
-        <li id="ref-5">Readings in Database Systems, 5th ed., Ch. 7 commentary.
+        <li id="ref-5">Bailis, Hellerstein, Stonebraker (eds.), <em>Readings in Database
+          Systems</em>, 5th ed., Ch. 7 commentary — why cardinality estimation dominates query
+          optimization.
           <a href="http://www.redbook.io/ch7-queryoptimization.html" rel="external">http://www.redbook.io/ch7-queryoptimization.html</a></li>
       </ol>
     </div>
@@ -276,15 +1017,13 @@ cargo test -p ferricdb-catalog -- --include-ignored ms7_</code></pre>
       <li>PostgreSQL docs, "Statistics Used by the Planner" — histograms and most-common-value
         lists: what fixes the uniformity assumption your model documents.
         <a href="https://www.postgresql.org/docs/current/planner-stats.html" rel="external">postgresql.org/docs/current/planner-stats.html</a></li>
-      <li>The Internals of PostgreSQL, §3.5–3.6 — how Postgres costs the three join methods and
+      <li><em>The Internals of PostgreSQL</em>, §3.5–3.6 — how PostgreSQL costs join methods and
         plans multi-table queries.
         <a href="https://www.interdb.jp/pg/pgsql03/05.html" rel="external">interdb.jp/pg/pgsql03/05.html</a></li>
+      <li>PostgreSQL docs, "Planner Cost Constants" — tuning <code>random_page_cost</code> for
+        SSDs and cached working sets.
+        <a href="https://www.postgresql.org/docs/current/runtime-config-query.html" rel="external">postgresql.org/docs/current/runtime-config-query.html</a></li>
     </ul>
-
-    <h2 id="sec-milestone">Milestone link</h2>
-    <p>Next on the path: <a href="../../modules/m09-transactions-mvcc/index.html">M09 ·
-    Transactions &amp; MVCC</a>, then <a href="../milestone-08/index.html">Milestone 8</a> —
-    FerricDB learns to share.</p>
 
     <nav class="prevnext">
       <a href="../../modules/m08-query-optimization/index.html"><span class="dir">← Previous</span> M08 · Query Optimization</a>
@@ -296,6 +1035,7 @@ cargo test -p ferricdb-catalog -- --include-ignored ms7_</code></pre>
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     done: ["heap", "disk", "buffer", "frontend", "catalog", "executor", "index"],
     current: ["planner"],

@@ -110,10 +110,10 @@
 pub const PAGE_SIZE: usize = 8192;          // matches PostgreSQL default block size
 pub type PageId = u32;
 pub const INVALID_PAGE_ID: PageId = u32::MAX;
-pub type TxnId = u64;                        // 0 = "invalid/none"
-pub type Lsn = u64;                          // 0 = "no LSN yet"
+pub type TxnId = u64;                        // 0 = frozen / none
+pub type Lsn = u64;                          // 0 = no LSN yet; real WAL records &gt;= 1
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DataType { Boolean, Integer, Float, Text }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -124,9 +124,9 @@ impl Value {
     pub fn sql_cmp(&amp;self, other: &amp;Value) -&gt; Option&lt;std::cmp::Ordering&gt;;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Column { pub name: String, pub data_type: DataType, pub nullable: bool }
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Schema { pub columns: Vec&lt;Column&gt; }
 impl Schema {
     pub fn index_of(&amp;self, name: &amp;str) -&gt; Option&lt;usize&gt;;
@@ -134,12 +134,12 @@ impl Schema {
 }
 
 /// Tuple version metadata, present in every stored tuple header from
-/// Milestone 1 (written as 0 until Milestone 8 starts using it).
+/// Milestone 1 (written as 0 until Milestone 8; xmin == 0 = frozen/bootstrap).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TupleMeta { pub xmin: TxnId, pub xmax: TxnId }
 
 /// Physical tuple address: (page, slot) — Postgres calls this the ctid.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RecordId { pub page_id: PageId, pub slot: u16 }</code></pre>
   <p>Semantic notes on the provided types:</p>
   <ul>
@@ -148,46 +148,73 @@ pub struct RecordId { pub page_id: PageId, pub slot: u16 }</code></pre>
     <li><strong><code>TupleMeta</code></strong> mirrors the <code>t_xmin</code>/<code>t_xmax</code>
       insert- and delete-transaction stamps in PostgreSQL's heap tuple header,<sup class="cite"><a href="#ref-2">2</a></sup>
       except we use <code>u64</code> transaction ids (a course choice: Postgres uses 32-bit XIDs and has to
-      manage wraparound; we simply never run out). You store and return it faithfully from Milestone&nbsp;1
+      manage wraparound; 64-bit IDs avoid wraparound altogether). You store and return it faithfully from Milestone&nbsp;1
       but always write zeros until Milestone&nbsp;8.</li>
     <li><strong><code>RecordId</code></strong> is FerricDB's tuple identifier — the analog of a Postgres
       TID, which is a (block number, offset number) pair used by indexes to locate tuples.<sup class="cite"><a href="#ref-1">1</a></sup></li>
     <li><strong><code>common::Error</code></strong> already defines the variants you need here:
       <code>Io</code> (with <code>#[from] std::io::Error</code>), <code>PageFull</code>,
-      <code>InvalidPage(PageId)</code>, <code>InvalidSlot(RecordId)</code>, plus
+      <code>InvalidPage(PageId)</code>, <code>InvalidSlot(RecordId)</code>, and
+      <code>Execution(String)</code> (used by <code>tuple::serialize</code> /
+      <code>tuple::deserialize</code> on schema/byte mismatches), plus
       <code>pub type Result&lt;T&gt;</code>.</li>
   </ul>
 
   <h3 id="spec-storage">You build: <code>crates/storage</code></h3>
-  <p>The public surface of <code>ferricdb-storage</code>, quoted from the API specification. Your
+  <p>The public surface of <code>ferricdb-storage</code>, quoted verbatim from <code>course/ferricdb/docs/api-spec.md</code>. Your
   implementation must match these signatures exactly — the provided tests compile against them.</p>
-  <pre><code>/// One 8 KB page in memory. First 16 bytes of every page are reserved:
+  <pre><code>pub const PAGE_TYPE_UNINIT: u32 = 0;
+pub const PAGE_TYPE_HEAP: u32 = 1;
+pub const PAGE_TYPE_BTREE_LEAF: u32 = 2;
+pub const PAGE_TYPE_BTREE_INTERNAL: u32 = 3;
+
+/// One 8 KB page in memory. First 16 bytes of every page are reserved:
 /// pageLSN (u64) + page type tag (u32) + reserved (u32).
 pub struct Page { /* [u8; PAGE_SIZE] */ }
 impl Page {
     pub fn new() -&gt; Self;
     pub fn lsn(&amp;self) -&gt; Lsn;
     pub fn set_lsn(&amp;mut self, lsn: Lsn);
+    pub fn page_type(&amp;self) -&gt; u32;
+    pub fn set_page_type(&amp;mut self, tag: u32);
     pub fn data(&amp;self) -&gt; &amp;[u8; PAGE_SIZE];
     pub fn data_mut(&amp;mut self) -&gt; &amp;mut [u8; PAGE_SIZE];
 }
 
-/// Slotted-page view over a Page: header + line-pointer array growing
-/// forward, tuple data growing backward from the end.
+/// Read-only slotted-page view over `&amp;Page` (use inside `PageStore::with_page`
+/// so reads never dirty buffer-pool frames).
+pub struct HeapPageRef&lt;'a&gt; { /* &amp;'a Page */ }
+impl&lt;'a&gt; HeapPageRef&lt;'a&gt; {
+    pub fn is_initialized(page: &amp;Page) -&gt; bool;
+    pub fn attach(page: &amp;'a Page) -&gt; Self;
+    pub fn get(&amp;self, slot: u16) -&gt; Option&lt;(TupleMeta, &amp;[u8])&gt;;
+    pub fn slot_count(&amp;self) -&gt; u16;
+    pub fn free_space(&amp;self) -&gt; usize;
+    pub fn next_page(&amp;self) -&gt; PageId;
+}
+
+/// Mutable slotted-page view over `&amp;mut Page`: 28-byte header (16B reserved +
+/// 4B next_page + 2B lower + 2B upper + 2B slot_count + 2B flags),
+/// line-pointer array growing forward, tuple data growing backward.
 pub struct HeapPage&lt;'a&gt; { /* &amp;'a mut Page */ }
 impl&lt;'a&gt; HeapPage&lt;'a&gt; {
     pub fn init(page: &amp;'a mut Page) -&gt; Self;       // format an empty heap page
     pub fn attach(page: &amp;'a mut Page) -&gt; Self;     // view an already-formatted page
+    pub fn as_ref(&amp;self) -&gt; HeapPageRef&lt;'_&gt;;
     pub fn insert(&amp;mut self, meta: TupleMeta, tuple: &amp;[u8]) -&gt; Option&lt;u16&gt;; // slot
     pub fn get(&amp;self, slot: u16) -&gt; Option&lt;(TupleMeta, &amp;[u8])&gt;;             // None if dead/absent
     pub fn set_meta(&amp;mut self, slot: u16, meta: TupleMeta) -&gt; Result&lt;()&gt;;   // MVCC updates xmin/xmax
     pub fn delete(&amp;mut self, slot: u16) -&gt; Result&lt;()&gt;;                      // mark dead (tombstone)
     pub fn slot_count(&amp;self) -&gt; u16;
     pub fn free_space(&amp;self) -&gt; usize;
+    pub fn next_page(&amp;self) -&gt; PageId;
+    pub fn set_next_page(&amp;mut self, next: PageId);
+    pub fn compact(&amp;mut self) -&gt; usize;                                     // MS8 VACUUM
+    pub fn put_at(&amp;mut self, slot: u16, meta: TupleMeta, tuple: &amp;[u8]) -&gt; Result&lt;()&gt;; // MS9 ARIES
 }
 
 pub mod tuple {
-    /// Format: null bitmap, then fixed-width values in schema order;
+    /// Format: null bitmap (bit 1 = NULL), then fixed-width values in schema order;
     /// TEXT as u32 length prefix + UTF-8 bytes.
     pub fn serialize(schema: &amp;Schema, values: &amp;[Value]) -&gt; Result&lt;Vec&lt;u8&gt;&gt;;
     pub fn deserialize(schema: &amp;Schema, bytes: &amp;[u8]) -&gt; Result&lt;Vec&lt;Value&gt;&gt;;
@@ -238,27 +265,34 @@ impl HeapFile {
       “next byte after last byte of WAL record for last change to this page.”<sup class="cite"><a href="#ref-2">2</a></sup>
       The LSN stays 0 until Milestone&nbsp;9; reserving it now means the on-disk format never has to
       change when logging arrives. <code>Page::new()</code> returns an all-zero page.</li>
-    <li><strong><code>HeapPage</code></strong> is a <em>view</em>, not a container: it borrows a
-      <code>Page</code> and interprets bytes 16.. as heap-page structure. <code>init</code> formats
-      (writes a fresh header); <code>attach</code> trusts the existing bytes. <code>insert</code> returns
-      <code>None</code> when the tuple plus one line pointer cannot fit — the caller
+    <li><strong><code>HeapPage</code> and <code>HeapPageRef</code></strong> are <em>views</em>, not containers:
+      <code>HeapPage&lt;'a&gt;</code> borrows <code>&amp;'a mut Page</code> and <code>HeapPageRef&lt;'a&gt;</code>
+      borrows <code>&amp;'a Page</code>, interpreting bytes 16.. as heap-page structure (read paths use
+      <code>HeapPageRef</code> inside <code>PageStore::with_page</code> so reads never dirty buffer-pool
+      frames in Milestone&nbsp;2). <code>init</code> formats a fresh header (setting
+      <code>PAGE_TYPE_HEAP</code>, <code>next_page = INVALID_PAGE_ID</code>, <code>lower = 28</code>,
+      <code>upper = PAGE_SIZE</code>, <code>slot_count = 0</code>, <code>flags = 0</code>);
+      <code>attach</code> trusts the existing bytes. <code>insert</code> returns
+      <code>None</code> when the tuple plus <code>TupleMeta</code> and one line pointer cannot fit — the caller
       (<code>HeapFile</code>) treats that as “try another page,” which is why this returns
       <code>Option</code> rather than <code>Err(PageFull)</code>. Slots are never renumbered and never
       reused: <code>delete</code> only marks the slot dead, and <code>slot_count</code> still counts dead
       slots. <code>get</code> on a dead or out-of-range slot returns <code>None</code>;
-      <code>set_meta</code>/<code>delete</code> on an absent slot return <code>Err(InvalidSlot)</code>.
-      <code>free_space</code> reports the bytes usable for one more insert (the hole minus the line
-      pointer the insert would add — document your exact convention in a doc comment).</li>
+      <code>set_meta</code>/<code>delete</code> on an absent or dead slot return <code>Err(InvalidSlot)</code>.
+      <code>free_space</code> reports the maximum payload byte length of a single new tuple that currently
+      fits (deducting both the line pointer and the 16-byte <code>TupleMeta</code>). Leave
+      <code>compact</code> stubbed for Milestone&nbsp;8 (<code>VACUUM</code>) and <code>put_at</code> stubbed
+      for Milestone&nbsp;9 (ARIES redo/undo).</li>
     <li><strong><code>tuple</code> format</strong> — the parts fixed by the spec: a null bitmap first,
       then values in schema order; BOOLEAN as 1 byte, INTEGER as <code>i64</code> (8 bytes), FLOAT as
       <code>f64</code> (8 bytes), TEXT as a <code>u32</code> byte-length prefix followed by that many
-      UTF-8 bytes. Course choices you should adopt: all integers little-endian via
-      <code>to_le_bytes</code>/<code>from_le_bytes</code>;<sup class="cite"><a href="#ref-6">6</a></sup>
+      UTF-8 bytes. FerricDB's course conventions (documented in <code>crates/storage/src/lib.rs</code>):
+      all integers little-endian via <code>to_le_bytes</code>/<code>from_le_bytes</code>;<sup class="cite"><a href="#ref-6">6</a></sup>
       NULL values occupy zero bytes in the body (only their bitmap bit); the bitmap is
-      ⌈columns/8⌉ bytes and is <em>always</em> present. PostgreSQL, by contrast, stores its null bitmap
-      only when the row has at least one NULL (the <code>HEAP_HASNULL</code> flag), with one bit per
-      column, 1&nbsp;=&nbsp;not-null.<sup class="cite"><a href="#ref-2">2</a></sup> We always write the
-      bitmap to keep offsets simple; pick a bit polarity and stick to it.</li>
+      ⌈columns/8⌉ bytes and is <em>always</em> present, with <strong>bit <code>1</code> = NULL</strong>
+      (and <code>0</code> = present). PostgreSQL, by contrast, stores its null bitmap only when the row
+      has at least one NULL (the <code>HEAP_HASNULL</code> flag) and uses the opposite polarity,
+      <code>1 = present</code> (not-null).<sup class="cite"><a href="#ref-2">2</a></sup></li>
     <li><strong><code>DiskManager</code></strong> maps <code>PageId</code> <em>n</em> to byte offset
       <code>n × PAGE_SIZE</code> in a single file. <code>open</code> creates the file if absent and
       derives <code>num_pages</code> from the file length on reopen. <code>allocate_page</code> hands out
@@ -333,9 +367,11 @@ impl HeapFile {
     uses with <code>pd_lower</code> and <code>pd_upper</code>.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup></figcaption>
   </figure>
 
-  <p>A worked capacity example with real numbers, assuming a 12-byte heap header (2-byte slot count,
-  2-byte lower, 2-byte upper, 4-byte next page, 2 bytes spare), 4-byte line pointers, and the 16-byte
-  <code>TupleMeta</code> prefix stored in front of each tuple's bytes: usable space is
+  <p>A worked capacity example with real numbers, using the standardized 12-byte heap header after
+  the 16-byte reserved page header (4-byte <code>next_page</code>, 2-byte <code>lower</code>,
+  2-byte <code>upper</code>, 2-byte <code>slot_count</code>, 2-byte <code>flags</code> — 28 bytes
+  total), 4-byte line pointers, and the 16-byte <code>TupleMeta</code> prefix stored in front of
+  each tuple's bytes: usable space is
   8192&nbsp;−&nbsp;16&nbsp;−&nbsp;12&nbsp;=&nbsp;8164 bytes, and a 19-byte tuple (Figure&nbsp;3) costs
   4&nbsp;+&nbsp;16&nbsp;+&nbsp;19&nbsp;=&nbsp;39 bytes, so one page holds ⌊8164&nbsp;/&nbsp;39⌋&nbsp;=&nbsp;209
   such tuples. For comparison, PostgreSQL pays a 24-byte page header, 4-byte line pointers, and a
@@ -345,19 +381,25 @@ impl HeapFile {
   <p>Build inside-out; every step is independently testable before the next begins. Signatures come
   from the spec above — the steps only add design hints, never solutions.</p>
   <ol>
-    <li><strong>Read the stubs, then <code>Page</code> first.</strong> Skim
-      <code>course/ferricdb/crates/storage</code> and the <code>ms1_</code> tests to see what is expected,
-      then implement <code>Page</code>: a boxed <code>[u8; PAGE_SIZE]</code> (boxed so the 8&nbsp;KB
-      buffer doesn't live on the stack), zeroed by <code>new()</code>, with <code>lsn()</code>/<code>set_lsn()</code>
-      reading and writing bytes 0..8. Write private helpers now —
+    <li><strong>Read the stubs, then finish <code>Page</code>.</strong> Skim
+      <code>course/ferricdb/crates/storage/src/lib.rs</code> and <code>tests/storage.rs</code> to see
+      what is already provided and what is stubbed. <code>Page { data: [u8; PAGE_SIZE] }</code> already
+      ships with <code>new()</code>, <code>data()</code>, <code>data_mut()</code>,
+      <code>page_type()</code>, and <code>set_page_type()</code> implemented; your job on
+      <code>Page</code> is implementing <code>lsn()</code> and <code>set_lsn()</code> on bytes 0..8
+      (little-endian <code>u64</code>). Write private helpers now —
       <code>read_u16(buf, off)</code>, <code>write_u32(buf, off, v)</code>, and friends — built on
       <code>copy_from_slice</code> plus <code>from_le_bytes</code>/<code>to_le_bytes</code>,<sup class="cite"><a href="#ref-6">6</a></sup>
       and use them for <em>every</em> multi-byte access in this crate (see the alignment pitfall).</li>
-    <li><strong>Design the heap-page header on paper before coding.</strong> After the 16 reserved
-      bytes you need at least: slot count, <code>lower</code> (offset where the next line pointer goes),
-      <code>upper</code> (offset where tuple data begins), and the next-page id for the chain. This
-      mirrors PostgreSQL's <code>pd_lower</code> (start of free space) and <code>pd_upper</code> (end of
-      free space).<sup class="cite"><a href="#ref-2">2</a></sup> Write your byte map as a comment table
+    <li><strong>Implement the standardized 28-byte heap-page header.</strong> Directly after the
+      16-byte reserved page header sit the 12 heap-header bytes defined in
+      <code>crates/storage/src/lib.rs</code>: <code>next_page</code> (<code>u32</code> at
+      <code>16..20</code>), <code>lower</code> (<code>u16</code> at <code>20..22</code>, initialized
+      to <code>28</code>), <code>upper</code> (<code>u16</code> at <code>22..24</code>, initialized
+      to <code>PAGE_SIZE</code>), <code>slot_count</code> (<code>u16</code> at <code>24..26</code>),
+      and <code>flags</code> (<code>u16</code> at <code>26..28</code>). This mirrors PostgreSQL's
+      <code>pd_lower</code> (start of free space) and <code>pd_upper</code> (end of free
+      space).<sup class="cite"><a href="#ref-2">2</a></sup> Define each offset as a named constant
       at the top of the file — future-you debugging a hexdump will be grateful.</li>
     <li><strong>Line pointers and <code>insert</code>.</strong> Each line pointer needs the tuple's byte
       offset, its length, and a dead flag. PostgreSQL bit-packs offset, flags, and length into 4
@@ -378,19 +420,30 @@ impl HeapFile {
       Storing the <code>TupleMeta</code> as a fixed 16-byte prefix in front of the tuple bytes (like
       Postgres's <code>t_xmin</code>/<code>t_xmax</code> living in the tuple header<sup class="cite"><a href="#ref-2">2</a></sup>)
       makes <code>set_meta</code> a trivial in-place overwrite later.</li>
-    <li><strong><code>get</code>, <code>set_meta</code>, <code>delete</code>.</strong>
-      <code>get</code>: bounds-check the slot, return <code>None</code> for dead or out-of-range, else
-      decode the meta prefix and return it with a borrow of the payload bytes.
+    <li><strong><code>HeapPageRef</code> plus <code>get</code>, <code>set_meta</code>, <code>delete</code>.</strong>
+      Implement the <code>Copy</code> read-only getters (<code>slot_count</code>,
+      <code>free_space</code>, <code>next_page</code>) once on <code>HeapPageRef</code> and have
+      <code>HeapPage</code> delegate to them via <code>self.as_ref()</code> (already provided). For
+      <code>get</code>, delegate both <code>HeapPageRef::get</code> and <code>HeapPage::get</code>
+      to one shared private helper <code>fn page_get(page: &amp;Page, slot: u16) -&gt; Option&lt;(TupleMeta, &amp;[u8])&gt;</code>
+      (calling <code>self.as_ref().get(slot)</code> inside <code>HeapPage::get</code> will not
+      compile because <code>HeapPageRef::get</code> borrows the temporary <code>HeapPageRef</code>
+      rather than <code>self.page</code>).
+      <code>get</code> bounds-checks the slot, returns <code>None</code> for dead or out-of-range, else
+      decodes the meta prefix and returns it with a borrow of the payload bytes.
       <code>set_meta</code> overwrites the 16-byte prefix in place. <code>delete</code> flips the dead
       flag and nothing else — no compaction, no slot-count decrement, no byte reclamation. That is the
       tombstone contract (see the pitfall on slot reuse).</li>
     <li><strong><code>tuple::serialize</code> / <code>deserialize</code>.</strong> Compute the bitmap
-      size as ⌈columns/8⌉, set bits while walking <code>schema.columns</code> and <code>values</code> in
-      lockstep, then append each non-null value's bytes at its fixed width (TEXT: <code>u32</code> byte
-      length, then the bytes). <code>deserialize</code> is the mirror image: read the bitmap, then
-      consume exactly the bytes each non-null column implies. Validate as you go — a length prefix
-      running past the input slice is corruption, not a panic. Check Figure&nbsp;3 by hand against your
-      implementation: serializing <code>(7, "naïve", NULL)</code> must produce exactly 19 bytes.</li>
+      size as ⌈columns/8⌉ (initially all zero), set bit <code>i</code> (<code>bitmap[i / 8] |= 1 &lt;&lt; (i % 8)</code>)
+      for each <code>Value::Null</code> while walking <code>schema.columns</code> and <code>values</code> in
+      lockstep (rejecting wrong arity, type mismatches, and <code>NULL</code> in non-nullable columns with
+      <code>Err(Error::Execution)</code>), then append each non-null value's bytes at its fixed width
+      (TEXT: <code>u32</code> byte length, then the bytes). <code>deserialize</code> is the mirror image:
+      read the bitmap, then consume exactly the bytes each non-null column implies. Validate as you go —
+      a truncated slice or length prefix running past the input is <code>Err(Error::Execution)</code>, not
+      a panic. Check Figure&nbsp;3 by hand against your implementation: serializing
+      <code>(7, "naïve", NULL)</code> must produce <code>0b0000_0100</code> in byte&nbsp;0 and 19 bytes total.</li>
     <li><strong><code>DiskManager</code>.</strong> Open the file read/write, creating it if needed;
       recover the page count from <code>file length / PAGE_SIZE</code>. Keep the count in an
       <code>AtomicU32</code> so <code>allocate_page(&amp;self)</code> can bump it without <code>&amp;mut</code>.
@@ -403,34 +456,43 @@ impl HeapFile {
       <code>with_page</code>: read the page into a local scratch <code>Page</code> and run the closure
       over it. <code>with_page_mut</code>: read, run, then <em>write the page back</em> —
       forgetting the write-back is the classic bug here, and it makes every mutation silently vanish.
-      <code>flush_all</code> maps to <code>File::sync_all</code>. Yes, this rereads 8&nbsp;KB from disk on
+      <code>flush_all</code> maps to <code>File::sync_data</code> (or <code>sync_all</code>). Yes, this rereads 8&nbsp;KB from disk on
       every access; that is deliberate. Milestone&nbsp;2 replaces it with cached frames behind the same
       trait.</li>
     <li><strong><code>HeapFile</code>.</strong> <code>create</code> allocates and formats the first
-      page. <code>insert</code> walks the chain trying <code>HeapPage::insert</code> on each page; when
-      the tail rejects the tuple, allocate a fresh page, link it via the tail's next-page field, and
-      insert there. A chain walk per insert is O(pages) — caching the last page id in the
-      <code>HeapFile</code> is a worthwhile upgrade, and the CS186 notes' page directory shows the
-      fully general fix<sup class="cite"><a href="#ref-4">4</a></sup> (not required here).
-      <code>get</code>/<code>set_meta</code>/<code>delete</code> are one <code>with_page(_mut)</code> on
-      <code>rid.page_id</code> plus an <code>attach</code>. Translate a dead-slot <code>get</code> to
-      <code>Ok(None)</code>, but an out-of-range page to <code>Err</code>.</li>
+      page. <code>insert</code> checks whether the tuple could ever fit in an empty heap page (returning
+      <code>Err(Error::PageFull)</code> immediately for oversized tuples), then walks the chain trying
+      <code>HeapPage::insert</code> on each page; when the tail rejects the tuple, allocate a fresh page,
+      link it via <code>set_next_page</code>, and insert there. A chain walk per insert is O(pages) —
+      caching the last page id in <code>HeapFile</code> is a worthwhile upgrade, and the CS186 notes'
+      page directory shows the fully general fix<sup class="cite"><a href="#ref-4">4</a></sup> (not required here).
+      <code>get</code> uses <code>with_page</code> + <code>HeapPageRef::attach</code> so reads stay read-only;
+      <code>set_meta</code> and <code>delete</code> use <code>with_page_mut</code> + <code>HeapPage::attach</code>.
+      Translate a dead-slot <code>get</code> to <code>Ok(None)</code>, and an out-of-range page to <code>Err</code>.</li>
     <li><strong><code>HeapScan</code> and the reopen loop.</strong> The iterator holds the current page
-      id and next slot; it advances slot-by-slot, skips dead slots, follows next-page links, and stops
-      at <code>INVALID_PAGE_ID</code>. Then close the loop end-to-end: create a database file, insert a
-      few hundred random tuples through <code>HeapFile</code>, <code>flush_all</code>, drop everything,
-      reopen the same path, and verify every <code>RecordId</code> and a full scan return identical
-      data. This is exactly what the milestone's property test automates.</li>
+      id and next slot; it reads each page through <code>with_page</code> + <code>HeapPageRef</code>,
+      advances slot-by-slot in <code>(page_id, slot)</code> order along the page chain, skips dead slots,
+      follows <code>next_page()</code> links, and stops at <code>INVALID_PAGE_ID</code>. Then close the
+      loop end-to-end: create a database file, insert a few hundred random tuples through
+      <code>HeapFile</code>, <code>flush_all</code>, drop everything, reopen the same path, and verify
+      every <code>RecordId</code> and a full scan return identical data.</li>
+    <li><strong>REPL continuity: <code>.open &lt;path&gt;</code>.</strong> In Milestone&nbsp;0,
+      <code>.open &lt;path&gt;</code> printed a placeholder message because no disk storage existed yet.
+      Once <code>DiskManager</code> passes its tests, you can wire <code>.open &lt;path&gt;</code> in
+      <code>crates/ferricdb/src/repl.rs</code> to validate and open the target file via
+      <code>DiskManager::open</code> — or defer wiring the full <code>ExecContext</code> until
+      Milestone&nbsp;2/3, when <code>BufferPoolManager</code> and <code>Catalog</code> snap into place
+      above it.</li>
   </ol>
 
   <figure>
     <svg viewBox="0 0 940 220" role="img">
-      <title>Byte-level serialization of the row (7, "naïve", NULL) for schema (id INTEGER, word TEXT, flag BOOLEAN): one null-bitmap byte, eight little-endian bytes for the integer, a four-byte length prefix, six UTF-8 bytes, and zero bytes for the NULL boolean — 19 bytes total.</title>
-      <text x="20" y="44" class="d-text-sm">bit 0 = id, bit 1 = word (set = present), bit 2 = flag (clear = NULL)</text>
-      <text x="690" y="44" text-anchor="middle" class="d-text-sm">5 chars but 6 bytes — “ï” is 2 bytes</text>
+      <title>Byte-level serialization of the row (7, "naïve", NULL) for schema (id INTEGER, word TEXT, flag BOOLEAN): one null-bitmap byte (0b0000_0100 with bit 1 = NULL), eight little-endian bytes for the integer, a four-byte length prefix, six UTF-8 bytes, and zero bytes for the NULL boolean — 19 bytes total.</title>
+      <text x="20" y="44" class="d-text-sm">bit 0 = id (0 = present), bit 1 = word (0 = present), bit 2 = flag (1 = NULL)</text>
+      <text x="720" y="44" text-anchor="middle" class="d-text-sm">5 chars but 6 bytes — “ï” is 2 bytes</text>
       <rect x="20" y="60" width="120" height="56" rx="4" class="d-box-hl"/>
       <text x="80" y="84" text-anchor="middle" class="d-text-sm">null bitmap</text>
-      <text x="80" y="103" text-anchor="middle" class="d-mono-sm">0b0000_0011</text>
+      <text x="80" y="103" text-anchor="middle" class="d-mono-sm">0b0000_0100</text>
       <rect x="140" y="60" width="260" height="56" rx="4" class="d-box"/>
       <text x="270" y="84" text-anchor="middle" class="d-text-sm">id = 7 (i64, little-endian)</text>
       <text x="270" y="103" text-anchor="middle" class="d-mono-sm">07 00 00 00 00 00 00 00</text>
@@ -454,35 +516,48 @@ impl HeapFile {
       <text x="415" y="186" text-anchor="middle" class="d-text-sm">19 bytes total — the &amp;[u8] handed to HeapPage::insert (TupleMeta is prefixed by the page, not by serialize)</text>
     </svg>
     <figcaption>Figure 3 — <code>tuple::serialize</code> output for the row <code>(7, "naïve", NULL)</code>
-    against schema <code>(id INTEGER, word TEXT, flag BOOLEAN)</code>, using bit&nbsp;=&nbsp;1 for
-    “present” (the opposite of PostgreSQL's 1&nbsp;=&nbsp;not-null is equally valid — just be
-    consistent<sup class="cite"><a href="#ref-2">2</a></sup>). The NULL boolean contributes only its
-    cleared bitmap bit.</figcaption>
+    against schema <code>(id INTEGER, word TEXT, flag BOOLEAN)</code>, using FerricDB's convention of
+    <strong>bit&nbsp;<code>1</code>&nbsp;=&nbsp;NULL</strong> (contrasting with PostgreSQL's
+    <code>1&nbsp;=&nbsp;present</code><sup class="cite"><a href="#ref-2">2</a></sup>). The NULL boolean
+    sets bit&nbsp;2 (<code>0b0000_0100</code>) and contributes zero body bytes.</figcaption>
   </figure>
 
   <h2 id="sec-tests">Test plan</h2>
-  <p>The starter workspace ships this milestone's tests marked
-  <code>#[ignore = "milestone 1"]</code> and named with the <code>ms1_</code> prefix. The
+  <p>The starter workspace ships this milestone's tests in <code>crates/storage/tests/storage.rs</code>
+  marked <code>#[ignore = "milestone 1"]</code> and named with the <code>ms1_</code> prefix. The
   <code>ms1_</code> argument below is a name filter selecting them; <code>--include-ignored</code> runs
-  them despite the attribute. That combination is the whole un-ignore workflow — nothing to edit while
-  you iterate:</p>
+  them despite the attribute:</p>
   <pre><code>cargo test -p ferricdb-storage -- --include-ignored ms1_</code></pre>
-  <p>Work toward the tests in this order:</p>
+  <p>Work toward the provided tests in this order:</p>
   <ul>
-    <li><strong><code>ms1_slotted_page_roundtrip</code></strong> is your first target: it exercises a
-      single <code>HeapPage</code> — insert until full, read everything back, delete some slots, and
-      confirm dead slots return <code>None</code> while live ones are untouched. Steps 1–4 above are
-      exactly the code under test.</li>
-    <li>The rest of the <code>ms1_</code> group covers tuple serialization round-trips (including a
-      seeded property test that generates random schemas and rows using the dev-only <code>rand</code>
-      dependency), <code>DiskManager</code> persistence across close/reopen, and multi-page
-      <code>HeapFile</code> inserts with full scans. Being seeded, the property test fails
-      reproducibly — when it does, print the offending tuple and shrink it by hand.</li>
+    <li><strong>Pages &amp; slotted layout:</strong> <code>ms1_page_lsn_roundtrip</code> checks
+      <code>Page::lsn</code>/<code>set_lsn</code>; <code>ms1_slotted_page_roundtrip</code> checks
+      <code>HeapPage::init</code>, <code>insert</code>, <code>get</code> with <code>TupleMeta</code>, and
+      read-only <code>HeapPageRef</code> access; <code>ms1_tombstone_semantics</code> checks dead-slot
+      <code>delete</code> and <code>Error::InvalidSlot</code> on double/out-of-range deletes;
+      <code>ms1_set_meta_updates_in_place</code> checks in-place <code>TupleMeta</code> overwrites; and
+      <code>ms1_free_space_decreases_and_bounds_inserts</code> fills a page until <code>insert</code>
+      returns <code>None</code> and checks <code>attach</code>.</li>
+    <li><strong>Tuple serialization:</strong> <code>ms1_tuple_serde_all_types_and_nulls</code> checks all
+      four types, <code>NULL</code>s, IEEE&nbsp;754 <code>-0.0</code> bit identity, and non-ASCII UTF-8;
+      <code>ms1_tuple_serde_wide_schema_multi_byte_bitmap</code> tests a 12-column schema (2-byte null
+      bitmap); <code>ms1_tuple_serde_rejects_bad_inputs</code> verifies errors on wrong arity,
+      <code>NULL</code> in a non-nullable column, type mismatch, and truncated slices; and
+      <code>ms1_tuple_serde_property_seeded</code> round-trips 200 deterministic random rows generated with
+      the dev-only <code>rand</code> dependency (fixed seed — print any failing row to debug).</li>
+    <li><strong>Disk manager &amp; heap file:</strong> <code>ms1_disk_manager_persistence_across_reopen</code>
+      and <code>ms1_disk_manager_rejects_out_of_range_reads</code> test file I/O and bounds checking;
+      <code>ms1_heapfile_roundtrip_and_scan</code> inserts 500 multi-page rows, verifies point reads,
+      deletes every 10th row, and asserts <code>scan()</code> yields all survivors in
+      <code>(page_id, slot)</code> order; <code>ms1_heapfile_survives_reopen</code> checks durability
+      across close/reopen; and <code>ms1_heapfile_rejects_oversized_tuple</code> asserts that a
+      <code>PAGE_SIZE</code>-byte tuple returns <code>Err(Error::PageFull)</code>.</li>
   </ul>
-  <p>Once everything is green, delete the <code>#[ignore]</code> attributes from the <code>ms1_</code>
-  tests so a plain <code>cargo test</code> guards against regressions from Milestone&nbsp;2 onward. Add
-  your own unit tests freely alongside — the byte helpers from step&nbsp;1 and the header round-trip
-  from step&nbsp;2 deserve their own.</p>
+  <p>Do <strong>not</strong> delete the <code>#[ignore]</code> attributes: per the workspace
+  <code>README.md</code>, keeping them leaves plain <code>cargo test --workspace</code> green in CI while
+  <code>--include-ignored ms1_</code> runs this milestone's regression suite whenever you want. Add your
+  own unit tests freely alongside — the byte helpers from step&nbsp;1 and the header round-trip from
+  step&nbsp;2 deserve their own.</p>
 
   <h2 id="sec-pitfalls">Common pitfalls</h2>
 
@@ -519,7 +594,8 @@ impl HeapFile {
     <code>lower + LP_SIZE + need &gt; upper</code>; forget the <code>LP_SIZE</code> term, or use
     <code>&gt;=</code> where you mean <code>&gt;</code>, and the last insert that “fits” writes its line
     pointer over the first tuple byte. <em>Symptom:</em> <code>ms1_slotted_page_roundtrip</code> passes
-    for a handful of tuples but corrupts the last one when a page fills — or <code>free_space</code>
+    for a handful of tuples, then <code>ms1_free_space_decreases_and_bounds_inserts</code> corrupts the
+    last tuple when a page fills — or <code>free_space</code>
     underflows a <code>usize</code> subtraction and panics. <em>Fix:</em> one function computes the
     fit decision and <code>free_space</code> from the same expression; test it at the exact boundary
     (a tuple that fits with 0 bytes to spare, then one byte more).</p>
@@ -530,8 +606,9 @@ impl HeapFile {
     <p>The <code>u32</code> prefix is the UTF-8 <em>byte</em> length. <code>"naïve"</code> is 5
     characters but 6 bytes (Figure&nbsp;3); Rust's <code>String::len</code> already returns bytes, so the
     bug arrives when someone “helpfully” writes <code>s.chars().count()</code> instead.
-    <em>Symptom:</em> ASCII-only tests pass, then the seeded property test (which generates non-ASCII
-    strings) fails with a UTF-8 decode error or a shifted read of the next column. <em>Fix:</em> use
+    <em>Symptom:</em> ASCII-only tests pass, then <code>ms1_tuple_serde_all_types_and_nulls</code> (which
+    round-trips <code>"héllo → 世界"</code>) fails with a UTF-8 decode error or a shifted read of the next
+    column. <em>Fix:</em> use
     <code>len()</code>, and in <code>deserialize</code> validate with <code>String::from_utf8</code>
     rather than the unchecked variant.</p>
   </div>
@@ -547,15 +624,14 @@ impl HeapFile {
 
   <h2 id="sec-done">Definition of done</h2>
   <ul>
-    <li><code>cargo test -p ferricdb-storage -- --include-ignored ms1_</code> passes with every test
-      green — including the seeded property test that round-trips random tuples through pages and
-      files.</li>
+    <li><code>cargo test -p ferricdb-storage -- --include-ignored ms1_</code> passes with all 14
+      <code>ms1_</code> tests green — including the seeded property test, wide multi-byte bitmap test,
+      bad-input rejection, and oversized-tuple rejection.</li>
     <li>A fresh database file survives close and reopen with identical contents: insert through
       <code>HeapFile</code>, <code>flush_all</code>, drop the <code>DiskManager</code>, reopen the same
       path, and every stored <code>RecordId</code> returns the same meta and bytes, with a full scan
-      yielding the same rows in the same order.</li>
-    <li>The <code>#[ignore]</code> markers are removed from the <code>ms1_</code> tests, so plain
-      <code>cargo test</code> now guards this layer permanently.</li>
+      yielding all surviving rows in <code>(page_id, slot)</code> order.</li>
+    <li><code>#[ignore]</code> attributes remain intact and <code>cargo test --workspace</code> stays green.</li>
     <li>Your heap-page byte map is documented as a comment table in the source, and
       <code>free_space</code>'s convention is stated in its doc comment.</li>
   </ul>
@@ -589,7 +665,7 @@ impl HeapFile {
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="The prefix counts UTF-8 bytes, and 'ï' encodes as two bytes (C3 AF), so 'naïve' is 6 bytes despite being 5 characters. Rust's String::len already returns the byte length — the bug is introduced by counting chars. The seeded property test generates non-ASCII text exactly to catch this.">
+  <fieldset class="quiz" data-explain="The prefix counts UTF-8 bytes, and 'ï' encodes as two bytes (C3 AF), so 'naïve' is 6 bytes despite being 5 characters. Rust's String::len already returns the byte length — the bug is introduced by counting chars. ms1_tuple_serde_all_types_and_nulls round-trips non-ASCII UTF-8 strings specifically to catch this.">
     <legend class="quiz-q"><code>tuple::serialize</code> writes TEXT as a <code>u32</code> length prefix
     followed by UTF-8 bytes. What prefix value does <code>"naïve"</code> get?</legend>
     <label><input type="radio" name="ms1-q3"> 4</label>
@@ -644,6 +720,7 @@ impl HeapFile {
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     done: [],
     current: ["heap", "disk"],

@@ -300,6 +300,20 @@ fn ms5_create_index_and_set_root_persist() {
     assert_eq!(info.indexes[0].name, "users_id_idx");
     assert_eq!(info.indexes[0].column, "id");
     assert_eq!(info.indexes[0].root_page, 77);
+
+    // Error cases: unknown table, unknown column, duplicate index name.
+    assert!(matches!(
+        catalog.create_index("bad_tbl_idx", "ghost", "id", 10),
+        Err(Error::Catalog(_))
+    ));
+    assert!(matches!(
+        catalog.create_index("bad_col_idx", "users", "no_such_col", 10),
+        Err(Error::Catalog(_))
+    ));
+    assert!(matches!(
+        catalog.create_index("users_id_idx", "users", "id", 10),
+        Err(Error::Catalog(_))
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -395,4 +409,47 @@ fn ms7_stats_none_for_never_analyzed_table() {
         .unwrap();
     assert!(catalog.stats("users").unwrap().is_none());
     assert!(catalog.stats("orders").unwrap().is_some());
+}
+
+#[test]
+#[ignore = "milestone 7"]
+fn ms7_stats_persist_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let expected = TableStats {
+        row_count: 500,
+        page_count: 7,
+        columns: vec![
+            ColumnStats {
+                min: Some(Value::Integer(1)),
+                max: Some(Value::Integer(500)),
+                distinct_estimate: 500,
+                null_count: 0,
+            },
+            ColumnStats {
+                min: Some(Value::Text("a".into())),
+                max: Some(Value::Text("z".into())),
+                distinct_estimate: 26,
+                null_count: 10,
+            },
+        ],
+    };
+    {
+        let store = open_store(&path);
+        let catalog = Catalog::bootstrap(Arc::clone(&store)).unwrap();
+        catalog.create_table("users", users_schema()).unwrap();
+        catalog.set_stats("users", expected.clone()).unwrap();
+        store.flush_all().unwrap();
+    }
+    let store = open_store(&path);
+    let catalog = Catalog::bootstrap(store).unwrap();
+    let got = catalog
+        .stats("users")
+        .unwrap()
+        .expect("stats must persist across reopen");
+    assert_eq!(got.row_count, expected.row_count);
+    assert_eq!(got.page_count, expected.page_count);
+    assert_eq!(got.columns.len(), 2);
+    assert_eq!(got.columns[0].min, expected.columns[0].min);
+    assert_eq!(got.columns[1].null_count, expected.columns[1].null_count);
 }

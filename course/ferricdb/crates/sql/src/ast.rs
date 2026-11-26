@@ -151,9 +151,10 @@ pub enum Expr {
     IsNull(Box<Expr>, bool),
     /// `CAST(expr AS type)`
     Cast(Box<Expr>, DataType),
-    /// A function call: `COUNT(*)` is `Function("COUNT", [Literal(…)])`
-    /// by convention `COUNT(*)` carries a single `Literal(Integer(1))`
-    /// argument. Aggregates arrive in Milestone 6.
+    /// A function call. Function names are folded to lowercase, and
+    /// `COUNT(*)` parses as `Function("count", vec![])` (matching
+    /// `AggExpr { func: Count, arg: None }` in `ferricdb-exec::binder`).
+    /// Aggregates arrive in Milestone 6.
     Function(String, Vec<Expr>),
 }
 
@@ -162,20 +163,24 @@ pub enum Expr {
 pub enum UnaryOp {
     /// `NOT` (binding power 3)
     Not,
-    /// unary `-` (binding power 7)
+    /// unary `-` (binding power 8)
     Neg,
 }
 
 /// Infix operators, listed with their Pratt binding powers (low binds
-/// loosest; recurse with `power + 1` for left associativity):
+/// loosest; recurse with `power + 1` for left associativity — matches
+/// [`crate::Parser::parse_expr`]):
 ///
 /// | power | operators |
 /// |-------|-----------|
 /// | 1 | `OR` |
 /// | 2 | `AND` |
-/// | 4 | `= != <> < <= > >=` |
-/// | 5 | `+ -` |
-/// | 6 | `* / %` |
+/// | 3 | prefix `NOT` |
+/// | 4 | postfix `IS NULL` / `IS NOT NULL` |
+/// | 5 | `= != <> < <= > >=` |
+/// | 6 | `+ -` |
+/// | 7 | `* / %` |
+/// | 8 | prefix `-` |
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinaryOp {
     And,

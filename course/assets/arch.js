@@ -47,7 +47,7 @@
     { d: "M 480 192 H 640", arrow: "both", label: { x: 560, y: 184, text: "name / type lookup" } },
     { d: "M 480 268 H 750 V 216", label: { x: 620, y: 260, text: "statistics" } },
     { d: "M 480 344 H 640", arrow: "both", label: { x: 560, y: 336, text: "visibility, conflicts" } },
-    { d: "M 750 368 V 472", label: { x: 758, y: 424, text: "commit / abort records" } },
+    { d: "M 750 368 V 472", label: { x: 760, y: 424, anchor: "start", text: "commit / abort records" } },
     { d: "M 480 496 H 640", dashed: true, label: { x: 560, y: 488, text: "WAL rule: log first" } },
     { d: "M 750 520 V 572 H 480", label: { x: 620, y: 564, text: "log file" } }
   ];
@@ -98,7 +98,7 @@
       if (e.dashed) path.setAttribute("stroke-dasharray", "5 4");
       svg.appendChild(path);
       if (e.label) {
-        var lbl = S("text", { x: e.label.x, y: e.label.y, "class": "d-text-sm", "text-anchor": "middle" }, e.label.text);
+        var lbl = S("text", { x: e.label.x, y: e.label.y, "class": "d-text-sm", "text-anchor": e.label.anchor || "middle" }, e.label.text);
         svg.appendChild(lbl);
       }
     });

@@ -255,7 +255,7 @@ impl Lexer {
 /// milestone; everything unmarked is Milestone 3:
 ///
 /// ```text
-/// script       := [ statement { ";" statement } ] [ ";" ]
+/// script       := { ";" } [ statement { ";" { ";" } statement } ] { ";" }
 /// statement    := create_table | drop_table | create_index
 ///               | insert | select | update | delete
 ///               | "BEGIN" | "COMMIT" | "ROLLBACK"
@@ -319,9 +319,9 @@ impl Parser {
         todo!("Milestone 3")
     }
 
-    /// Parse a single standalone expression (test convenience; also used
-    /// by the REPL's `.ast` meta-command). Trailing unconsumed tokens are
-    /// an error.
+    /// Parse a single standalone expression (test convenience for Pratt
+    /// precedence unit tests; the REPL's `.ast <sql>` meta-command calls
+    /// [`Parser::parse`]). Trailing unconsumed tokens are an error.
     ///
     /// Operator precedence, lowest binding to tightest binding (modeled
     /// on PostgreSQL's table):

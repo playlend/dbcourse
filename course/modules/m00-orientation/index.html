@@ -82,9 +82,10 @@
 
   <h2 id="sec-map">The course map: modules interleaved with milestones</h2>
 
-  <p>Figure 1 is the recommended path. Blue-bordered boxes are concept modules, green boxes are
-  project milestones, and the amber box holds the optional stretch milestones. Each box in the
-  figure is a link — you can navigate the whole course from here.</p>
+  <p>Figure 1 is the recommended path. Neutral boxes are concept modules (with the blue box marking
+  where you are now), green boxes are project milestones, and the amber box holds the optional
+  stretch milestones. Click any other box in the figure to jump straight to its page — you can
+  navigate the whole course from here.</p>
 
   <figure>
     <svg viewBox="0 0 940 326" role="img">
@@ -189,7 +190,7 @@
     "go deeper" trail. When a sentence describes how PostgreSQL, SQLite, or any published algorithm
     behaves, the superscript tells you where that knowledge comes from.</li>
     <li><strong>Course choices are labeled.</strong> Some numbers are decisions, not facts. FerricDB
-    uses 8&nbsp;KB pages — a course choice matching PostgreSQL's usual 8&nbsp;kB block
+    uses 8&nbsp;KB pages — a course choice matching PostgreSQL's usual 8&nbsp;KB block
     size<sup class="cite"><a href="#ref-9">9</a></sup> — and its server will listen on port 5433, a
     course choice made so your database never collides with a real PostgreSQL instance on its default
     port 5432.<sup class="cite"><a href="#ref-4">4</a></sup></li>
@@ -295,7 +296,7 @@
       </thead>
       <tbody>
         <tr><td>Wire protocol server</td><td><code>crates/server</code></td><td>M11</td><td>MS10</td></tr>
-        <tr><td>SQL front-end</td><td><code>crates/sql</code></td><td>M05</td><td>MS3</td></tr>
+        <tr><td>SQL front-end</td><td><code>crates/sql</code> (lexer/parser/AST) + <code>crates/exec</code> (binder)</td><td>M05</td><td>MS3</td></tr>
         <tr><td>Catalog</td><td><code>crates/catalog</code></td><td>M05</td><td>MS3 (stats: MS7)</td></tr>
         <tr><td>Planner / optimizer</td><td><code>crates/exec</code></td><td>M06, M08</td><td>MS4, MS7</td></tr>
         <tr><td>Executor</td><td><code>crates/exec</code></td><td>M06, M07</td><td>MS4, MS6</td></tr>
@@ -383,13 +384,13 @@
   <div class="callout note">
     <span class="callout-title">Worked example — how much does that scan actually read?</span>
     <p>Give <code>students</code> 40,000 rows averaging 100 bytes each (tuple header included).
-    FerricDB's pages are 8,192 bytes — our course choice, matching PostgreSQL's usual 8&nbsp;kB block
+    FerricDB's pages are 8,192 bytes — our course choice, matching PostgreSQL's usual 8&nbsp;KB block
     size.<sup class="cite"><a href="#ref-9">9</a></sup> Following PostgreSQL's heap page layout, a
     24-byte page header sits at the front, and each stored tuple also costs a 4-byte item identifier
     in the page's line-pointer array.<sup class="cite"><a href="#ref-9">9</a></sup> So one page holds
     ⌊(8192&nbsp;−&nbsp;24)&nbsp;/&nbsp;(100&nbsp;+&nbsp;4)⌋&nbsp;=&nbsp;78 rows, and the table needs
-    ⌈40,000&nbsp;/&nbsp;78⌉&nbsp;=&nbsp;513 pages ≈ 4.2&nbsp;MB. A cold sequential scan therefore
-    issues 513 page requests, every one a buffer-pool miss; with a 128-frame (1&nbsp;MiB) pool —
+    ⌈40,000&nbsp;/&nbsp;78⌉&nbsp;=&nbsp;513 pages ≈ 4.0&nbsp;MB. A cold sequential scan therefore
+    issues 513 page requests, every one a buffer-pool miss; with a 128-frame (1&nbsp;MB) pool —
     another course choice — the scan also forces at least 385 evictions along the way. Why we care so
     much: the CMU storage notes put the latency gap in human terms — if an L1 cache reference took
     one second, an SSD read would take about 4.4 hours and a spinning-disk read about 3.3
@@ -489,7 +490,7 @@
     <p>A tempting shortcut is to <code>mmap</code> the database file and let the OS page data in and
     out — virtual memory as a free buffer pool. The CMU notes advise against it for both correctness
     and performance: a page fault blocks the faulting thread, the DBMS loses control over when dirty
-    pages reach disk (fatal for recovery ordering, as you will see in M10), and the OS simply knows
+    pages reach disk (fatal for recovery ordering, as you will see in M10), and the OS knows far
     less about access patterns than the database does.<sup class="cite"><a href="#ref-8">8</a></sup>
     FerricDB reads and writes its files explicitly through the disk manager.</p>
   </div>
@@ -498,7 +499,7 @@
 
   <p>This course keeps two real systems on the desk at all times. <strong>PostgreSQL is the model
   we imitate</strong>: FerricDB copies its semantics — the parse/analyze/rewrite/plan/execute
-  pipeline,<sup class="cite"><a href="#ref-5">5</a></sup> heap tables of 8&nbsp;kB slotted
+  pipeline,<sup class="cite"><a href="#ref-5">5</a></sup> heap tables of 8&nbsp;KB slotted
   pages,<sup class="cite"><a href="#ref-9">9</a></sup> MVCC transactions, a write-ahead log, and its
   wire protocol — because those semantics are exhaustively documented (Suzuki's
   <em>The Internals of PostgreSQL</em> devotes chapters to each subsystem, from process and memory
@@ -628,7 +629,7 @@
         <li id="ref-6">CMU 15-445/645 Database Systems — course home (topics and course design). <a href="https://15445.courses.cs.cmu.edu/" rel="external">https://15445.courses.cs.cmu.edu/</a></li>
         <li id="ref-7">CMU 15-445/645, Fall 2025 — programming projects (buffer pool → index → query execution → concurrency control, built in sequence). <a href="https://15445.courses.cs.cmu.edu/fall2025/assignments.html" rel="external">https://15445.courses.cs.cmu.edu/fall2025/assignments.html</a></li>
         <li id="ref-8">A. Pavlo, CMU 15-445/645 Fall 2025, Lecture #03 notes “Database Storage (Part I)” — disk-oriented architecture, volatile vs non-volatile devices, latency analogy, mmap discussion, pages and heap files. <a href="https://15445.courses.cs.cmu.edu/fall2025/notes/03-storage1.pdf" rel="external">https://15445.courses.cs.cmu.edu/fall2025/notes/03-storage1.pdf</a></li>
-        <li id="ref-9">PostgreSQL documentation, “Database Page Layout” (8 kB default page, 24-byte header, 4-byte item identifiers). <a href="https://www.postgresql.org/docs/current/storage-page-layout.html" rel="external">https://www.postgresql.org/docs/current/storage-page-layout.html</a></li>
+        <li id="ref-9">PostgreSQL documentation, “Database Page Layout” (8 KB default page, 24-byte header, 4-byte item identifiers). <a href="https://www.postgresql.org/docs/current/storage-page-layout.html" rel="external">https://www.postgresql.org/docs/current/storage-page-layout.html</a></li>
         <li id="ref-10">“About SQLite”, SQLite project documentation — serverless in-process library, whole database in a single disk file, most widely deployed database. <a href="https://sqlite.org/about.html" rel="external">https://sqlite.org/about.html</a></li>
       </ol>
     </div>
@@ -741,7 +742,7 @@ document.addEventListener("DOMContentLoaded", function () {
 
       /* return path: results flowing back up to the client */
       var ret = S("path", {
-        d: "M 290 468 H 330 V 36 H 302",
+        d: "M 290 468 H 330 V 36 H 290",
         "class": unwind ? "d-line-hl" : "d-line"
       });
       if (!unwind) ret.setAttribute("stroke-dasharray", "5 4");

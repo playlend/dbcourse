@@ -52,7 +52,8 @@
   <h2 id="sec-goal">The goal</h2>
   <p>Milestone 8 shipped with the course's most honest test:
   <code>ms8_write_skew_is_documented</code> asserts that the write-skew anomaly
-  <em>succeeds</em> under your snapshot isolation, exactly as toyDB documents for its own
+  <em>succeeds</em> under your snapshot isolation (built on PostgreSQL's <code>xmin</code>/<code>xmax</code>
+  visibility rules<sup class="cite"><a href="#ref-3">3</a></sup>), exactly as toyDB documents for its own
   MVCC.<sup class="cite"><a href="#ref-2">2</a></sup> This stretch flips that test: add a
   <code>SERIALIZABLE</code> isolation mode under which the same scenario aborts one transaction
   with a serialization error, while plain snapshot isolation mode keeps its current behavior.</p>
@@ -79,8 +80,11 @@
   </figure>
 
   <h2 id="sec-spec">Suggested design</h2>
-  <p>Extensions to <code>crates/txn</code> — a suggested shape, not a provided stub:</p>
-  <pre><code>pub enum IsolationLevel { Snapshot, Serializable }
+  <p>Extensions to <code>crates/common</code> (so both <code>crates/sql</code> and
+  <code>crates/txn</code> can name <code>IsolationLevel</code> without breaking the crate graph)
+  and <code>crates/txn</code> — a suggested shape, not a provided stub:</p>
+  <pre><code>// in crates/common (or define an AST enum in crates/sql and map it in crates/exec)
+pub enum IsolationLevel { Snapshot, Serializable }
 
 impl TransactionManager {
     pub fn begin_with(&amp;self, level: IsolationLevel) -&gt; Arc&lt;Transaction&gt;;
@@ -96,8 +100,10 @@ impl TransactionManager {
 
   <h2 id="sec-plan">Build plan</h2>
   <ol>
-    <li>Add the isolation level to <code>begin</code>, the REPL (<code>BEGIN SERIALIZABLE</code>),
-      and the session default.</li>
+    <li>Extend <code>ast::Statement::Begin</code> (in <code>crates/sql</code>) and
+      <code>BoundStatement::Begin</code> to carry an optional <code>IsolationLevel</code>
+      (<code>BEGIN ISOLATION LEVEL SERIALIZABLE</code> / <code>BEGIN SERIALIZABLE</code>), and
+      wire <code>begin_with</code> into <code>execute()</code> and the session default.</li>
     <li>Thread <code>record_read</code> through SeqScan and IndexScan — only for rows actually
       returned to the transaction, only under Serializable.</li>
     <li>Keep read sets alongside the write sets you already store; extend the commit-time check
@@ -166,6 +172,16 @@ impl TransactionManager {
           <a href="https://www.interdb.jp/pg/pgsql05.html" rel="external">https://www.interdb.jp/pg/pgsql05.html</a></li>
       </ol>
     </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>PostgreSQL Documentation, "Serializable Isolation Level" — how SIREAD locks, granularity
+        promotion, and rw-antidependency tracking work in production Postgres.
+        <a href="https://www.postgresql.org/docs/current/transaction-iso.html#XACT-SERIALIZABLE" rel="external">postgresql.org/docs/current/transaction-iso.html</a></li>
+      <li>Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, Ch. 5 — snapshot mechanics and
+        isolation tradeoffs beneath SSI.
+        <a href="https://www.interdb.jp/pg/pgsql05.html" rel="external">interdb.jp/pg/pgsql05.html</a></li>
+    </ul>
 
     <nav class="prevnext">
       <a href="../stretch-s1/index.html"><span class="dir">← Previous</span> Stretch S1 · Lock Manager &amp; Row Locks</a>

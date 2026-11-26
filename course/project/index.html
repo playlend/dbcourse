@@ -98,15 +98,17 @@
     replacement policy, the B+Tree, the parser, the executor operators, MVCC visibility, and the
     WAL/recovery machinery are the learning content — you implement them yourself.</li>
     <li><strong>Allowed helper crates</strong> (already wired in the workspace):
-    <code>bytes</code>, <code>thiserror</code>, <code>tempfile</code>, <code>criterion</code>
-    (benchmarks), <code>rustyline</code> (REPL), <code>tokio</code> (server milestone only), plus
-    <code>rand</code> and <code>sqllogictest</code> inside tests. Everything else needs a very
-    good reason.</li>
-    <li><strong>One escape hatch:</strong> the SQL parser may be replaced with
-    <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">sqlparser-rs</a>
-    if parsing is not where you want to spend your time — but
-    <a href="../modules/m05-sql-parsing/index.html">Module 5</a> teaches you to write one, and the
-    hand-written path is the recommended one. The AST stays the same either way.</li>
+    <code>bytes</code>, <code>thiserror</code>, <code>tempfile</code> (<code>ferricdb</code> binary
+    temp DBs and dev tests), <code>criterion</code> (dev, benchmarks), <code>rustyline</code>
+    (REPL), <code>tokio</code> (<code>server</code> crate and <code>ferricdb</code>
+    <code>--serve</code> entrypoint), plus <code>rand</code> (dev, fixed-seed property/fuzz tests)
+    and <code>sqllogictest</code> (dev, harness only). Do not add other dependencies.</li>
+    <li><strong>One escape hatch:</strong> <code>sqlparser</code>
+    (<a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">sqlparser-rs</a>) is
+    permitted solely as the Milestone 3 escape hatch if parsing is not where you want to spend your
+    time — it is not a default workspace dependency.
+    <a href="../modules/m05-sql-parsing/index.html">Module 5</a> teaches you to write the parser by
+    hand, and the hand-written path is the recommended one. The AST stays the same either way.</li>
     <li><strong>Each milestone page gives you:</strong> learning objectives, required reading,
     the public Rust API to implement (quoted from the workspace's API contract), step-by-step
     guidance with hints — never solutions — a test plan, common pitfalls, and a definition of
@@ -125,15 +127,21 @@
 cargo test --workspace -- --list --ignored
 
 # work on milestone 2
-cargo test -p ferricdb-buffer -- --include-ignored ms2_</code></pre>
+cargo test -p ferricdb-buffer -- --include-ignored ms2_
+
+# sqllogictest suites (from Milestone 4 onward)
+cargo test -p ferricdb -- --include-ignored ms4_slt_crud
+cargo test -p ferricdb -- --include-ignored ms6_slt_joins_agg_sort
+cargo test -p ferricdb -- --include-ignored slt_all</code></pre>
 
   <p>From Milestone 4 onward — once SQL executes end to end — correctness is also checked by
   <em>sqllogictest</em> files: scripted SQL sessions with expected results, run by the
   <code>sqllogictest</code> crate (the Rust runner maintained by the RisingLight project and used
   by several Rust database projects).<sup class="cite"><a href="#ref-2">2</a></sup> The files live in
-  <code>crates/ferricdb/tests/slt/</code> and the same suite that runs in-process in MS4 runs over
-  a real <code>psql</code> session in MS10 — the strongest possible statement that your database
-  behaves like a database.</p>
+  <code>crates/ferricdb/tests/slt/</code> and are driven by the <code>ms4_slt_crud</code>,
+  <code>ms6_slt_joins_agg_sort</code>, and <code>slt_all</code> harness tests. The same SQL
+  workload that runs in-process in MS4–MS6 runs over a real <code>psql</code> session in MS10 — the
+  strongest possible statement that your database behaves like a database.</p>
 
   <h2 id="sec-workspace">The workspace</h2>
   <p>The Cargo workspace lives at <code>course/ferricdb/</code>. Public APIs are declared as
@@ -151,8 +159,8 @@ cargo test -p ferricdb-buffer -- --include-ignored ms2_</code></pre>
       <tr><td><code>crates/storage</code></td><td>pages, slotted heap pages, tuple format, disk manager, heap files</td><td><a href="milestone-01/index.html">MS1</a></td><td><a href="../modules/m02-storage/index.html">M02</a></td></tr>
       <tr><td><code>crates/buffer</code></td><td>buffer pool manager, CLOCK / LRU-K replacers, page guards</td><td><a href="milestone-02/index.html">MS2</a></td><td><a href="../modules/m03-buffer-pool/index.html">M03</a></td></tr>
       <tr><td><code>crates/sql</code></td><td>lexer, recursive-descent + Pratt parser, AST</td><td><a href="milestone-03/index.html">MS3</a></td><td><a href="../modules/m05-sql-parsing/index.html">M05</a></td></tr>
-      <tr><td><code>crates/catalog</code></td><td>self-hosting system catalog, table/index metadata, statistics</td><td><a href="milestone-03/index.html">MS3</a>, <a href="milestone-07/index.html">MS7</a></td><td><a href="../modules/m05-sql-parsing/index.html">M05</a></td></tr>
-      <tr><td><code>crates/exec</code></td><td>binder, planner, Volcano operators, joins, external sort, optimizer</td><td><a href="milestone-04/index.html">MS4</a>–<a href="milestone-07/index.html">MS7</a></td><td><a href="../modules/m06-query-execution/index.html">M06</a>–<a href="../modules/m08-query-optimization/index.html">M08</a></td></tr>
+      <tr><td><code>crates/catalog</code></td><td>self-hosting system catalog, table/index metadata, statistics</td><td><a href="milestone-03/index.html">MS3</a>, <a href="milestone-05/index.html">MS5</a>, <a href="milestone-07/index.html">MS7</a></td><td><a href="../modules/m05-sql-parsing/index.html">M05</a></td></tr>
+      <tr><td><code>crates/exec</code></td><td>binder, planner, Volcano operators, joins, external sort, optimizer</td><td><a href="milestone-03/index.html">MS3</a>–<a href="milestone-08/index.html">MS8</a></td><td><a href="../modules/m06-query-execution/index.html">M06</a>–<a href="../modules/m08-query-optimization/index.html">M08</a></td></tr>
       <tr><td><code>crates/index</code></td><td>disk-resident B+Tree with splits and range iterators</td><td><a href="milestone-05/index.html">MS5</a></td><td><a href="../modules/m04-data-structures-indexes/index.html">M04</a></td></tr>
       <tr><td><code>crates/txn</code></td><td>transaction manager, snapshots, MVCC visibility, conflict detection</td><td><a href="milestone-08/index.html">MS8</a></td><td><a href="../modules/m09-transactions-mvcc/index.html">M09</a></td></tr>
       <tr><td><code>crates/wal</code></td><td>write-ahead log, checkpoints, ARIES recovery</td><td><a href="milestone-09/index.html">MS9</a></td><td><a href="../modules/m10-logging-recovery/index.html">M10</a></td></tr>
@@ -163,10 +171,15 @@ cargo test -p ferricdb-buffer -- --include-ignored ms2_</code></pre>
   </div>
 
   <p>The crate dependency graph is acyclic and mirrors the architecture diagram:
-  <code>common</code> at the bottom; <code>storage</code> → <code>buffer</code> →
-  <code>index</code> up the storage spine; <code>sql</code>, <code>catalog</code>, and
-  <code>txn</code> feeding <code>exec</code>; <code>wal</code> hooking into <code>buffer</code>
-  through a log-flush trait so the WAL rule can be enforced without a dependency cycle.</p>
+  <code>common</code> sits at the bottom; <code>storage</code> → <code>buffer</code> →
+  <code>wal</code> form the page and logging spine (<code>wal</code> implements <code>buffer</code>'s
+  <code>LogFlusher</code> trait so the WAL rule is enforced without a cycle); <code>catalog</code>
+  and <code>index</code> depend only on <code>common</code> and <code>storage</code> (through the
+  <code>PageStore</code> trait, so either <code>DiskManager</code> or <code>BufferPoolManager</code>
+  plugs in); <code>sql</code>, <code>txn</code>, <code>catalog</code>, <code>index</code>, and
+  <code>storage</code> feed <code>exec</code>; <code>server</code> depends on <code>common</code>,
+  <code>exec</code>, <code>catalog</code>, and <code>txn</code>; and the <code>ferricdb</code>
+  binary wires everything together.</p>
 
   <h2 id="sec-milestones">Milestones at a glance</h2>
   <div class="cards">
@@ -255,12 +268,17 @@ cargo test -p ferricdb-buffer -- --include-ignored ms2_</code></pre>
     </ul>
 
     <p><a class="btn primary" href="milestone-00/index.html">Start with Milestone 0 →</a></p>
+    <p class="muted">Course text, diagrams, and starter code are released under the MIT License.
+    FerricDB is an independent educational project, not affiliated with or endorsed by the
+    PostgreSQL Global Development Group. External papers, documentation, and repositories linked
+    above remain the property of their respective copyright holders.</p>
   </footer>
 </main>
 
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     links: true,
     root: ".."

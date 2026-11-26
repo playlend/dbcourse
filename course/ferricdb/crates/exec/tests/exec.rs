@@ -1,21 +1,26 @@
-//! Provided Milestone 4 / 6 / 7 test suites for the query engine, driven
-//! end-to-end through [`ferricdb_exec::execute`] over a tempfile-backed
-//! database.
+//! Provided Milestone 3 / 4 / 5 / 6 / 7 / 8 test suites for the query engine,
+//! driven through `Binder`, `ExternalSorter`, `Planner`, and
+//! [`ferricdb_exec::execute`] over a tempfile-backed database.
 //!
 //! Run per milestone:
+//!   cargo test -p ferricdb-exec -- --include-ignored ms3_
 //!   cargo test -p ferricdb-exec -- --include-ignored ms4_
+//!   cargo test -p ferricdb-exec -- --include-ignored ms5_
 //!   cargo test -p ferricdb-exec -- --include-ignored ms6_
 //!   cargo test -p ferricdb-exec -- --include-ignored ms7_
+//!   cargo test -p ferricdb-exec -- --include-ignored ms8_
 
 use std::sync::Arc;
 
 use ferricdb_buffer::{BufferPoolManager, ClockReplacer};
 use ferricdb_catalog::Catalog;
-use ferricdb_common::{Column, DataType, Schema, Value};
-use ferricdb_exec::binder::BoundExpr;
+use ferricdb_common::{Column, DataType, Error, Schema, Value};
+use ferricdb_exec::binder::{Binder, BoundExpr, BoundStatement};
 use ferricdb_exec::plan::LogicalPlan;
+use ferricdb_exec::sort::ExternalSorter;
 use ferricdb_exec::{execute, ExecContext, Planner, QueryResult};
 use ferricdb_sql::ast::BinaryOp;
+use ferricdb_sql::Parser;
 use ferricdb_storage::{DiskManager, PageStore};
 use ferricdb_txn::TransactionManager;
 
@@ -69,6 +74,68 @@ fn seed_users(db: &Db) {
         "INSERT INTO users (id, name, age) VALUES \
          (1, 'ada', 36), (2, 'bob', 29), (3, 'eve', NULL), (4, 'dan', 41)",
     );
+}
+
+// ================================================================= MS3
+
+#[test]
+#[ignore = "milestone 3"]
+fn ms3_binder_resolves_and_rejects() {
+    let db = fresh_db();
+    db.ctx
+        .catalog
+        .create_table(
+            "users",
+            Schema {
+                columns: vec![
+                    Column {
+                        name: "id".into(),
+                        data_type: DataType::Integer,
+                        nullable: false,
+                    },
+                    Column {
+                        name: "name".into(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                    },
+                    Column {
+                        name: "score".into(),
+                        data_type: DataType::Float,
+                        nullable: true,
+                    },
+                ],
+            },
+        )
+        .unwrap();
+
+    let binder = Binder::new(&db.ctx.catalog);
+
+    // Valid SELECT resolves names and types.
+    let stmt = Parser::parse("SELECT id, name AS who FROM users WHERE score > 10")
+        .unwrap()
+        .pop()
+        .unwrap();
+    let BoundStatement::Select(bound) = binder.bind(stmt).expect("valid SELECT binds") else {
+        panic!("expected BoundStatement::Select");
+    };
+    assert_eq!(bound.schema.columns.len(), 2);
+    assert_eq!(bound.schema.columns[0].name, "id");
+    assert_eq!(bound.schema.columns[1].name, "who");
+
+    // Unknown table, unknown column, non-boolean WHERE, and bad arithmetic all return Error::Bind.
+    for bad in [
+        "SELECT id FROM ghost",
+        "SELECT missing FROM users",
+        "SELECT id FROM users WHERE id",
+        "SELECT name + 1 FROM users",
+        "INSERT INTO users (id, name) VALUES (1)",
+    ] {
+        let stmt = Parser::parse(bad).unwrap().pop().unwrap();
+        assert!(
+            matches!(binder.bind(stmt), Err(Error::Bind(_))),
+            "{bad:?} must fail binding with Error::Bind"
+        );
+    }
 }
 
 // ================================================================= MS4
@@ -176,18 +243,20 @@ fn ms4_order_by_limit_and_null_ordering() {
 fn ms4_halloween_guard() {
     let db = fresh_db();
     run(&db, "CREATE TABLE n (x INTEGER)");
-    // 95..105: rows below 100 qualify; each must be bumped exactly once
+    // 95..105: rows below 100 qualify; incrementing by +1 keeps 95..98 STILL
+    // < 100, so a naive streaming UPDATE without a Halloween guard re-visits
+    // newly inserted tuples and increments them repeatedly until they hit 100!
     for x in 95..105 {
         run(&db, &format!("INSERT INTO n (x) VALUES ({x})"));
     }
-    let upd = run(&db, "UPDATE n SET x = x + 10 WHERE x < 100");
+    let upd = run(&db, "UPDATE n SET x = x + 1 WHERE x < 100");
     assert_eq!(upd[0].affected, 5);
     let mut got = ints(&db, "SELECT x FROM n");
     got.sort_unstable();
     assert_eq!(
         got,
-        vec![100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
-        "no row processed twice (the Halloween problem)"
+        vec![96, 97, 98, 99, 100, 100, 101, 102, 103, 104],
+        "each qualifying row processed exactly once (the Halloween problem)"
     );
 }
 
@@ -203,6 +272,34 @@ fn ms4_errors_are_errors() {
         execute("SELECT name + 1 FROM users", &db.ctx).is_err(),
         "type error"
     );
+}
+
+// ================================================================= MS5
+
+#[test]
+#[ignore = "milestone 5"]
+fn ms5_create_index_and_index_scan_execution() {
+    let db = fresh_db();
+    run(&db, "CREATE TABLE items (id INTEGER, grp INTEGER)");
+    for i in 0..200 {
+        run(&db, &format!("INSERT INTO items VALUES ({i}, {})", i % 10));
+    }
+    run(&db, "CREATE INDEX idx_items_id ON items (id)");
+    run(&db, "CREATE INDEX idx_items_grp ON items (grp)");
+
+    // Subsequent inserts must maintain existing indexes too.
+    run(&db, "INSERT INTO items VALUES (200, 0), (201, 1)");
+
+    assert_eq!(ints(&db, "SELECT id FROM items WHERE id = 42"), vec![42]);
+    assert_eq!(ints(&db, "SELECT id FROM items WHERE id = 200"), vec![200]);
+
+    let mut range_ids = ints(&db, "SELECT id FROM items WHERE id >= 10 AND id < 15");
+    range_ids.sort_unstable();
+    assert_eq!(range_ids, vec![10, 11, 12, 13, 14]);
+
+    // Non-unique secondary index scan returns all matching rows.
+    let grp0 = ints(&db, "SELECT id FROM items WHERE grp = 0");
+    assert_eq!(grp0.len(), 21, "0, 10, ..., 200");
 }
 
 // ================================================================= MS6
@@ -279,10 +376,59 @@ fn ms6_group_by_aggregates() {
 
 #[test]
 #[ignore = "milestone 6"]
+fn ms6_external_sorter_spills_runs() {
+    let db = fresh_db();
+    let schema = Schema {
+        columns: vec![
+            Column {
+                name: "k".into(),
+                data_type: DataType::Integer,
+                nullable: true,
+            },
+            Column {
+                name: "pad".into(),
+                data_type: DataType::Text,
+                nullable: false,
+            },
+        ],
+    };
+    let mut sorter = ExternalSorter::new(Arc::clone(&db.ctx.store), schema, 4, vec![(0, false)]);
+    let mut expected: Vec<i64> = Vec::new();
+    for i in 0..1500i64 {
+        let k = (i * 7919) % 1500;
+        expected.push(k);
+        sorter
+            .push(vec![Value::Integer(k), Value::Text("x".repeat(40))])
+            .unwrap();
+    }
+    sorter
+        .push(vec![Value::Null, Value::Text("null-last".into())])
+        .unwrap();
+
+    assert!(
+        sorter.spilled_runs() > 0,
+        "1500 rows (~80 KB) must spill runs under a 4-page (32 KB) budget"
+    );
+    let out = sorter.finish().unwrap();
+    assert_eq!(out.len(), 1501);
+    expected.sort_unstable();
+    let got_non_null: Vec<i64> = out[..1500]
+        .iter()
+        .map(|r| match r[0] {
+            Value::Integer(v) => v,
+            _ => panic!("expected integer"),
+        })
+        .collect();
+    assert_eq!(got_non_null, expected);
+    assert_eq!(out[1500][0], Value::Null, "NULL sorts last");
+}
+
+#[test]
+#[ignore = "milestone 6"]
 fn ms6_external_sort_under_tiny_budget() {
     let db = fresh_db();
     run(&db, "CREATE TABLE big (k INTEGER, pad TEXT NOT NULL)");
-    // enough rows that they cannot fit in a 2-page budget
+    // enough rows (~80 KB) that they cannot fit in a 4-page (32 KB) budget
     for chunk in 0..20 {
         let mut vals = Vec::new();
         for i in 0..100 {
@@ -299,15 +445,9 @@ fn ms6_external_sort_under_tiny_budget() {
     let reference = ints(&db, "SELECT k FROM big ORDER BY k");
     assert_eq!(reference.len(), 2000);
 
-    // now force spilling
-    let tiny = ExecContext {
-        catalog: Arc::clone(&db.ctx.catalog),
-        store: Arc::clone(&db.ctx.store),
-        txn_manager: Arc::clone(&db.ctx.txn_manager),
-        current_txn: std::sync::Mutex::new(None),
-        wal: None,
-        memory_pages: 2,
-    };
+    // now force spilling (memory_pages = 4 gives textbook 3-way merge)
+    let mut tiny = db.ctx.new_session();
+    tiny.memory_pages = 4;
     let spilled = execute("SELECT k FROM big ORDER BY k", &tiny)
         .unwrap()
         .pop()
@@ -328,29 +468,6 @@ fn ms6_external_sort_under_tiny_budget() {
 
 // ================================================================= MS7
 
-fn table_info_for_tests() -> ferricdb_catalog::TableInfo {
-    ferricdb_catalog::TableInfo {
-        oid: 100,
-        name: "t".into(),
-        schema: Schema {
-            columns: vec![
-                Column {
-                    name: "a".into(),
-                    data_type: DataType::Integer,
-                    nullable: false,
-                },
-                Column {
-                    name: "b".into(),
-                    data_type: DataType::Integer,
-                    nullable: true,
-                },
-            ],
-        },
-        first_page: 3,
-        indexes: vec![],
-    }
-}
-
 fn lit(v: i64) -> BoundExpr {
     BoundExpr::Literal(Value::Integer(v))
 }
@@ -368,6 +485,13 @@ fn colref(table: usize, column: usize) -> BoundExpr {
 fn ms7_constant_folding() {
     let db = fresh_db();
     let planner = Planner::new(&db.ctx);
+    let out_schema = Schema {
+        columns: vec![Column {
+            name: "c0".into(),
+            data_type: DataType::Integer,
+            nullable: true,
+        }],
+    };
     let plan = LogicalPlan::Projection {
         input: Box::new(LogicalPlan::Values {
             rows: vec![vec![lit(1)]],
@@ -382,6 +506,7 @@ fn ms7_constant_folding() {
                 Box::new(lit(4)),
             )),
         )],
+        schema: out_schema,
     };
     let optimized = planner.optimize(plan).unwrap();
     let LogicalPlan::Projection { exprs, .. } = optimized else {
@@ -394,17 +519,21 @@ fn ms7_constant_folding() {
 #[ignore = "milestone 7"]
 fn ms7_predicate_pushdown_single_side() {
     let db = fresh_db();
+    run(&db, "CREATE TABLE t (a INTEGER NOT NULL, b INTEGER)");
+    let t = db.ctx.catalog.table("t").unwrap();
     let planner = Planner::new(&db.ctx);
-    let t = table_info_for_tests();
+
     // Filter(left.a = 5) above a cross join must land on the LEFT input
     let plan = LogicalPlan::Filter {
         predicate: BoundExpr::Binary(Box::new(colref(0, 0)), BinaryOp::Eq, Box::new(lit(5))),
         input: Box::new(LogicalPlan::NestedLoopJoin {
             left: Box::new(LogicalPlan::SeqScan {
+                table_idx: 0,
                 table: t.clone(),
                 filter: None,
             }),
             right: Box::new(LogicalPlan::SeqScan {
+                table_idx: 1,
                 table: t.clone(),
                 filter: None,
             }),
@@ -485,4 +614,54 @@ fn ms7_explain_does_not_execute_but_analyze_does() {
         vec![0],
         "EXPLAIN ANALYZE runs it"
     );
+}
+
+// ================================================================= MS8
+
+#[test]
+#[ignore = "milestone 8"]
+fn ms8_sql_transactions_commit_rollback_isolation() {
+    let db = fresh_db();
+    run(
+        &db,
+        "CREATE TABLE acct (id INTEGER PRIMARY KEY, bal INTEGER)",
+    );
+    run(&db, "INSERT INTO acct VALUES (1, 100)");
+
+    let s1 = db.ctx.new_session();
+    let s2 = db.ctx.new_session();
+
+    // Uncommitted writes in s1 are invisible to s2 (no dirty read) and vanish on ROLLBACK.
+    execute("BEGIN", &s1).unwrap();
+    execute("UPDATE acct SET bal = 250 WHERE id = 1", &s1).unwrap();
+    let s2_bal = execute("SELECT bal FROM acct WHERE id = 1", &s2)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .rows;
+    assert_eq!(s2_bal, vec![vec![Value::Integer(100)]], "no dirty read");
+    execute("ROLLBACK", &s1).unwrap();
+    assert_eq!(ints(&db, "SELECT bal FROM acct WHERE id = 1"), vec![100]);
+
+    // Snapshot isolation: s2 sees its BEGIN snapshot even after s1 commits.
+    execute("BEGIN", &s2).unwrap();
+    execute("BEGIN", &s1).unwrap();
+    execute("UPDATE acct SET bal = 150 WHERE id = 1", &s1).unwrap();
+    execute("COMMIT", &s1).unwrap();
+    let s2_still = execute("SELECT bal FROM acct WHERE id = 1", &s2)
+        .unwrap()
+        .pop()
+        .unwrap()
+        .rows;
+    assert_eq!(
+        s2_still,
+        vec![vec![Value::Integer(100)]],
+        "snapshot isolation prevents fuzzy reads"
+    );
+    execute("COMMIT", &s2).unwrap();
+
+    // After s2 closes, a new statement sees 150 and VACUUM succeeds.
+    assert_eq!(ints(&db, "SELECT bal FROM acct WHERE id = 1"), vec![150]);
+    execute("VACUUM", &db.ctx).unwrap();
+    assert_eq!(ints(&db, "SELECT bal FROM acct WHERE id = 1"), vec![150]);
 }

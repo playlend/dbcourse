@@ -25,11 +25,13 @@
 
 <main>
   <h1>Milestone 8 · Transactions and MVCC Snapshot Isolation</h1>
-  <p class="subtitle">Bring the xmin/xmax fields to life: transaction ids, snapshots, the ten
-  visibility rules, first-committer-wins conflicts, COMMIT/ROLLBACK, and VACUUM.</p>
+  <p class="subtitle">Bring the <code>xmin</code> and <code>xmax</code> tuple headers to life:
+  atomic snapshots, all ten visibility rules plus frozen tuples, first-updater-wins and
+  first-committer-wins conflict detection, composite-index MVCC updates, and real
+  <code>VACUUM</code> page compaction.</p>
 
   <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
-  all specification content is readable without it.</p></noscript>
+  all specification content and SVG figures are readable without it.</p></noscript>
 
   <div class="toc">
     <strong>On this page</strong>
@@ -38,6 +40,7 @@
       <li><a href="#sec-reading">Required reading</a></li>
       <li><a href="#sec-arch">Where this fits</a></li>
       <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-visibility">The ten visibility rules (plus frozen tuples)</a></li>
       <li><a href="#sec-guidance">Step-by-step guidance</a></li>
       <li><a href="#sec-tests">Test plan</a></li>
       <li><a href="#sec-pitfalls">Common pitfalls</a></li>
@@ -48,60 +51,106 @@
     </ol>
   </div>
 
-  <p>Since Milestone 1, every tuple you have written carried two silent u64s: <code>xmin</code>
-  and <code>xmax</code>, faithfully stored as zero. Today they wake up. The remarkable thing
-  about this milestone is how little machinery it takes — a transaction manager, a snapshot
-  struct, one pure visibility function threaded through your scans — to turn a single-user
-  engine into one where concurrent sessions each see a consistent world. The design is
-  PostgreSQL's, simplified; the honesty requirement (write skew!) is
-  toyDB's.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  <p>Since Milestone 1, every tuple you wrote into a <code>HeapPage</code> carried two quiet
+  64-bit integers in its 16-byte <code>TupleMeta</code> header: <code>xmin</code> and
+  <code>xmax</code>, faithfully stored as zero. Today they wake up. By adding a compact
+  transaction manager, an atomic snapshot captured at <code>BEGIN</code>, one pure visibility
+  function threaded through both scan operators, and out-of-place versioned writes, FerricDB
+  graduates from a single-user engine into a multi-version database where readers never block
+  writers and writers never block readers.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>The concurrency model is PostgreSQL's <strong>Snapshot Isolation</strong> (which PostgreSQL
+  calls <code>REPEATABLE READ</code>): one snapshot per transaction, tuple-level
+  <code>xmin</code>/<code>xmax</code> versioning, and first-committer-wins conflict detection
+  returning <code>Error::Serialization</code>.<sup class="cite"><a href="#ref-1">1</a></sup><sup
+  class="cite"><a href="#ref-2">2</a></sup> The honesty pledge is toyDB's: dirty reads, dirty
+  writes, lost updates, fuzzy reads, and phantoms are all eliminated, while <strong>write
+  skew</strong> remains permitted under snapshot isolation and is explicitly pinned down by a
+  provided test until you close it with Serializable Snapshot Isolation in
+  <a href="../stretch-s2/index.html">Stretch Milestone S2</a>.<sup class="cite"><a
+  href="#ref-3">3</a></sup></p>
 
   <h2 id="sec-objectives">Learning objectives</h2>
   <ul>
-    <li><strong>Implement</strong> transaction lifecycle: BEGIN / COMMIT / ROLLBACK plus
-      autocommit for bare statements.</li>
-    <li><strong>Implement</strong> snapshots (xmin, xmax, active set) captured at BEGIN.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Implement</strong> the interdb Ch. 5 visibility rules as a pure function and
-      apply them in every scan.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Implement</strong> MVCC writes: insert stamps xmin; delete stamps xmax; update =
-      delete + insert.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Implement</strong> first-committer-wins conflict detection returning
-      <code>Error::Serialization</code> (SQLSTATE 40001 spirit).<sup class="cite"><a href="#ref-2">2</a></sup></li>
-    <li><strong>Implement</strong> VACUUM against the oldest-active-snapshot horizon.<sup class="cite"><a href="#ref-4">4</a></sup></li>
-    <li><strong>Demonstrate</strong> — with tests — which anomalies snapshot isolation prevents
-      and that write skew survives.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>Implement</strong> the ten interdb Ch. 5 MVCC visibility rules (plus
+      <code>xmin == 0</code> frozen/bootstrap tuples) as a pure function
+      <code>Snapshot::is_visible</code>.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Implement</strong> <code>TransactionManager</code> with atomic transaction-id
+      assignment and snapshot capture, commit-state tracking, first-committer-wins conflict
+      detection, and the <code>oldest_visible_xid()</code> garbage-collection horizon.<sup
+      class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong>Implement</strong> out-of-place MVCC writes (<code>INSERT</code>,
+      <code>DELETE</code>, <code>UPDATE</code>) with first-updater-wins protection on
+      <code>meta.xmax</code>, seamlessly paired with Milestone 5's composite
+      <code>(key, rid)</code> B+Tree.</li>
+    <li><strong>Wire</strong> session transaction lifecycle (<code>BEGIN</code>,
+      <code>COMMIT</code>, <code>ROLLBACK</code>, autocommit, and PostgreSQL-style
+      <code>failed_txn</code> error state) through <code>ExecContext</code> and
+      <code>execute()</code>.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Implement</strong> <code>VACUUM</code> parsing in <code>crates/sql</code>,
+      slot-preserving heap compaction in <code>HeapPage::compact()</code>, and horizon-safe dead
+      tuple and index cleanup.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong>Demonstrate</strong> multi-session isolation, serialization aborts, and
+      documented write skew via automated tests using <code>ExecContext::new_session()</code>.<sup
+      class="cite"><a href="#ref-3">3</a></sup></li>
   </ul>
 
   <h2 id="sec-reading">Required reading</h2>
   <ul>
     <li><a href="../../modules/m09-transactions-mvcc/index.html">M09 · Transactions &amp;
-      MVCC</a> — the concept module. Its visibility checker implements the exact rule set you
-      are about to write; keep it open while coding.</li>
-    <li>The Internals of PostgreSQL, §5.5–5.6 — snapshots and the ten visibility rules; your
-      <code>is_visible</code> must mirror them.
+      MVCC</a> — the concept module. Its interactive visibility checker and anomaly timelines
+      execute the exact rules you are building here; keep it open while coding.</li>
+    <li>Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, §5.5–5.6 — snapshots and the ten
+      visibility rules your <code>Snapshot::is_visible</code> mirrors.<sup class="cite"><a
+      href="#ref-1">1</a></sup>
       <a href="https://www.interdb.jp/pg/pgsql05/06.html" rel="external">interdb.jp/pg/pgsql05/06.html</a></li>
-    <li>toyDB's MVCC design walkthrough — a complete Rust reference for the shape of the
-      transaction manager.
-      <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md" rel="external">github.com/erikgrinaker/toydb/docs/architecture/mvcc.md</a></li>
+    <li>PostgreSQL Documentation, <em>Transaction Isolation</em> — Repeatable Read as Snapshot
+      Isolation, serialization failures, and the SQLSTATE <code>40001</code> retry contract.<sup
+      class="cite"><a href="#ref-2">2</a></sup>
+      <a href="https://www.postgresql.org/docs/current/transaction-iso.html" rel="external">postgresql.org/docs/current/transaction-iso.html</a></li>
+    <li>toyDB's MVCC design walkthrough — a crisp Rust architecture guide for transaction
+      managers and honest anomaly coverage.<sup class="cite"><a href="#ref-3">3</a></sup>
+      <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md" rel="external">github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md</a></li>
   </ul>
 
   <h2 id="sec-arch">Where this fits</h2>
   <figure>
     <div id="arch-diagram"></div>
-    <figcaption>Figure 1 — the transaction manager lights up, cross-cutting the executor and
-    access methods: every scan consults it, every write stamps its ids.</figcaption>
+    <figcaption>Figure 1 — FerricDB architecture. The transaction manager lights up as a
+    cross-cutting service: scans consult snapshots before yielding rows, DML operators stamp
+    <code>xmin</code>/<code>xmax</code> and record write sets, and <code>VACUUM</code> consults
+    <code>oldest_visible_xid()</code> before reclaiming heap slots and index entries.</figcaption>
   </figure>
 
-  <h2 id="sec-spec">Specification</h2>
-  <p>You implement <code>crates/txn</code> and thread it through <code>exec</code> and the
-  storage write paths:</p>
+  <p>Notice how earlier architectural choices pay off today. In Milestone 1 you reserved
+  <code>TupleMeta { xmin, xmax }</code> in every heap slot and kept tombstoned line pointers so
+  slot numbers never shifted. In Milestone 5 you keyed the B+Tree on composite
+  <code>(key, rid)</code> pairs rather than bare keys, specifically so two versions of an updated
+  row can coexist under the same indexed key. And in Milestone 4 you designed
+  <code>ExecContext::new_session()</code> to clone the shared database <code>Arc</code>s while
+  giving each session its own isolated <code>current_txn</code> and <code>failed_txn</code>
+  slots. Milestone 8 connects all of those hooks together.</p>
 
-  <pre><code>#[derive(Clone, Debug)]
-pub struct Snapshot { pub xmin: TxnId, pub xmax: TxnId,
-                      pub active: std::collections::BTreeSet&lt;TxnId&gt; }
+  <h2 id="sec-spec">Specification</h2>
+
+  <h3 id="spec-txn">1. Transaction manager and snapshots (<code>crates/txn</code>)</h3>
+  <p>From <code>course/ferricdb/docs/api-spec.md</code> and
+  <code>course/ferricdb/crates/txn/src/lib.rs</code> — implement every public type and method
+  verbatim (note that <code>TransactionManager::restore</code> is stubbed for Milestone 9 WAL
+  recovery and stays <code>todo!("Milestone 9")</code> for now):</p>
+  <pre><code>// crates/txn/src/lib.rs — verbatim public surface
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub owner: TxnId,
+    pub xmin: TxnId,
+    pub xmax: TxnId,
+    /// Other in-flight transactions (excluding `owner`).
+    pub active: std::collections::BTreeSet&lt;TxnId&gt;,
+}
 impl Snapshot {
     /// MVCC visibility of a tuple version to this snapshot, given the
-    /// commit state oracle. Mirrors the interdb Ch.5 rules.
+    /// commit state oracle. `xmin == 0` is treated as frozen/committed.
     pub fn is_visible(&amp;self, meta: &amp;TupleMeta,
                       committed: &amp;dyn Fn(TxnId) -&gt; bool) -&gt; bool;
 }
@@ -113,151 +162,780 @@ impl Transaction {
     pub fn snapshot(&amp;self) -&gt; &amp;Snapshot;
 }
 
-pub struct TransactionManager { /* next txid, states, active set */ }
+pub struct TransactionManager { /* next txid (&gt;= 1), states, active set */ }
 impl TransactionManager {
     pub fn new() -&gt; Self;
     pub fn begin(&amp;self) -&gt; std::sync::Arc&lt;Transaction&gt;;
-    /// First-committer-wins: Err(Error::Serialization) if the write set
-    /// intersects a concurrently-committed transaction's writes.
+    /// First-committer-wins: aborts and returns Err(Error::Serialization) if
+    /// the write set intersects a concurrently-committed transaction's writes.
     pub fn commit(&amp;self, txn: &amp;Transaction) -&gt; Result&lt;()&gt;;
     pub fn abort(&amp;self, txn: &amp;Transaction);
     pub fn is_committed(&amp;self, id: TxnId) -&gt; bool;
+    pub fn is_active(&amp;self, id: TxnId) -&gt; bool;
     pub fn record_write(&amp;self, txn: &amp;Transaction, rid: RecordId);
     /// Oldest xmin any active snapshot can still see (VACUUM horizon).
     pub fn oldest_visible_xid(&amp;self) -&gt; TxnId;
+    /// Restore committed txns and advance next_txid after WAL recovery (MS9).
+    pub fn restore(&amp;self, max_txn_id: TxnId, committed: impl IntoIterator&lt;Item = TxnId&gt;);
 }</code></pre>
 
-  <p>Semantics contract:</p>
+  <p>Pay close attention to <code>Snapshot</code>'s four fields. Unlike a fragile
+  <code>xmax - 1</code> heuristic, <code>Snapshot</code> carries an explicit
+  <code>pub owner: TxnId</code> field so any snapshot knows unequivocally which transaction owns
+  it — even when other transactions started concurrently before or after it. Equally important:
+  <code>active</code> contains all <strong>other</strong> in-flight transactions (excluding
+  <code>owner</code>), while <code>xmin</code> is the oldest active transaction id including
+  <code>owner</code>, and <code>xmax</code> is the first unassigned transaction id at capture
+  time (<code>owner &lt; xmax</code>). Transaction ids start at <code>1</code> because
+  <code>0</code> is reserved for "none" (on <code>xmax</code>) and "frozen / bootstrap" (on
+  <code>xmin</code>).</p>
+
+  <h3 id="spec-hooks">2. Storage compaction, SQL parsing, and execution hooks</h3>
+  <p>Three adjacent crates have small, exact Milestone 8 hooks:</p>
+  <pre><code>// crates/storage/src/lib.rs — MS8 VACUUM compaction hook
+impl&lt;'a&gt; HeapPage&lt;'a&gt; {
+    /// Reclaim dead (tombstoned) tuple bodies by repacking live tuples tightly
+    /// toward PAGE_SIZE and advancing `upper`. Preserves every live slot number
+    /// and leaves `slot_count()` unchanged. Returns bytes reclaimed.
+    pub fn compact(&amp;mut self) -&gt; usize;                                     // MS8 VACUUM
+}
+
+// crates/sql/src/ast.rs — extend Parser::parse in crates/sql/src/lib.rs:
+//   Statement::Vacuum   ("VACUUM")  — BEGIN/COMMIT/ROLLBACK already parse since MS3
+
+// crates/exec/src/lib.rs — per-session transaction slots (already declared)
+pub struct ExecContext {
+    pub catalog: Arc&lt;Catalog&gt;,
+    pub store: Arc&lt;dyn PageStore&gt;,
+    pub txn_manager: Arc&lt;TransactionManager&gt;,
+    pub current_txn: Mutex&lt;Option&lt;Arc&lt;Transaction&gt;&gt;&gt;,
+    pub failed_txn: Mutex&lt;bool&gt;,
+    pub wal: Option&lt;Arc&lt;dyn WalHook&gt;&gt;,
+    pub memory_pages: usize,
+}
+impl ExecContext {
+    pub fn new_session(&amp;self) -&gt; Self; // isolated per-connection / per-session state
+}</code></pre>
+
+  <h3 id="spec-contract">3. Semantics contract</h3>
   <ul>
-    <li><strong>Snapshot capture is atomic</strong> with txid assignment: <code>begin()</code>
-      assigns the next id and captures {xmin = oldest active, xmax = next unassigned,
-      active = in-flight ids} under one lock, so no transaction is ever missing from a snapshot
-      that should contain it.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Visibility</strong> follows the module's rules 1–10 exactly, including the
-      own-transaction cases (my insert visible; my delete invisible to me) and the
-      active-in-snapshot exceptions (rules 5 and 9). "Active in snapshot" = in the active set
-      or ≥ snapshot xmax.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Writes:</strong> INSERT stamps <code>xmin = my id</code>; DELETE stamps
-      <code>xmax = my id</code> via <code>HeapFile::set_meta</code> (tuple body untouched);
-      UPDATE writes a new version and stamps the old one's xmax — never in-place. Index entries
-      are added for new versions; old entries stay until VACUUM.</li>
-    <li><strong>Conflicts:</strong> every write also calls <code>record_write</code>; at
-      <code>commit()</code>, if any rid in my write set was written by a transaction that
-      committed after my snapshot, I abort with <code>Error::Serialization</code> — the
-      first committer wins. ROLLBACK marks aborted; rule 1 instantly hides everything the
-      transaction wrote (no undo needed — that elegance is MVCC's gift; contrast Milestone 9).</li>
-    <li><strong>REPL / execute():</strong> BEGIN opens a transaction bound to the session;
-      COMMIT/ROLLBACK close it; bare statements run in a one-statement autocommit transaction.
-      Scans without any explicit transaction still see committed-only data.</li>
-    <li><strong>VACUUM</strong> scans heaps and removes versions whose deleter is committed and
-      &lt; <code>oldest_visible_xid()</code> (and aborted-insert corpses), compacting slots via
-      your Milestone 1 tombstone machinery.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong>Atomic snapshot capture:</strong> <code>TransactionManager::begin()</code>
+      acquires the internal mutex once to allocate <code>id = next_txid</code> (starting at
+      <code>1</code>), snapshot <code>active</code> (all currently active ids before inserting
+      <code>id</code>), compute <code>xmin = active.first().copied().unwrap_or(id)</code>, set
+      <code>xmax = id + 1</code>, insert <code>id</code> into the active set with state
+      <code>TxnState::Active</code>, and increment <code>next_txid</code>. Splitting id
+      assignment and snapshot capture across two locks opens a race where a concurrent
+      transaction vanishes from your active set.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>First-updater-wins AND first-committer-wins:</strong> write conflicts are guarded
+      at <em>both</em> write time and commit time:
+      <ul>
+        <li><em>Write time (first-updater-wins):</em> before an <code>UPDATE</code> or
+          <code>DELETE</code> stamps <code>meta.xmax = my_id</code> on an existing tuple at
+          <code>rid</code>, inspect its current <code>meta.xmax</code> atomically inside one
+          <code>store.with_page_mut(rid.page_id, ...)</code> latch using
+          <code>HeapPage::attach</code>. If <code>meta.xmax != 0</code> and
+          <code>meta.xmax != my_id</code>, and either
+          <code>txn_manager.is_active(meta.xmax)</code> or
+          <code>txn_manager.is_committed(meta.xmax)</code> holds, abort immediately with
+          <code>Err(Error::Serialization(...))</code>.
+          Why is this essential? A heap tuple header holds only <strong>one</strong>
+          <code>xmax</code> slot. Without first-updater-wins (and without holding the page latch
+          across the check and stamp), transaction <code>T1</code> could stamp
+          <code>xmax = T1</code> and commit while concurrent <code>T2</code> overwrites
+          <code>xmax = T2</code> and later aborts — silently resurrecting <code>T1</code>'s
+          deleted tuple under Rule 6b! If neither <code>is_active</code> nor
+          <code>is_committed</code> is true, <code>meta.xmax</code> belongs to an already-aborted
+          transaction and overwriting <code>xmax</code> is completely safe.</li>
+        <li><em>Commit time (first-committer-wins):</em> every <code>INSERT</code>,
+          <code>UPDATE</code>, and <code>DELETE</code> calls
+          <code>txn_manager.record_write(&amp;txn, rid)</code>. Inside
+          <code>TransactionManager::commit(&amp;txn)</code>, under the same lock that marks
+          <code>txn</code> committed, check whether <code>txn</code>'s write set intersects the
+          write set of any transaction <code>c</code> that committed concurrently with
+          <code>txn</code> (i.e., <code>c</code> was in <code>txn.snapshot().active</code> or
+          <code>c &gt;= txn.snapshot().xmax</code>). If any <code>rid</code> collides, mark
+          <code>txn</code> as <code>TxnState::Aborted</code>, remove it from the active set so
+          <code>oldest_visible_xid()</code> advances, and return
+          <code>Err(Error::Serialization(...))</code>.<sup class="cite"><a
+          href="#ref-2">2</a></sup></li>
+      </ul>
+    </li>
+    <li><strong>Seamless MVCC <code>UPDATE</code> with composite B+Trees:</strong> an
+      <code>UPDATE</code> never edits a tuple in place and never deletes the old index entry at
+      update time. Instead, it stamps <code>xmax = my_id</code> on <code>old_rid</code> via
+      <code>HeapFile::set_meta</code>, inserts the new tuple bytes with
+      <code>TupleMeta { xmin: my_id, xmax: 0 }</code> producing <code>new_rid</code>, records
+      both <code>old_rid</code> and <code>new_rid</code> in the write set, and inserts
+      <code>(new_key, new_rid)</code> into every index on the table while keeping
+      <code>(old_key, old_rid)</code> intact! Because Milestone 5's <code>BPlusTree</code> orders
+      entries by composite <code>(key, rid)</code>, both <code>(key, old_rid)</code> and
+      <code>(key, new_rid)</code> coexist cleanly even when the indexed column's value did not
+      change. Every <code>IndexScan</code> resolves each candidate <code>rid</code> from the heap
+      and filters by <code>snapshot.is_visible(&amp;meta, &amp;oracle)</code> (Figure 2).</li>
+    <li><strong><code>ROLLBACK</code> now vs. Milestone 9:</strong> in Milestone 8 (before the
+      write-ahead log exists), <code>ROLLBACK</code> calls <code>txn_manager.abort(&amp;txn)</code>
+      and clears <code>current_txn</code> and <code>failed_txn</code>. Under visibility rules 1
+      and 6b, every version created by the aborted transaction vanishes immediately and every
+      <code>xmax</code> it stamped is ignored; physical reclamation happens later when
+      <code>VACUUM</code> runs. In <a href="../milestone-09/index.html">Milestone 9</a>, adding
+      ARIES write-ahead logging layers physical undo + Compensation Log Records (CLRs) on abort
+      and crash recovery, plus <code>TransactionManager::restore</code> so committed states
+      survive process restarts — giving you full ACID durability without changing a single
+      visibility rule.</li>
+    <li><strong>Session transaction state &amp; autocommit:</strong> <code>BEGIN</code> starts a
+      transaction and stores it in <code>ctx.current_txn</code> (erroring if already inside one);
+      <code>COMMIT</code> commits it and clears <code>current_txn</code>; <code>ROLLBACK</code>
+      aborts it and clears both <code>current_txn</code> and <code>failed_txn</code>. If any
+      statement inside an explicit transaction fails (including a serialization failure), set
+      <code>ctx.failed_txn = true</code> so subsequent statements fail until <code>ROLLBACK</code>
+      (matching PostgreSQL's <code>ReadyForQuery('E')</code> protocol state in Milestone 10). Any
+      statement executed when <code>current_txn</code> is <code>None</code> runs in an implicit
+      single-statement autocommit transaction (<code>begin</code> → run → <code>commit</code> on
+      <code>Ok</code> or <code>abort</code> on <code>Err</code>).</li>
+    <li><strong><code>VACUUM</code> horizon safety:</strong>
+      <code>TransactionManager::oldest_visible_xid()</code> returns the minimum
+      <code>snapshot.xmin</code> across all currently active transactions (or
+      <code>next_txid</code> when no transactions are active).<sup class="cite"><a
+      href="#ref-4">4</a></sup> <code>VACUUM</code> reclaims only tuples that are guaranteed
+      invisible to every current and future snapshot: aborted inserts
+      (<code>xmin != 0</code>, not committed, and <code>xmin &lt; horizon</code>) and old
+      committed deletes (<code>xmax != 0</code>, committed, and <code>xmax &lt; horizon</code>).</li>
   </ul>
 
+  <h2 id="sec-visibility">The ten visibility rules (plus frozen tuples)</h2>
+  <p><code>Snapshot::is_visible(&amp;self, meta, committed)</code> is a pure function with zero
+  shared state. Define one helper predicate for whether another transaction <code>x</code> is in
+  this snapshot's "future":
+  <code>is_in_future(x) = self.active.contains(&amp;x) || x &gt;= self.xmax</code>. Notice that
+  <code>committed(x)</code> returns <code>true</code> only when <code>x</code> is committed, and
+  <code>false</code> when <code>x</code> is either in progress or aborted; combining it with
+  <code>self.owner</code> and <code>is_in_future(x)</code> resolves every single one of
+  interdb §5.6's ten rules plus FerricDB's <code>xmin == 0</code> frozen-tuple rule:<sup
+  class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Rule</th>
+          <th>Creator (<code>meta.xmin</code>)</th>
+          <th>Deleter (<code>meta.xmax</code>)</th>
+          <th>Visible?</th>
+          <th>Example in <code>snapshot_100</code><br><code>owner=100, xmin=98, xmax=101, active={98}</code></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Frozen</strong></td>
+          <td><code>xmin == 0</code> (bootstrap / pre-MS8 tuple)</td>
+          <td>Treat creator as committed in distant past → evaluate <code>xmax</code> via R6–R10</td>
+          <td><strong>By <code>xmax</code></strong></td>
+          <td><code>(0, 0)</code> → <code>true</code>; <code>(0, 96)</code> → <code>false</code>; <code>(0, 100)</code> → <code>false</code></td>
+        </tr>
+        <tr>
+          <td><strong>R1</strong></td>
+          <td>Aborted (<code>!committed(xmin)</code>, <code>xmin != owner</code>, not in future)</td>
+          <td>Any</td>
+          <td><strong><code>false</code></strong></td>
+          <td><code>(99, 0)</code> → <code>false</code> (T99 aborted)</td>
+        </tr>
+        <tr>
+          <td><strong>R2</strong></td>
+          <td><code>xmin == owner</code> (my own insert)</td>
+          <td><code>xmax == 0</code> (or aborted)</td>
+          <td><strong><code>true</code></strong></td>
+          <td><code>(100, 0)</code> → <code>true</code></td>
+        </tr>
+        <tr>
+          <td><strong>R3</strong></td>
+          <td><code>xmin == owner</code> (my own insert)</td>
+          <td><code>xmax == owner</code> (deleted by me)</td>
+          <td><strong><code>false</code></strong></td>
+          <td><code>(100, 100)</code> → <code>false</code></td>
+        </tr>
+        <tr>
+          <td><strong>R4</strong></td>
+          <td>Other in-progress (<code>!committed(xmin)</code>, <code>xmin != owner</code>, in future)</td>
+          <td>Any</td>
+          <td><strong><code>false</code></strong></td>
+          <td><code>(98, 0)</code> → <code>false</code> (T98 still running)</td>
+        </tr>
+        <tr>
+          <td><strong>R5</strong></td>
+          <td><code>committed(xmin)</code> AND <code>is_in_future(xmin)</code></td>
+          <td>Any</td>
+          <td><strong><code>false</code></strong></td>
+          <td><code>(98, 0)</code> after T98 commits, or <code>(105, 0)</code> → <code>false</code></td>
+        </tr>
+        <tr>
+          <td><strong>R6</strong></td>
+          <td><code>committed(xmin)</code> AND <code>!is_in_future(xmin)</code></td>
+          <td><code>xmax == 0</code> (not deleted)</td>
+          <td><strong><code>true</code></strong></td>
+          <td><code>(95, 0)</code> → <code>true</code></td>
+        </tr>
+        <tr>
+          <td><strong>R6b</strong></td>
+          <td><code>committed(xmin)</code> AND <code>!is_in_future(xmin)</code></td>
+          <td><code>xmax != 0</code>, aborted (<code>!committed(xmax)</code>, <code>xmax != owner</code>)</td>
+          <td><strong><code>true</code></strong></td>
+          <td><code>(95, 99)</code> → <code>true</code> (T99 aborted delete)</td>
+        </tr>
+        <tr>
+          <td><strong>R7</strong></td>
+          <td><code>committed(xmin)</code> AND <code>!is_in_future(xmin)</code></td>
+          <td><code>xmax == owner</code> (deleted by me)</td>
+          <td><strong><code>false</code></strong></td>
+          <td><code>(95, 100)</code> → <code>false</code></td>
+        </tr>
+        <tr>
+          <td><strong>R8</strong></td>
+          <td><code>committed(xmin)</code> AND <code>!is_in_future(xmin)</code></td>
+          <td>Other in-progress (<code>!committed(xmax)</code>, <code>xmax != owner</code>, in future)</td>
+          <td><strong><code>true</code></strong></td>
+          <td><code>(95, 98)</code> → <code>true</code> (T98 delete uncommitted)</td>
+        </tr>
+        <tr>
+          <td><strong>R9</strong></td>
+          <td><code>committed(xmin)</code> AND <code>!is_in_future(xmin)</code></td>
+          <td><code>committed(xmax)</code> AND <code>is_in_future(xmax)</code></td>
+          <td><strong><code>true</code></strong></td>
+          <td><code>(95, 98)</code> after T98 commits → <code>true</code> (future delete!)</td>
+        </tr>
+        <tr>
+          <td><strong>R10</strong></td>
+          <td><code>committed(xmin)</code> AND <code>!is_in_future(xmin)</code></td>
+          <td><code>committed(xmax)</code> AND <code>!is_in_future(xmax)</code></td>
+          <td><strong><code>false</code></strong></td>
+          <td><code>(95, 96)</code> → <code>false</code> (T96 deleted before snapshot)</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>Look closely at the symmetry between creator and deleter. A creator is visible to this
+  snapshot if and only if <code>meta.xmin == 0</code> (frozen), <code>meta.xmin == self.owner</code>
+  (mine), or <code>committed(meta.xmin) &amp;&amp; !is_in_future(meta.xmin)</code> (committed
+  before my snapshot). Once the creator passes, the deletion is visible to this snapshot —
+  hiding the tuple — if and only if <code>meta.xmax != 0</code> AND
+  (<code>meta.xmax == self.owner</code> OR
+  (<code>committed(meta.xmax) &amp;&amp; !is_in_future(meta.xmax)</code>)). Every single one of
+  the twelve rows above collapses cleanly into those two symmetric checks, and every rule maps
+  one-to-one onto the cases in <code>ms8_visibility_rules_table</code>,
+  <code>ms8_frozen_tuple_xmin_zero_is_visible</code>, and
+  <code>ms8_visibility_active_in_snapshot_rules</code>.<sup class="cite"><a
+  href="#ref-1">1</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 920 350" role="img">
+      <title>MVCC out-of-place UPDATE with composite (key, rid) B+Tree entries and VACUUM
+      reclamation: before VACUUM both (id=1, p0:s0) and (id=1, p0:s1) coexist so old snapshot T3
+      reads v1 while new snapshot T4 reads v2; once T3 ends and oldest_visible_xid passes 2,
+      VACUUM removes the dead index entry, tombstones slot 0, and compacts page p0 without moving
+      slot 1's slot number.</title>
+      <defs>
+        <marker id="ms8-f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"></path>
+        </marker>
+      </defs>
+
+      <!-- Left title -->
+      <text x="262" y="24" class="d-text" font-weight="600" text-anchor="middle">Before VACUUM (T2 updated id=1; old snapshot T3 still active)</text>
+
+      <!-- Left B+Tree leaf -->
+      <rect x="20" y="38" width="484" height="68" rx="6" class="d-box-hl"></rect>
+      <text x="34" y="58" class="d-text-sm" font-weight="600">B+Tree leaf — composite (key, rid) allows duplicate key with distinct rids</text>
+      <rect x="34" y="68" width="212" height="28" rx="4" class="d-box-warn"></rect>
+      <text x="140" y="87" class="d-mono" text-anchor="middle">(id=1, p0:s0)</text>
+      <rect x="266" y="68" width="224" height="28" rx="4" class="d-box-good"></rect>
+      <text x="378" y="87" class="d-mono" text-anchor="middle">(id=1, p0:s1)</text>
+
+      <!-- Arrows index -> heap -->
+      <path d="M 140 96 V 146" class="d-line" marker-end="url(#ms8-f2-arr)"></path>
+      <path d="M 378 96 V 146" class="d-line-hl" marker-end="url(#ms8-f2-arr)"></path>
+
+      <!-- Left Heap Page p0 -->
+      <rect x="20" y="148" width="484" height="118" rx="6" class="d-box"></rect>
+      <text x="34" y="168" class="d-text-sm" font-weight="600">Heap Page p0 — out-of-place UPDATE stamps old xmax, inserts new version</text>
+
+      <rect x="34" y="180" width="214" height="74" rx="5" class="d-box-warn"></rect>
+      <text x="141" y="199" class="d-mono" text-anchor="middle">slot 0 (p0:s0) · v1</text>
+      <text x="141" y="218" class="d-mono-sm" text-anchor="middle">xmin=1, xmax=2</text>
+      <text x="141" y="238" class="d-mono-sm" text-anchor="middle">(id=1, bal=100)</text>
+
+      <rect x="266" y="180" width="224" height="74" rx="5" class="d-box-good"></rect>
+      <text x="378" y="199" class="d-mono" text-anchor="middle">slot 1 (p0:s1) · v2</text>
+      <text x="378" y="218" class="d-mono-sm" text-anchor="middle">xmin=2, xmax=0</text>
+      <text x="378" y="238" class="d-mono-sm" text-anchor="middle">(id=1, bal=250)</text>
+
+      <!-- Snapshot verdict boxes -->
+      <rect x="20" y="282" width="232" height="50" rx="5" class="d-box"></rect>
+      <text x="136" y="302" class="d-mono-sm" text-anchor="middle">T3 snap (active={2})</text>
+      <text x="136" y="320" class="d-text-sm" text-anchor="middle">sees v1 (R9), hides v2 (R5)</text>
+
+      <rect x="268" y="282" width="236" height="50" rx="5" class="d-box"></rect>
+      <text x="386" y="302" class="d-mono-sm" text-anchor="middle">T4 snap (began after T2)</text>
+      <text x="386" y="320" class="d-text-sm" text-anchor="middle">hides v1 (R10), sees v2 (R6)</text>
+
+      <!-- Transition arrow -->
+      <text x="538" y="150" class="d-text-sm" text-anchor="middle">T3 ends</text>
+      <text x="538" y="164" class="d-mono-sm" text-anchor="middle">horizon&gt;2</text>
+      <text x="538" y="178" class="d-text-sm" text-anchor="middle">VACUUM</text>
+      <path d="M 510 192 H 566" class="d-line-hl" marker-end="url(#ms8-f2-arr)"></path>
+
+      <!-- Right title -->
+      <text x="738" y="24" class="d-text" font-weight="600" text-anchor="middle">After VACUUM + HeapPage::compact()</text>
+
+      <!-- Right B+Tree leaf -->
+      <rect x="574" y="38" width="328" height="68" rx="6" class="d-box-hl"></rect>
+      <text x="588" y="58" class="d-text-sm" font-weight="600">B+Tree::delete(1, p0:s0) removes only dead rid</text>
+      <rect x="588" y="68" width="136" height="28" rx="4" class="d-box-bad" stroke-dasharray="4 3"></rect>
+      <text x="656" y="87" class="d-text-sm" text-anchor="middle">(1, p0:s0) deleted</text>
+      <rect x="736" y="68" width="152" height="28" rx="4" class="d-box-good"></rect>
+      <text x="812" y="87" class="d-mono" text-anchor="middle">(id=1, p0:s1)</text>
+
+      <!-- Arrow right index -> heap -->
+      <path d="M 812 96 V 146" class="d-line-hl" marker-end="url(#ms8-f2-arr)"></path>
+
+      <!-- Right Heap Page p0 -->
+      <rect x="574" y="148" width="328" height="118" rx="6" class="d-box"></rect>
+      <text x="588" y="168" class="d-text-sm" font-weight="600">Heap Page p0 — dead body reclaimed, slot # intact</text>
+
+      <rect x="588" y="180" width="124" height="74" rx="5" class="d-box-bad" stroke-dasharray="4 3"></rect>
+      <text x="650" y="206" class="d-mono-sm" text-anchor="middle">slot 0</text>
+      <text x="650" y="224" class="d-mono-sm" text-anchor="middle">TOMBSTONE</text>
+      <text x="650" y="242" class="d-text-sm" text-anchor="middle">0 body bytes</text>
+
+      <rect x="724" y="180" width="164" height="74" rx="5" class="d-box-good"></rect>
+      <text x="806" y="199" class="d-mono" text-anchor="middle">slot 1 (p0:s1)</text>
+      <text x="806" y="218" class="d-mono-sm" text-anchor="middle">repacked at page end</text>
+      <text x="806" y="238" class="d-text-sm" text-anchor="middle">slot # unchanged!</text>
+
+      <!-- Right summary -->
+      <rect x="574" y="282" width="328" height="50" rx="5" class="d-box-good"></rect>
+      <text x="738" y="302" class="d-text-sm" text-anchor="middle">upper advances → free_space() grows</text>
+      <text x="738" y="320" class="d-text-sm" text-anchor="middle">p0:s1 never shifts → zero live index rewrites</text>
+    </svg>
+    <figcaption>Figure 2 — How Milestone 5's composite <code>(key, rid)</code> B+Tree,
+    out-of-place MVCC <code>UPDATE</code>, and slot-preserving <code>HeapPage::compact()</code>
+    fit together across a tuple's lifecycle.<sup class="cite"><a href="#ref-1">1</a></sup><sup
+    class="cite"><a href="#ref-4">4</a></sup></figcaption>
+  </figure>
+
   <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <p>Build from the pure logic outward to storage compaction and SQL integration, turning each
+  crate's <code>ms8_</code> tests green as you go.</p>
+
   <ol>
-    <li><strong><code>is_visible</code> first, as a pure function.</strong> No manager, no
-      storage — just (meta, snapshot, oracle) → bool, structured as the module's three cases by
-      creator status. The provided table-driven test enumerates all ten rules; make it green
-      before touching anything stateful. This function is 40 lines and the heart of the
-      milestone.</li>
-    <li><strong>TransactionManager next.</strong> One mutex over {next_id, states map, active
-      set, write sets}. <code>begin</code>/<code>commit</code>/<code>abort</code> are small
-      critical sections; keep the commit-time conflict check inside the same lock that flips
-      the state to Committed, or two racing commits can both pass the check.</li>
-    <li><strong>Thread the snapshot through ExecContext.</strong> The context gains a current
-      transaction slot; SeqScan and IndexScan filter every tuple through
-      <code>snapshot.is_visible(meta, oracle)</code> before anything else sees it. The oracle
-      is a closure over <code>TransactionManager::is_committed</code>.</li>
-    <li><strong>Stamp the write paths.</strong> Insert/Delete/Update executors take the current
-      txid from the context. Update is delete-then-insert on the same heap — resist any "small
-      update optimization"; version history is the feature.</li>
-    <li><strong>Wire BEGIN/COMMIT/ROLLBACK.</strong> They have parsed since Milestone 3;
-      execution is a session-state change plus manager calls. Autocommit wraps everything else.</li>
-    <li><strong>Conflict detection.</strong> Record writes as you stamp them; implement the
-      commit check; surface <code>Error::Serialization</code> through the REPL as a clean
-      retryable message, the way Postgres tells applications to treat
-      40001.<sup class="cite"><a href="#ref-2">2</a></sup></li>
-    <li><strong>Anomaly scripts.</strong> Now run the provided ms8_ scenario tests: they script
-      two interleaved transactions through the manager exactly like the module's anomaly zoo —
-      lost update prevented, fuzzy read prevented, phantom prevented, and
-      <code>ms8_write_skew_is_documented</code> asserting the skew <em>succeeds</em>. When that
-      last one passes, read its doc comment out loud; it is the course's honesty pledge.<sup class="cite"><a href="#ref-3">3</a></sup></li>
-    <li><strong>VACUUM last.</strong> Compute the horizon, sweep the heaps, drop dead index
-      entries. Verify with the before/after page-count assertions and re-run the whole
-      <code>slt_all</code> suite — vacuum must be invisible to correctness.</li>
+    <li>
+      <p><strong>Implement <code>Snapshot::is_visible</code> first.</strong> It is roughly 30
+      lines of pure Rust with zero locks and zero I/O. Structure it cleanly around the two
+      symmetric helpers from the table above (creator visibility with the <code>xmin == 0</code>
+      frozen fast path, then deleter visibility). Run
+      <code>cargo test -p ferricdb-txn -- --include-ignored ms8_visibility</code> and
+      <code>ms8_frozen</code> until all three visibility tests pass.</p>
+    </li>
+
+    <li>
+      <p><strong>Build <code>TransactionManager</code> behind one mutex.</strong> Inside
+      <code>ManagerState</code> (guarded by <code>self.inner: Mutex&lt;ManagerState&gt;</code>),
+      keep: <code>next_txid: TxnId</code> (initialized to <code>1</code>),
+      <code>states: HashMap&lt;TxnId, TxnState&gt;</code>,
+      <code>active: BTreeMap&lt;TxnId, TxnId&gt;</code> (mapping each active txn id to its
+      captured <code>snapshot.xmin</code>, so both the active set and
+      <code>oldest_visible_xid()</code> are O(active) or O(1)),
+      <code>in_flight_writes: HashMap&lt;TxnId, HashSet&lt;RecordId&gt;&gt;</code>, and
+      <code>committed_writes: Vec&lt;(TxnId, HashSet&lt;RecordId&gt;)&gt;</code> (or map keyed by
+      <code>TxnId</code>).</p>
+      <ul>
+        <li><code>begin()</code>: lock once; allocate <code>id = next_txid; next_txid += 1;</code>
+          build <code>active: BTreeSet&lt;TxnId&gt;</code> from the keys currently in
+          <code>state.active</code> (which does <em>not</em> include <code>id</code>); compute
+          <code>xmin = active.first().copied().unwrap_or(id)</code>; set <code>xmax = id + 1</code>;
+          insert <code>id</code> into <code>states</code> as <code>Active</code> and into
+          <code>state.active</code> with value <code>xmin</code>; return
+          <code>Arc::new(Transaction { id, snapshot })</code>.</li>
+        <li><code>record_write(txn, rid)</code>: lock and insert <code>rid</code> into
+          <code>in_flight_writes[txn.id()]</code>.</li>
+        <li><code>commit(txn)</code>: lock once; take <code>my_writes</code>; scan every
+          <code>(cid, c_writes)</code> in <code>committed_writes</code> where <code>cid</code>
+          was concurrent with <code>txn</code> (i.e.,
+          <code>txn.snapshot().active.contains(&amp;cid) || cid &gt;= txn.snapshot().xmax</code>).
+          If <code>my_writes</code> shares any <code>RecordId</code> with <code>c_writes</code>,
+          set <code>states[id] = TxnState::Aborted</code>, remove <code>id</code> from
+          <code>state.active</code>, and return <code>Err(Error::Serialization(...))</code>.
+          Otherwise set <code>states[id] = TxnState::Committed</code>, remove <code>id</code>
+          from <code>state.active</code>, store <code>(id, my_writes)</code> in
+          <code>committed_writes</code>, and return <code>Ok(())</code>.</li>
+        <li><code>abort(txn)</code>: lock once; set <code>states[id] = TxnState::Aborted</code>,
+          remove <code>id</code> from <code>state.active</code>, and discard
+          <code>in_flight_writes.remove(&amp;id)</code> so aborted writers never conflict with
+          anyone.</li>
+        <li><code>oldest_visible_xid()</code>: lock once; return the minimum
+          <code>snapshot.xmin</code> stored in <code>state.active.values()</code>, or
+          <code>state.next_txid</code> if no transactions are active.<sup class="cite"><a
+          href="#ref-4">4</a></sup></li>
+      </ul>
+      <p>Run <code>cargo test -p ferricdb-txn -- --include-ignored ms8_</code> — all 11
+      transaction-manager tests (including <code>ms8_write_skew_is_documented</code> and the
+      8-thread <code>ms8_concurrent_begins_are_atomic</code> stress test) should now pass!</p>
+    </li>
+
+    <li>
+      <p><strong>Implement <code>HeapPage::compact()</code> and parse <code>VACUUM</code>.</strong>
+      In <code>crates/storage/src/lib.rs</code>, implement <code>HeapPage::compact(&amp;mut self) -&gt; usize</code>:
+      read <code>old_upper</code>; iterate <code>slot in 0..self.slot_count()</code> collecting
+      every live slot's <code>(slot, meta, payload.to_vec())</code>; reset
+      <code>upper = PAGE_SIZE</code>; rewrite each live entry tightly backward from
+      <code>PAGE_SIZE</code>, updating that exact slot's line pointer offset while keeping dead
+      slots tombstoned and <code>slot_count</code> untouched; write the updated <code>upper</code>
+      to the 28-byte header and return <code>new_upper.saturating_sub(old_upper)</code>. Verify
+      with <code>cargo test -p ferricdb-storage -- --include-ignored ms8_</code>.</p>
+      <p>In <code>crates/sql/src/lib.rs</code>, add the one-line parser branch mapping
+      <code>Keyword::Vacuum</code> to <code>ast::Statement::Vacuum</code> (and wire
+      <code>BoundStatement::Vacuum</code> in <code>crates/exec/src/binder.rs</code>). Verify with
+      <code>cargo test -p ferricdb-sql -- --include-ignored ms8_</code>.</p>
+    </li>
+
+    <li>
+      <p><strong>Thread snapshots through <code>SeqScan</code> and <code>IndexScan</code>.</strong>
+      Every query executing through <code>execute()</code> now runs inside an active
+      <code>Arc&lt;Transaction&gt;</code> — either the session's explicit transaction in
+      <code>ctx.current_txn</code>, or a fresh autocommit transaction created at the start of the
+      statement. Pass that <code>Arc&lt;Transaction&gt;</code> (or clone its
+      <code>Snapshot</code>) into <code>SeqScan</code> and <code>IndexScan</code>. Before
+      deserializing or evaluating a filter predicate on any heap tuple, check
+      <code>snapshot.is_visible(&amp;meta, &amp;|x| txn_manager.is_committed(x))</code> and skip
+      invisible versions. Because <code>Catalog::bootstrap</code> and earlier DDL wrote system
+      tuples with <code>xmin == 0</code>, the frozen-tuple rule ensures system tables and
+      pre-existing rows remain visible automatically.</p>
+    </li>
+
+    <li>
+      <p><strong>Convert DML executors to MVCC writes with first-updater-wins.</strong></p>
+      <ul>
+        <li><code>Insert</code>: write every new tuple with
+          <code>TupleMeta { xmin: my_id, xmax: 0 }</code>, call
+          <code>txn_manager.record_write(&amp;txn, rid)</code>, and insert
+          <code>(key, rid)</code> into every index in <code>table.indexes</code> (for non-NULL
+          keys).</li>
+        <li><code>Delete</code>: materialize target <code>RecordId</code>s from the child scan
+          first (preserving the Halloween guard). For each <code>rid</code>, check
+          first-updater-wins and stamp <code>xmax</code> atomically inside a single
+          <code>ctx.store.with_page_mut(rid.page_id, ...)</code> call via
+          <code>HeapPage::attach</code>: read <code>(meta, _)</code>, abort with
+          <code>Error::Serialization</code> if <code>meta.xmax != 0 &amp;&amp; meta.xmax != my_id
+          &amp;&amp; (txn_manager.is_active(meta.xmax) || txn_manager.is_committed(meta.xmax))</code>,
+          otherwise call <code>page.set_meta(rid.slot, TupleMeta { xmin: meta.xmin, xmax: my_id })</code>
+          before releasing the latch, then call <code>txn_manager.record_write(&amp;txn, rid)</code>.
+          Do <em>not</em> call <code>heap.delete(rid)</code> or remove index entries here — older
+          snapshots may still need that version!</li>
+        <li><code>Update</code>: materialize target <code>(old_rid, old_values)</code> pairs first.
+          For each row, perform the exact same atomic check-and-stamp on <code>old_rid</code> via
+          <code>with_page_mut</code> + <code>HeapPage::attach</code> (first-updater-wins check, then
+          <code>set_meta</code> with <code>xmax = my_id</code>), serialize the updated row and call
+          <code>heap.insert(TupleMeta { xmin: my_id, xmax: 0 }, &amp;new_bytes)</code> to obtain
+          <code>new_rid</code>, record both <code>old_rid</code> and <code>new_rid</code> with
+          <code>record_write</code>, and insert <code>(new_key, new_rid)</code> (for non-NULL keys)
+          into every index on the table (leaving <code>(old_key, old_rid)</code> untouched for older
+          snapshots).</li>
+      </ul>
+    </li>
+
+    <li>
+      <p><strong>Wire <code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code>, and
+      <code>failed_txn</code> in <code>execute()</code>.</strong> Check
+      <code>*ctx.failed_txn.lock().unwrap()</code> at the top of each statement inside an
+      explicit transaction: if <code>true</code> and the statement is not <code>Rollback</code>,
+      return <code>Err(Error::Execution("current transaction is aborted; run ROLLBACK".into()))</code>.
+      On <code>BEGIN</code>, call <code>txn_manager.begin()</code> and store the result in
+      <code>ctx.current_txn</code> (tag <code>"BEGIN"</code>). On <code>COMMIT</code>, take the
+      transaction out of <code>ctx.current_txn</code> and call <code>txn_manager.commit(&amp;txn)</code>
+      — if it returns <code>Err(Error::Serialization(e))</code>, the transaction has already been
+      marked aborted by the manager, so clear <code>failed_txn = false</code> and propagate the
+      error (tag <code>"COMMIT"</code> on success). On <code>ROLLBACK</code>, take any open
+      transaction, call <code>txn_manager.abort(&amp;txn)</code>, reset
+      <code>failed_txn = false</code>, and return tag <code>"ROLLBACK"</code>. For any error
+      during a statement inside an explicit transaction (such as a bind error or first-updater-wins
+      <code>Error::Serialization</code>), mark <code>failed_txn = true</code> (and if it was a
+      serialization conflict, aborting immediately or waiting for explicit <code>ROLLBACK</code>
+      must be consistent — ensure <code>ms8_sql_transactions_commit_rollback_isolation</code> and
+      PostgreSQL error semantics stay clean).</p>
+    </li>
+
+    <li>
+      <p><strong>Implement <code>VACUUM</code> execution.</strong> Dispatch
+      <code>BoundStatement::Vacuum</code> in <code>execute()</code> (disallowing it inside an
+      explicit transaction, just as PostgreSQL does, and running against
+      <code>horizon = ctx.txn_manager.oldest_visible_xid()</code>). For each table in
+      <code>ctx.catalog.tables()?</code>, walk the table's heap page chain page by page. For each
+      live slot on a page with <code>(meta, bytes)</code>, check whether it is dead and below the
+      horizon:</p>
+      <pre><code>// Reclaim condition for a tuple version at (page_id, slot) with meta:
+let aborted_insert = meta.xmin != 0
+    &amp;&amp; !txn_manager.is_committed(meta.xmin)
+    &amp;&amp; meta.xmin &lt; horizon;
+let old_committed_delete = meta.xmax != 0
+    &amp;&amp; txn_manager.is_committed(meta.xmax)
+    &amp;&amp; meta.xmax &lt; horizon;
+if aborted_insert || old_committed_delete {
+    // 1. Deserialize tuple and remove (key, rid) from every index via BPlusTree::delete
+    //    (skipping Value::Null keys, matching Insert — BPlusTree rejects NULL)
+    // 2. Tombstone slot via HeapPage::delete(slot)
+}
+// 3. After sweeping the page, call HeapPage::compact() if any slot was tombstoned</code></pre>
+      <p>Return tag <code>"VACUUM"</code>. Notice why step 1 must delete the exact
+      <code>(key, rid)</code> pair: the newer live version of the same row may share
+      <code>key</code> under a different <code>new_rid</code>, and composite
+      <code>BPlusTree::delete(&amp;key, old_rid)</code> removes only the dead pointer without
+      disturbing the live one!</p>
+    </li>
   </ol>
 
-  <h2 id="sec-tests">Test plan</h2>
-  <pre><code>cargo test -p ferricdb-txn  -- --include-ignored ms8_
+  <figure>
+    <svg viewBox="0 0 920 330" role="img">
+      <title>Side-by-side comparison of first-committer-wins conflict prevention on overlapping
+      writes (lost update aborted with Error::Serialization / SQLSTATE 40001) versus write skew
+      on disjoint writes (both transactions commit under Snapshot Isolation, documented by
+      ms8_write_skew_is_documented).</title>
+      <defs>
+        <marker id="ms8-f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"></path>
+        </marker>
+      </defs>
 
-# end-to-end regressions — MVCC must not change single-session results
-cargo test -p ferricdb -- --include-ignored slt_all
-cargo test -p ferricdb-exec -- --include-ignored ms4_</code></pre>
-  <p>The ms8_ group: the ten-rule visibility table; snapshot-capture atomicity under concurrent
-  begins; the first-committer-wins pair; the four anomaly scripts; write skew documented;
-  <code>oldest_visible_xid</code> with overlapping snapshots; vacuum horizon safety (a version
-  still visible to an old snapshot survives vacuum).</p>
+      <!-- Left Panel: First-Committer-Wins -->
+      <text x="230" y="24" class="d-text" font-weight="600" text-anchor="middle">First-Committer-Wins: Overlapping Writes</text>
+      <rect x="44" y="38" width="142" height="26" rx="4" class="d-box"></rect>
+      <text x="115" y="55" class="d-mono-sm" text-anchor="middle">T1 (snap sees v0)</text>
+      <rect x="274" y="38" width="142" height="26" rx="4" class="d-box"></rect>
+      <text x="345" y="55" class="d-mono-sm" text-anchor="middle">T2 (snap sees v0)</text>
+      <line x1="115" y1="64" x2="115" y2="296" class="d-line" stroke-dasharray="3 3"></line>
+      <line x1="345" y1="64" x2="345" y2="296" class="d-line" stroke-dasharray="3 3"></line>
+
+      <rect x="26" y="76" width="178" height="28" rx="4" class="d-box"></rect>
+      <text x="115" y="94" class="d-mono-sm" text-anchor="middle">READ p0:s0 (bal=100)</text>
+
+      <rect x="256" y="110" width="178" height="28" rx="4" class="d-box"></rect>
+      <text x="345" y="128" class="d-mono-sm" text-anchor="middle">READ p0:s0 (bal=100)</text>
+
+      <rect x="26" y="146" width="178" height="30" rx="4" class="d-box-hl"></rect>
+      <text x="115" y="165" class="d-mono-sm" text-anchor="middle">WRITE p0:s0 (+20)</text>
+
+      <rect x="256" y="184" width="178" height="30" rx="4" class="d-box-hl"></rect>
+      <text x="345" y="203" class="d-mono-sm" text-anchor="middle">WRITE p0:s0 (+50)</text>
+
+      <rect x="26" y="222" width="178" height="28" rx="4" class="d-box-good"></rect>
+      <text x="115" y="240" class="d-mono-sm" text-anchor="middle">COMMIT → Ok(())</text>
+
+      <rect x="256" y="258" width="178" height="34" rx="4" class="d-box-bad"></rect>
+      <text x="345" y="273" class="d-mono-sm" text-anchor="middle">COMMIT → Err(40001)</text>
+      <text x="345" y="287" class="d-text-sm" text-anchor="middle">Error::Serialization</text>
+
+      <path d="M 204 236 L 254 268" class="d-line-hl" marker-end="url(#ms8-f3-arr)"></path>
+      <text x="230" y="314" class="d-text-sm" text-anchor="middle">Write sets collide on {p0:s0} → T2 aborts &amp; retries</text>
+
+      <!-- Divider -->
+      <path d="M 460 16 V 318" class="d-line" stroke-dasharray="5 4"></path>
+
+      <!-- Right Panel: Write Skew -->
+      <text x="690" y="24" class="d-text" font-weight="600" text-anchor="middle">Write Skew: Disjoint Writes (SI Allows)</text>
+      <rect x="504" y="38" width="142" height="26" rx="4" class="d-box"></rect>
+      <text x="575" y="55" class="d-mono-sm" text-anchor="middle">T1 (Alice off call)</text>
+      <rect x="734" y="38" width="142" height="26" rx="4" class="d-box"></rect>
+      <text x="805" y="55" class="d-mono-sm" text-anchor="middle">T2 (Bob off call)</text>
+      <line x1="575" y1="64" x2="575" y2="296" class="d-line" stroke-dasharray="3 3"></line>
+      <line x1="805" y1="64" x2="805" y2="296" class="d-line" stroke-dasharray="3 3"></line>
+
+      <rect x="486" y="76" width="178" height="28" rx="4" class="d-box"></rect>
+      <text x="575" y="94" class="d-mono-sm" text-anchor="middle">READ Alice &amp; Bob (2)</text>
+
+      <rect x="716" y="110" width="178" height="28" rx="4" class="d-box"></rect>
+      <text x="805" y="128" class="d-mono-sm" text-anchor="middle">READ Alice &amp; Bob (2)</text>
+
+      <rect x="486" y="146" width="178" height="30" rx="4" class="d-box-warn"></rect>
+      <text x="575" y="165" class="d-mono-sm" text-anchor="middle">WRITE Alice (p1:s0)</text>
+
+      <rect x="716" y="184" width="178" height="30" rx="4" class="d-box-warn"></rect>
+      <text x="805" y="203" class="d-mono-sm" text-anchor="middle">WRITE Bob (p1:s1)</text>
+
+      <rect x="486" y="222" width="178" height="28" rx="4" class="d-box-good"></rect>
+      <text x="575" y="240" class="d-mono-sm" text-anchor="middle">COMMIT → Ok(())</text>
+
+      <rect x="716" y="258" width="178" height="34" rx="4" class="d-box-warn"></rect>
+      <text x="805" y="273" class="d-mono-sm" text-anchor="middle">COMMIT → Ok(()) !</text>
+      <text x="805" y="287" class="d-text-sm" text-anchor="middle">0 doctors left on call</text>
+
+      <text x="690" y="314" class="d-text-sm" text-anchor="middle">{p1:s0} ∩ {p1:s1} = ∅ → permitted under SI (closed in S2)</text>
+    </svg>
+    <figcaption>Figure 3 — Left: overlapping write sets trigger first-committer-wins
+    (<code>Error::Serialization</code>, SQLSTATE <code>40001</code>).<sup class="cite"><a
+    href="#ref-2">2</a></sup> Right: disjoint write sets let write skew commit under Snapshot
+    Isolation, documented honestly by <code>ms8_write_skew_is_documented</code>.<sup
+    class="cite"><a href="#ref-3">3</a></sup></figcaption>
+  </figure>
+
+  <h2 id="sec-tests">Test plan</h2>
+  <p>Milestone 8 exercises four crates plus end-to-end regressions. Run every provided
+  <code>ms8_</code> test group from <code>course/ferricdb/</code>:</p>
+  <pre><code># 1. Visibility rules, TransactionManager, conflicts, write skew, concurrency (11 tests)
+cargo test -p ferricdb-txn     -- --include-ignored ms8_
+
+# 2. Slot-preserving heap compaction for VACUUM (1 test)
+cargo test -p ferricdb-storage -- --include-ignored ms8_
+
+# 3. VACUUM SQL parsing (1 test)
+cargo test -p ferricdb-sql     -- --include-ignored ms8_
+
+# 4. Multi-session SQL transactions, isolation, ROLLBACK, VACUUM (1 test)
+cargo test -p ferricdb-exec    -- --include-ignored ms8_
+
+# 5. End-to-end regressions — MVCC must not break single-session SQL behavior
+cargo test -p ferricdb         -- --include-ignored slt_all
+cargo test -p ferricdb-exec    -- --include-ignored ms4_</code></pre>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Crate</th><th>Provided <code>ms8_</code> tests</th><th>What they verify</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ferricdb-txn</code></td>
+          <td><code>ms8_visibility_rules_table</code>, <code>ms8_frozen_tuple_xmin_zero_is_visible</code>, <code>ms8_visibility_active_in_snapshot_rules</code>, <code>ms8_begin_assigns_increasing_ids_and_snapshots</code>, <code>ms8_first_committer_wins</code>, <code>ms8_no_conflict_when_not_concurrent</code>, <code>ms8_abort_frees_conflicts</code>, <code>ms8_fuzzy_read_prevented</code>, <code>ms8_write_skew_is_documented</code>, <code>ms8_oldest_visible_xid_tracks_active_snapshots</code>, <code>ms8_concurrent_begins_are_atomic</code></td>
+          <td>All 10 interdb §5.6 visibility rules plus <code>xmin == 0</code> frozen tuples, explicit <code>owner</code> snapshots, first-committer-wins abort + horizon release, sequential non-conflict, abort cleanup, fuzzy-read prevention, documented write skew, horizon tracking, and 8-thread atomic <code>begin()</code>.</td>
+        </tr>
+        <tr>
+          <td><code>ferricdb-storage</code></td>
+          <td><code>ms8_heap_page_compact_reclaims_space</code></td>
+          <td><code>HeapPage::compact()</code> reclaims dead tuple bytes into <code>free_space()</code> while keeping every live slot number and payload intact.</td>
+        </tr>
+        <tr>
+          <td><code>ferricdb-sql</code></td>
+          <td><code>ms8_vacuum_parse</code></td>
+          <td><code>VACUUM</code> parses to <code>ast::Statement::Vacuum</code>.</td>
+        </tr>
+        <tr>
+          <td><code>ferricdb-exec</code></td>
+          <td><code>ms8_sql_transactions_commit_rollback_isolation</code></td>
+          <td>Two isolated sessions via <code>ExecContext::new_session()</code> verify no dirty reads, clean <code>ROLLBACK</code>, snapshot isolation preventing fuzzy reads across commits, and post-commit <code>VACUUM</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p><strong>Recommended tests to add yourself:</strong> write three extra multi-session
+  integration tests in <code>crates/exec</code> using <code>ExecContext::new_session()</code>:
+  (1)&nbsp;<strong>phantom-read prevention</strong> (session A scans <code>WHERE age &gt; 30</code>,
+  session B inserts a matching row and commits, session A re-scans and still sees the original
+  count); (2)&nbsp;<strong><code>VACUUM</code> horizon safety</strong> (session A holds an open
+  snapshot while session B updates a row and commits, then <code>VACUUM</code> runs — assert
+  session A still reads the old version, and once session A commits, a second <code>VACUUM</code>
+  actually reclaims heap free space and deletes the stale B+Tree entry); and
+  (3)&nbsp;<strong>SQL-level write conflict</strong> (two sessions both update <code>id = 1</code>
+  and assert the loser receives <code>Error::Serialization</code> and does not clobber the
+  winner's <code>xmax</code>).</p>
 
   <h2 id="sec-pitfalls">Common pitfalls</h2>
   <div class="callout pitfall">
-    <span class="callout-title">A transaction that can't see its own writes</span>
-    <p><em>Symptom:</em> INSERT then SELECT in the same transaction returns nothing.
-    <em>Cause:</em> treating in-progress creators as invisible unconditionally — rule 4 without
-    rule 2's own-transaction exception. The symmetric bug (rule 7) makes your own deletes
-    visible to you. Both are single branches in <code>is_visible</code>; the table test names
-    them.</p>
+    <span class="callout-title">Pitfall — a transaction cannot see its own writes or still sees its own deletes</span>
+    <p><em>Symptom:</em> <code>INSERT</code> followed by <code>SELECT</code> inside the same
+    <code>BEGIN ... COMMIT</code> block returns zero rows, or <code>DELETE</code> followed by
+    <code>SELECT</code> still shows the deleted row. <em>Cause:</em> forgetting to check
+    <code>self.owner</code> before checking <code>committed(xid)</code> (missing Rules 2, 3, and
+    7). Because <code>Snapshot</code> carries <code>owner</code> explicitly, handle
+    <code>meta.xmin == self.owner</code> and <code>meta.xmax == self.owner</code> first — and
+    never include <code>owner</code> inside <code>snapshot.active</code>.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Snapshot race at begin</span>
-    <p><em>Symptom:</em> rare test flakes where a transaction sees a "future" commit.
-    <em>Cause:</em> assigning the txid and reading the active set in separate critical sections
-    — a transaction that starts between them is missing from your active list, so its later
-    commit looks like the past (rule 5 never fires). One lock, one capture.</p>
+    <span class="callout-title">Pitfall — single-<code>xmax</code> clobbering on concurrent writes</span>
+    <p><em>Symptom:</em> a committed <code>DELETE</code> or <code>UPDATE</code> mysteriously
+    comes back to life after a concurrent transaction aborts. <em>Cause:</em> relying solely on
+    commit-time first-committer-wins without checking <code>meta.xmax</code> before calling
+    <code>HeapFile::set_meta</code>. When <code>T1</code> stamps <code>xmax = T1</code> and
+    <code>T2</code> overwrites it with <code>xmax = T2</code> and then aborts, <code>T1</code>'s
+    stamp is lost forever. Enforce first-updater-wins before modifying <code>meta.xmax</code>.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Conflict check outside the commit lock</span>
-    <p><em>Symptom:</em> two transactions updating the same row both commit under stress.
-    <em>Cause:</em> check-then-commit as two steps. The check and the state flip must be atomic;
-    otherwise both pass the check against the same "nobody committed yet" world.</p>
+    <span class="callout-title">Pitfall — snapshot race or split commit lock</span>
+    <p><em>Symptom:</em> intermittent failures under <code>ms8_concurrent_begins_are_atomic</code>
+    or two concurrent writers both committing. <em>Cause:</em> allocating <code>next_txid</code>
+    and reading <code>active</code> under separate locks, or checking write-set conflicts before
+    releasing and re-acquiring the mutex to mark <code>Committed</code>. Keep both
+    <code>begin()</code> and <code>commit()</code> atomic inside a single critical section.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Vacuum eats a row someone can still see</span>
-    <p><em>Symptom:</em> a long-running transaction's second read of the same row returns
-    nothing. <em>Cause:</em> using "deleter committed" as the reclaim condition instead of
-    "deleter committed AND below every active snapshot's horizon". The watermark exists
-    precisely for this.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+    <span class="callout-title">Pitfall — forgetting to remove aborted losers from the active set</span>
+    <p><em>Symptom:</em> <code>ms8_first_committer_wins</code> fails its horizon assertion, or
+    <code>VACUUM</code> permanently stops reclaiming dead rows after a single conflict.
+    <em>Cause:</em> returning <code>Err(Error::Serialization)</code> from <code>commit()</code>
+    without flipping the loser to <code>TxnState::Aborted</code> and removing its id from
+    <code>state.active</code>. A stalled active entry pins <code>oldest_visible_xid()</code>
+    forever.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — <code>HeapPage::compact()</code> renumbering slots or <code>VACUUM</code> ignoring indexes</span>
+    <p><em>Symptom:</em> <code>IndexScan</code> returns wrong rows or crashes after
+    <code>VACUUM</code>. <em>Cause:</em> shifting live entries down to lower slot indexes during
+    compaction (invalidating every <code>RecordId</code> stored in B+Trees), or tombstoning dead
+    heap slots without calling <code>BPlusTree::delete(&amp;key, rid)</code> first. Always keep
+    each live tuple at its original slot index and remove dead <code>(key, rid)</code> pairs from
+    every index before tombstoning the slot.</p>
   </div>
 
   <h2 id="sec-done">Definition of done</h2>
   <ul>
-    <li>All <code>ms8_</code> tests pass, including the write-skew documentation test;
-      <code>slt_all</code> and earlier groups still pass.</li>
-    <li>Two REPL sessions demonstrate live: session A begins and reads a row; session B updates
-      it and commits; A re-reads the <em>old</em> value; after A commits and re-reads, the new
-      value appears.</li>
-    <li>Two sessions updating the same row: the second committer gets a serialization error and
-      succeeds on retry.</li>
-    <li>After a bulk UPDATE, <code>VACUUM</code> reclaims space (visible via a page-count or
-      free-space report) and nothing changes semantically.</li>
-    <li>You can state from memory which anomalies your database now prevents and the one it
-      documents instead of preventing.</li>
+    <li>All <code>ms8_</code> tests pass across all four crates (<code>ferricdb-txn</code>,
+      <code>ferricdb-storage</code>, <code>ferricdb-sql</code>, <code>ferricdb-exec</code>),
+      including <code>ms8_write_skew_is_documented</code>; <code>slt_all</code> and earlier
+      milestone suites still pass.</li>
+    <li>Multi-session integration tests using <code>ExecContext::new_session()</code> demonstrate
+      live in one process: session A begins and reads a row; session B updates it and commits;
+      session A re-reads the <em>old</em> value; after session A commits, a fresh read observes
+      the new value. (Note: two separate REPL OS processes do not share an in-memory
+      <code>TransactionManager</code> or buffer pool — interactive multi-client sessions over TCP
+      come alive in <a href="../milestone-10/index.html">Milestone 10</a>.)</li>
+    <li>Two concurrent sessions updating the same row trigger <code>Error::Serialization</code>
+      for the loser while preserving the winner's committed update intact, and a retry succeeds.</li>
+    <li>After a bulk <code>UPDATE</code> on an indexed table (and closing old snapshots),
+      <code>VACUUM</code> reclaims dead tuple bytes via <code>HeapPage::compact()</code> and
+      prunes dead <code>(key, rid)</code> entries from the B+Tree with zero semantic change.</li>
+    <li>You can state from memory the five anomalies FerricDB now prevents (dirty write, dirty
+      read, lost update, fuzzy read, phantom read) and the one anomaly it honestly documents
+      instead of preventing (write skew).<sup class="cite"><a href="#ref-3">3</a></sup></li>
   </ul>
 
   <h2 id="sec-quiz">Check your understanding</h2>
-  <fieldset class="quiz" data-explain="ROLLBACK just marks the transaction aborted — rule 1 makes every version it created invisible instantly, and its xmax stamps on other rows are ignored (deleter aborted, rule 6). The versions physically remain until VACUUM. Undo-by-bookkeeping is MVCC's structural gift; Milestone 9 shows what systems without it must do.">
-    <legend class="quiz-q">What work does ROLLBACK do to the heap pages?</legend>
-    <label><input type="radio" name="q1"> Restores before-images of every modified tuple</label>
-    <label><input type="radio" name="q1" data-correct> None — marking the transaction aborted makes its versions invisible by rule; VACUUM reclaims them later</label>
-    <label><input type="radio" name="q1"> Deletes the transaction's tuples immediately</label>
+  <fieldset class="quiz" data-explain="In Milestone 8 (before WAL exists), ROLLBACK marks the transaction Aborted in TransactionManager: visibility rules 1 and 6b immediately hide its inserts and ignore its xmax stamps, while dead tuples wait for VACUUM. In Milestone 9, adding ARIES WAL layers physical undo + CLRs on rollback and crash recovery plus TransactionManager::restore so committed state survives restarts.">
+    <legend class="quiz-q">1. How does <code>ROLLBACK</code> work in Milestone 8, and what does Milestone 9 add on top of it?</legend>
+    <label><input type="radio" name="q-ms8-1"> Milestone 8 rewrites the entire heap file from a backup copy; Milestone 9 removes MVCC</label>
+    <label><input type="radio" name="q-ms8-1" data-correct> Milestone 8 marks the txn <code>Aborted</code> so rules 1 and 6b hide its writes until <code>VACUUM</code>; Milestone 9 adds WAL-backed physical undo, CLRs, and crash recovery</label>
+    <label><input type="radio" name="q-ms8-1"> Milestone 8 ignores <code>ROLLBACK</code> because snapshot isolation never aborts</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
-  <fieldset class="quiz" data-explain="First-committer-wins compares write sets against transactions that committed AFTER my snapshot — concurrent ones. A transaction that committed before I began is simply part of my snapshot's world; conflicting with it is impossible by construction.">
-    <legend class="quiz-q">Against which transactions does the commit-time conflict check compare write sets?</legend>
-    <label><input type="radio" name="q2"> All transactions that ever wrote the same rows</label>
-    <label><input type="radio" name="q2" data-correct> Those that committed after my snapshot was taken — my concurrent peers</label>
-    <label><input type="radio" name="q2"> Only transactions still in progress at my commit</label>
+
+  <fieldset class="quiz" data-explain="First-committer-wins checks write-set intersections strictly against concurrent peers — transactions that committed after my snapshot was taken (in snapshot.active or >= snapshot.xmax). A transaction that committed before I began is already part of my snapshot's past, so updating a row it wrote is a normal sequential update, not a conflict.">
+    <legend class="quiz-q">2. Against which transactions does <code>TransactionManager::commit</code> compare write sets?</legend>
+    <label><input type="radio" name="q-ms8-2"> Every transaction that has ever written the same <code>RecordId</code> since database creation</label>
+    <label><input type="radio" name="q-ms8-2" data-correct> Concurrent peers that committed after my snapshot was captured</label>
+    <label><input type="radio" name="q-ms8-2"> Only transactions that aborted before my <code>COMMIT</code></label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Every heap tuple header has only one xmax field. Without checking meta.xmax before stamping (first-updater-wins), concurrent T2 could overwrite T1's committed or active xmax with T2 and later abort — causing Rule 6b (aborted deleter) to resurrect T1's deleted tuple!">
+    <legend class="quiz-q">3. Why must <code>UPDATE</code> and <code>DELETE</code> check <code>meta.xmax</code> before stamping (first-updater-wins) even though <code>commit()</code> checks write sets?</legend>
+    <label><input type="radio" name="q-ms8-3"> Because <code>HeapFile::set_meta</code> refuses to write non-zero values</label>
+    <label><input type="radio" name="q-ms8-3" data-correct> Because a tuple header holds only one <code>xmax</code>; letting a second writer overwrite it and later abort would resurrect the first writer's delete under Rule 6b</label>
+    <label><input type="radio" name="q-ms8-3"> Because <code>TransactionManager::commit</code> does not receive the transaction's write set</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
@@ -266,15 +944,15 @@ cargo test -p ferricdb-exec -- --include-ignored ms4_</code></pre>
     <h2 id="sec-sources">Primary sources</h2>
     <div class="refs">
       <ol>
-        <li id="ref-1">Hironobu Suzuki, The Internals of PostgreSQL, §5.5–5.6 — snapshots
-          (xmin:xmax:xip) and the ten visibility rules this milestone implements.
+        <li id="ref-1">Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, §5.5–5.6 — snapshots
+          (<code>xmin:xmax:xip</code>) and the ten visibility rules this milestone implements.
           <a href="https://www.interdb.jp/pg/pgsql05/06.html" rel="external">https://www.interdb.jp/pg/pgsql05/06.html</a></li>
         <li id="ref-2">PostgreSQL Documentation, "Transaction Isolation" — Repeatable Read as
-          snapshot isolation, serialization failures, and the 40001 retry discipline.
+          Snapshot Isolation, serialization failures, and the SQLSTATE <code>40001</code> retry
+          discipline.
           <a href="https://www.postgresql.org/docs/current/transaction-iso.html" rel="external">https://www.postgresql.org/docs/current/transaction-iso.html</a></li>
         <li id="ref-3">erikgrinaker/toydb — the MVCC design walkthrough and the documented
-          anomaly coverage (write skew possible without SSI) this milestone reproduces
-          honestly.
+          anomaly coverage (write skew possible without SSI) this milestone reproduces honestly.
           <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/mvcc.md</a>
           and <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/sql.md" rel="external">docs/sql.md</a></li>
         <li id="ref-4">CMU 15-445/645 (Fall 2025), Project #4 — the watermark (lowest read
@@ -285,17 +963,15 @@ cargo test -p ferricdb-exec -- --include-ignored ms4_</code></pre>
 
     <h2 id="sec-deeper">Go deeper</h2>
     <ul>
-      <li>The Internals of PostgreSQL, §5.7 — the worked visibility example across Read
-        Committed and Repeatable Read, with hint bits (a clog-lookup cache your oracle closure
-        approximates). <a href="https://www.interdb.jp/pg/pgsql05/07.html" rel="external">interdb.jp/pg/pgsql05/07.html</a></li>
-      <li>PostgreSQL docs, "Routine Vacuuming" — what production vacuum juggles beyond your
-        horizon sweep. <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html" rel="external">postgresql.org/docs/current/routine-vacuuming.html</a></li>
+      <li><em>The Internals of PostgreSQL</em>, §5.7 — the worked visibility example across Read
+        Committed and Repeatable Read, plus hint bits (an on-tuple commit-log cache).
+        <a href="https://www.interdb.jp/pg/pgsql05/07.html" rel="external">interdb.jp/pg/pgsql05/07.html</a></li>
+      <li>PostgreSQL docs, "Routine Vacuuming" — autovacuum, transaction-id wraparound freezing,
+        and visibility maps beyond this milestone's horizon sweep.
+        <a href="https://www.postgresql.org/docs/current/routine-vacuuming.html" rel="external">postgresql.org/docs/current/routine-vacuuming.html</a></li>
+      <li><a href="../stretch-s2/index.html">Stretch Milestone S2 · Serializable Snapshot Isolation
+        (SSI)</a> — preview how predicate tracking closes the write-skew test you passed today.</li>
     </ul>
-
-    <h2 id="sec-milestone">Milestone link</h2>
-    <p>Next on the path: <a href="../../modules/m10-logging-recovery/index.html">M10 · Logging
-    &amp; Recovery</a>, then <a href="../milestone-09/index.html">Milestone 9</a> — surviving
-    the crash.</p>
 
     <nav class="prevnext">
       <a href="../../modules/m09-transactions-mvcc/index.html"><span class="dir">← Previous</span> M09 · Transactions &amp; MVCC</a>
@@ -307,6 +983,7 @@ cargo test -p ferricdb-exec -- --include-ignored ms4_</code></pre>
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor", "index"],
     current: ["txn"],

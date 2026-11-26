@@ -8,11 +8,11 @@ rust-version.workspace = true
 [dependencies]
 ferricdb-common = { workspace = true }
 ferricdb-storage = { workspace = true }
-ferricdb-buffer = { workspace = true }
 ferricdb-index = { workspace = true }
 ferricdb-sql = { workspace = true }
 ferricdb-catalog = { workspace = true }
 ferricdb-txn = { workspace = true }
 
 [dev-dependencies]
+ferricdb-buffer = { workspace = true }
 tempfile = { workspace = true }

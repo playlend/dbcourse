@@ -35,6 +35,17 @@ pub enum BoundExpr {
         /// the catalog to type an expression).
         data_type: DataType,
     },
+    /// Positional reference into the immediate child operator's output row
+    /// (Milestone 6). Used in post-`Aggregate` projections and `ORDER BY`
+    /// clauses where `LogicalPlan::Aggregate` emits
+    /// `[group_by_0, ..., group_by_{g-1}, agg_0, ..., agg_{a-1}]`, so
+    /// referencing aggregate `k` is `InputRef { index: g + k, .. }`.
+    InputRef {
+        /// Flat offset in the immediate child operator's output row.
+        index: usize,
+        /// Inferred result type of that output column.
+        data_type: DataType,
+    },
     Unary(UnaryOp, Box<BoundExpr>),
     Binary(Box<BoundExpr>, BinaryOp, Box<BoundExpr>),
     IsNull(Box<BoundExpr>, bool),
@@ -162,6 +173,12 @@ impl<'a> Binder<'a> {
     /// name); type errors (`age + name`, a non-boolean WHERE); INSERT
     /// arity/type mismatches; UPDATEs of unknown columns; aggregates in
     /// Milestone-3-era queries (they bind from Milestone 6 on).
+    ///
+    /// **Implicit numeric widening:** an `Integer` expression is implicitly
+    /// widened to `Float` (e.g. via `BoundExpr::Cast(..., DataType::Float)`
+    /// or numeric promotion) when inserted into a `Float` column, assigned in
+    /// `UPDATE` to a `Float` column, or combined with a `Float` in arithmetic
+    /// or comparisons (`o_total > 100` where `o_total` is `FLOAT`).
     pub fn bind(&self, stmt: ast::Statement) -> Result<BoundStatement> {
         todo!("Milestone 3")
     }

@@ -12,3 +12,8 @@ ferricdb-catalog = { workspace = true }
 ferricdb-txn = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+
+[dev-dependencies]
+ferricdb-storage = { workspace = true }
+ferricdb-buffer = { workspace = true }
+tempfile = { workspace = true }

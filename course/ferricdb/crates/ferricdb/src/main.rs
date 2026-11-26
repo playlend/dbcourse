@@ -15,7 +15,7 @@ fn main() -> ExitCode {
     let mut db_path: Option<PathBuf> = None;
     let mut serve: Option<String> = None;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--db" => match args.next() {
@@ -23,8 +23,12 @@ fn main() -> ExitCode {
                 None => return usage("--db needs a path"),
             },
             "--serve" => {
-                // optional address; default lives in ServerConfig
-                serve = Some(args.next().unwrap_or_else(|| "127.0.0.1:5433".to_string()));
+                // optional address; only consume the next arg if it isn't another flag
+                let addr = match args.peek() {
+                    Some(next) if !next.starts_with('-') => args.next().unwrap(),
+                    _ => "127.0.0.1:5433".to_string(),
+                };
+                serve = Some(addr);
             }
             "--help" | "-h" => {
                 println!("ferricdb [--db <path>] [--serve [addr]]");

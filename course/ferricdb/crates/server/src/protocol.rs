@@ -20,7 +20,7 @@
 //!   4 bytes and *excludes* the type byte. An empty-body message (e.g.
 //!   `Sync`) therefore has length 4.
 //! * A length smaller than 4 can never be valid and must be rejected with
-//!   [`Error::Protocol`].
+//!   [`ferricdb_common::Error::Protocol`].
 //! * Strings on the wire are NUL-terminated UTF-8 ("C strings") unless noted.
 //!
 //! The **startup packet is the one exception**: it has *no type byte*. Its
@@ -34,7 +34,8 @@
 //!
 //! | type | message | body |
 //! |------|---------|------|
-//! | —    | [`FrontendMessage::StartupMessage`] | Int32 version, `key\0value\0`… pairs, final `\0` |
+//! | —    | [`FrontendMessage::SslRequest`] | Int32 80877103 (no params; total length = 8) |
+//! | —    | [`FrontendMessage::StartupMessage`] | Int32 version (`196608`), `key\0value\0`… pairs, final `\0` |
 //! | `Q`  | [`FrontendMessage::Query`] | SQL text as C string |
 //! | `P`  | [`FrontendMessage::Parse`] | statement name C string, SQL C string, Int16 n, n × Int32 param type OIDs |
 //! | `B`  | [`FrontendMessage::Bind`] | portal C string, statement C string, Int16 0 (format codes, starter always 0), Int16 n params, n × (Int32 len or -1 for NULL, then bytes), Int16 0 (result formats) |
@@ -64,14 +65,28 @@
 //! (`D` and `E` appear in both tables — the two directions are independent
 //! namespaces, exactly as in PostgreSQL.)
 //!
-//! # Out of scope
+//! # SSL / TLS negotiation (`SSLRequest`)
 //!
-//! Real clients may open with an `SSLRequest` or `CancelRequest` packet
-//! (special magic version numbers 80877103 / 80877102 instead of 196608).
-//! The starter does not model them: decode them as [`Error::Protocol`] and
-//! tell `psql` to skip TLS with `sslmode=disable`. (Stretch goal: answer
-//! `SSLRequest` with a single `'N'` byte in the accept loop before the
-//! startup packet, so a default `psql` invocation works too.)
+//! Real PostgreSQL clients (`psql` with its default `sslmode=prefer`, libpq,
+//! drivers) open every TCP connection with an 8-byte **`SSLRequest`** packet:
+//! `[length = 8 (Int32), code = 80877103 (Int32)]` (no type byte).
+//!
+//! [`read_message`] with `startup = true` decodes this as
+//! [`FrontendMessage::SslRequest`]. The server's accept loop replies with a
+//! single byte:
+//!
+//! * `b'N'` — decline TLS and continue reading the real `StartupMessage` on
+//!   the same TCP stream (required for Milestone 10 so plain
+//!   `psql -h 127.0.0.1 -p 5433` connects without needing `sslmode=disable`);
+//! * `b'S'` — accept TLS and wrap the TCP stream in a TLS handshake before
+//!   reading `StartupMessage` (documented optional SSL/TLS upgrade in
+//!   Milestone 10 & Module 11).
+//!
+//! Unknown startup codes (such as `CancelRequest` = `80877102`) are rejected
+//! with [`ferricdb_common::Error::Protocol`]. Note also that the `Int32` length header is
+//! **signed** — always decode it as `i32` so negative lengths (e.g. `-1`)
+//! fail immediately with `Error::Protocol` instead of waiting forever for
+//! `u32::MAX` bytes.
 
 use bytes::BytesMut;
 use ferricdb_common::Result;
@@ -80,17 +95,27 @@ use ferricdb_common::Result;
 /// Int32 of every startup packet body must equal this.
 pub const PROTOCOL_VERSION: u32 = 196608;
 
+/// Special startup request code sent by PostgreSQL clients probing for TLS:
+/// `(1234 << 16) | 5679` = 80877103.
+pub const SSL_REQUEST_CODE: u32 = 80877103;
+
 /// A message sent by the client (frontend) to the server (backend).
 ///
 /// Field layouts are documented in the [module docs](self); the extended
 /// query protocol messages (`Parse`/`Bind`/`Describe`/`Execute`/`Sync`) are
-/// a Milestone 10 stretch goal — the simple-query flow only needs
-/// `StartupMessage`, `Query`, `Terminate`, and (with auth) `PasswordMessage`.
+/// codec-tested in Milestone 10 and optional in the live server loop — the
+/// simple-query flow needs `SslRequest`, `StartupMessage`, `Query`,
+/// `Terminate`, and (with auth) `PasswordMessage`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrontendMessage {
-    /// First message on every connection. **No type byte** — just length,
-    /// version, and `key\0value\0` parameter pairs (ordered as sent).
-    /// Interesting keys: `user`, `database`.
+    /// 8-byte TLS probe (`length = 8`, `code = SSL_REQUEST_CODE`). No type
+    /// byte. Server responds with a single `'N'` (decline) or `'S'` (upgrade
+    /// to TLS) byte, then reads `StartupMessage`.
+    SslRequest,
+    /// First protocol message after optional SSL negotiation. **No type
+    /// byte** — just length, version (`PROTOCOL_VERSION`), and
+    /// `key\0value\0` parameter pairs (ordered as sent). Interesting keys:
+    /// `user`, `database`.
     StartupMessage {
         /// Parameter pairs in wire order, e.g. `("user", "ferris")`.
         params: Vec<(String, String)>,
@@ -189,9 +214,10 @@ pub enum BackendMessage {
         /// Column descriptors in output order.
         fields: Vec<FieldDescription>,
     },
-    /// `'D'` — one result row. Values are in **text format** (the decimal /
-    /// UTF-8 rendering of each value), `None` = SQL NULL, encoded as
-    /// length **-1** with no value bytes.
+    /// `'D'` — one result row. Values are in **text format** (decimal /
+    /// UTF-8 rendering of each value; note PostgreSQL renders booleans as
+    /// `"t"` / `"f"` for OID 16), `None` = SQL NULL, encoded as length
+    /// **-1** with no value bytes.
     DataRow {
         /// One entry per column of the `RowDescription`.
         values: Vec<Option<Vec<u8>>>,
@@ -260,14 +286,16 @@ pub struct FieldDescription {
 ///   than the length field promises). `buf` is left untouched; read more
 ///   bytes from the socket and call again.
 /// * `Err(Error::Protocol)` — the bytes can never form a valid message:
-///   a length field < 4 (it must at least count itself), an unknown type
-///   byte, a missing NUL terminator, invalid UTF-8, or a startup packet
-///   whose version is not [`PROTOCOL_VERSION`]. The caller should report
-///   and close the connection.
+///   a signed `i32` length field `< 4` (it must at least count itself), an
+///   unknown type byte, a missing NUL terminator, invalid UTF-8, or a
+///   startup packet whose code is neither [`PROTOCOL_VERSION`] nor
+///   [`SSL_REQUEST_CODE`]. The caller should report and close the
+///   connection.
 ///
-/// `startup` selects the framing mode: pass `true` for the first message of
-/// a connection (startup packet, **no type byte**) and `false` afterwards
-/// (normal type-byte framing).
+/// `startup` selects the framing mode: pass `true` before the startup
+/// handshake completes (accepts [`FrontendMessage::SslRequest`] and
+/// [`FrontendMessage::StartupMessage`], **no type byte**) and `false`
+/// afterwards (normal type-byte framing).
 pub fn read_message(buf: &mut BytesMut, startup: bool) -> Result<Option<FrontendMessage>> {
     todo!("Milestone 10")
 }
@@ -279,7 +307,7 @@ pub fn read_message(buf: &mut BytesMut, startup: bool) -> Result<Option<Frontend
 /// session loop encodes into a `BytesMut` and hands the bytes to the socket
 /// in one write.
 ///
-/// Errors with [`Error::Protocol`] on unencodable input — e.g. a string
+/// Errors with [`ferricdb_common::Error::Protocol`] on unencodable input — e.g. a string
 /// field that contains an interior NUL byte, or more than `i16::MAX`
 /// columns in a row.
 pub fn write_message(buf: &mut BytesMut, msg: &BackendMessage) -> Result<()> {

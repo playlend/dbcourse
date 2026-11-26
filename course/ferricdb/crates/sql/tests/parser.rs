@@ -238,6 +238,67 @@ fn ms3_update_delete_txn_statements() {
     assert_eq!(parse_one("BEGIN"), Statement::Begin);
     assert_eq!(parse_one("COMMIT"), Statement::Commit);
     assert_eq!(parse_one("ROLLBACK"), Statement::Rollback);
+    assert_eq!(
+        parse_one("DROP TABLE t"),
+        Statement::DropTable { name: "t".into() }
+    );
+}
+
+#[test]
+#[ignore = "milestone 3"]
+fn ms3_insert_without_columns_and_type_synonyms() {
+    let got = parse_one("INSERT INTO t VALUES (1, 2.5, 'ok')");
+    assert_eq!(
+        got,
+        Statement::Insert {
+            table: "t".into(),
+            columns: None,
+            rows: vec![vec![
+                int(1),
+                Expr::Literal(Value::Float(2.5)),
+                Expr::Literal(Value::Text("ok".into())),
+            ]],
+        }
+    );
+
+    let got = parse_one("CREATE TABLE s (a INT, b DOUBLE, c VARCHAR, d BOOLEAN NOT NULL)");
+    assert_eq!(
+        got,
+        Statement::CreateTable {
+            name: "s".into(),
+            columns: vec![
+                ColumnDef {
+                    name: "a".into(),
+                    data_type: DataType::Integer,
+                    nullable: true,
+                    primary_key: false,
+                },
+                ColumnDef {
+                    name: "b".into(),
+                    data_type: DataType::Float,
+                    nullable: true,
+                    primary_key: false,
+                },
+                ColumnDef {
+                    name: "c".into(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                },
+                ColumnDef {
+                    name: "d".into(),
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                    primary_key: false,
+                },
+            ],
+        }
+    );
+
+    assert!(
+        Parser::parse_expr("1 + 2 3").is_err(),
+        "parse_expr must reject trailing unconsumed tokens"
+    );
 }
 
 #[test]
@@ -412,4 +473,50 @@ fn ms6_cross_join_and_comma_from() {
     };
     assert_eq!(*kind, JoinKind::Cross);
     assert!(on.is_none());
+}
+
+// -------------------------------------------------- MS5 / MS7 / MS8 grammar
+
+#[test]
+#[ignore = "milestone 5"]
+fn ms5_create_index_parse() {
+    assert_eq!(
+        parse_one("CREATE INDEX idx_users_id ON users (id)"),
+        Statement::CreateIndex {
+            name: "idx_users_id".into(),
+            table: "users".into(),
+            column: "id".into(),
+        }
+    );
+}
+
+#[test]
+#[ignore = "milestone 7"]
+fn ms7_analyze_and_explain_parse() {
+    assert_eq!(
+        parse_one("ANALYZE users"),
+        Statement::Analyze {
+            table: Some("users".into()),
+        }
+    );
+    assert_eq!(parse_one("ANALYZE"), Statement::Analyze { table: None });
+
+    let Statement::Explain { analyze, inner } = parse_one("EXPLAIN SELECT * FROM users") else {
+        panic!("expected Explain")
+    };
+    assert!(!analyze);
+    assert!(matches!(*inner, Statement::Select(_)));
+
+    let Statement::Explain { analyze, inner } = parse_one("EXPLAIN ANALYZE DELETE FROM users")
+    else {
+        panic!("expected Explain Analyze")
+    };
+    assert!(analyze);
+    assert!(matches!(*inner, Statement::Delete { .. }));
+}
+
+#[test]
+#[ignore = "milestone 8"]
+fn ms8_vacuum_parse() {
+    assert_eq!(parse_one("VACUUM"), Statement::Vacuum);
 }

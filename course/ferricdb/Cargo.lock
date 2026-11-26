@@ -457,10 +457,13 @@ name = "ferricdb-server"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "ferricdb-buffer",
  "ferricdb-catalog",
  "ferricdb-common",
  "ferricdb-exec",
+ "ferricdb-storage",
  "ferricdb-txn",
+ "tempfile",
  "tokio",
 ]
 

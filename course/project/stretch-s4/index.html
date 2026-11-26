@@ -78,8 +78,12 @@
   <ol>
     <li><strong>Define the state machine.</strong>
       <code>trait StateMachine { fn apply(&amp;mut self, entry: &amp;[u8]) -&gt; Result&lt;Vec&lt;u8&gt;&gt;; }</code>
-      — entries are serialized write statements; apply() wraps your <code>execute()</code>.
-      Reads can bypass the log on the leader (see pitfalls).</li>
+      — start with auto-commit write statements wrapped in <code>execute()</code>, then handle
+      multi-statement transactions (<code>BEGIN ... COMMIT</code>) by replicating either a
+      session-tagged command sequence or an atomic commit-time write-set batch so open transactions
+      do not interleave inconsistently across nodes. Reads can bypass the Raft log on the leader
+      <em>only</em> when paired with a linearizable leadership check (Raft's ReadIndex / quorum
+      heartbeat round, or a bounded-clock leader lease — see pitfalls).</li>
     <li><strong>Implement Raft small.</strong> Follow toyDB's decomposition: a node struct with
       role state, a persisted log, election timers with randomized timeouts, AppendEntries
       heartbeats, and commit-index advancement on majority acknowledgment.<sup class="cite"><a href="#ref-2">2</a></sup>
@@ -113,7 +117,9 @@
     <p>The Raft log orders <em>commands</em> across nodes; the Milestone 9 WAL protects each
     node's local storage. They are not interchangeable and you likely keep both — decide and
     document whether snapshot reads on followers are allowed (stale) or forbidden
-    (leader-only reads, linearizable).</p>
+    (leader-only reads, which are linearizable only if the leader confirms leadership via a
+    ReadIndex quorum heartbeat check or a bounded-clock lease rather than serving local state
+    unchecked during a network partition).</p>
   </div>
 
   <h2 id="sec-done">Definition of done</h2>
@@ -149,6 +155,16 @@
           <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md</a></li>
       </ol>
     </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>toyDB Raft Implementation — readable Rust Raft module demonstrating persistent log state,
+        election timers, leader forwarding, and state-machine application.
+        <a href="https://github.com/erikgrinaker/toydb" rel="external">github.com/erikgrinaker/toydb</a></li>
+      <li>Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, Ch. 11 — contrast consensus-based
+        replication with PostgreSQL's primary-standby streaming WAL replication.
+        <a href="https://www.interdb.jp/pg/" rel="external">interdb.jp/pg/</a></li>
+    </ul>
 
     <nav class="prevnext">
       <a href="../stretch-s3/index.html"><span class="dir">← Previous</span> Stretch S3 · LSM Storage Engine</a>

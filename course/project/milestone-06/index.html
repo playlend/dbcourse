@@ -126,22 +126,47 @@ pub enum Expr {
     Literal(Value), Column(Option&lt;String&gt; /*qualifier*/, String),
     Unary(UnaryOp, Box&lt;Expr&gt;), Binary(Box&lt;Expr&gt;, BinaryOp, Box&lt;Expr&gt;),
     IsNull(Box&lt;Expr&gt;, bool /*negated*/), Cast(Box&lt;Expr&gt;, DataType),
-    Function(String, Vec&lt;Expr&gt;),            // aggregates from MS6
+    Function(String, Vec&lt;Expr&gt;),            // lowercase; COUNT(*) = Function("count", vec![])
 }</code></pre>
-  <p>The planner emits four plan variants for this milestone (three new, plus
-  <code>Sort</code> which finally gets a spill-capable implementation), and the executor
-  crate gains a sort module:</p>
+  <p>The binder and planner use the types below (quoted verbatim from <code>api-spec.md</code>):
+  <code>BoundExpr::InputRef</code> lets post-<code>Aggregate</code> projections and
+  <code>ORDER BY</code> clauses index the aggregate output row directly, <code>LogicalPlan</code>
+  adds joins and aggregation alongside <code>Projection</code> and spill-capable <code>Sort</code>,
+  and <code>crates/exec/src/sort.rs</code> defines the four-method <code>ExternalSorter</code>
+  API:</p>
   <pre><code>// crates/exec — public surface to implement (quoted from api-spec.md)
+pub mod binder {
+    pub enum BoundExpr {
+        Literal(Value),
+        Column { table: usize, column: usize, data_type: DataType },
+        /// Flat offset into immediate child's output (e.g. post-Aggregate [group_by..., aggs...]).
+        InputRef { index: usize, data_type: DataType },
+        Unary(UnaryOp, Box&lt;BoundExpr&gt;),
+        Binary(Box&lt;BoundExpr&gt;, BinaryOp, Box&lt;BoundExpr&gt;),
+        IsNull(Box&lt;BoundExpr&gt;, bool),
+        Cast(Box&lt;BoundExpr&gt;, DataType),
+        Function(String, Vec&lt;BoundExpr&gt;),
+    }
+    pub enum AggFunc { Count, Sum, Avg, Min, Max }
+    pub struct AggExpr { pub func: AggFunc, pub arg: Option&lt;BoundExpr&gt; }
+    pub enum BoundTableRef {
+        Table(TableInfo),
+        Join { left: Box&lt;BoundTableRef&gt;, right: Box&lt;BoundTableRef&gt;,
+               kind: JoinKind, on: Option&lt;BoundExpr&gt; },
+    }
+}
+
 pub mod plan {
     pub enum LogicalPlan {
         // …variants you built in Milestones 4–5, plus:
+        Projection { input: Box&lt;LogicalPlan&gt;, exprs: Vec&lt;BoundExpr&gt;, schema: Schema },
         NestedLoopJoin { left: Box&lt;LogicalPlan&gt;, right: Box&lt;LogicalPlan&gt;,
                          on: Option&lt;BoundExpr&gt; },                            // MS6
         HashJoin { left: Box&lt;LogicalPlan&gt;, right: Box&lt;LogicalPlan&gt;,
-                   left_keys: Vec&lt;BoundExpr&gt;, right_keys: Vec&lt;BoundExpr&gt; },  // MS6
+                   left_keys: Vec&lt;BoundExpr&gt;, right_keys: Vec&lt;BoundExpr&gt; },  // MS6 (build left, probe right)
         Aggregate { input: Box&lt;LogicalPlan&gt;, group_by: Vec&lt;BoundExpr&gt;,
                     aggregates: Vec&lt;AggExpr&gt; },                              // MS6
-        Sort { input: Box&lt;LogicalPlan&gt;, keys: Vec&lt;(BoundExpr, bool)&gt; },
+        Sort { input: Box&lt;LogicalPlan&gt;, keys: Vec&lt;(BoundExpr, bool)&gt; },      // NULLs LAST in ASC &amp; DESC
         // …
     }
 }
@@ -150,17 +175,32 @@ pub mod plan {
 pub trait Executor {
     fn schema(&amp;self) -&gt; &amp;Schema;
     fn open(&amp;mut self) -&gt; Result&lt;()&gt;;
-    fn next(&amp;mut self) -&gt; Result&lt;Option&lt;Vec&lt;Value&gt;&gt;&gt;;
+    fn next(&amp;mut self) -&gt; Result&lt;Option&lt;ExecRow&gt;&gt;;
     fn close(&amp;mut self) -&gt; Result&lt;()&gt;;
 }
 
-pub struct ExecContext { /* Arc: catalog, page store, txn manager, current txn,
-                            wal (opt), memory budget for sort/hash (MS6) */ }
+pub const DEFAULT_MEMORY_PAGES: usize = 64;
+pub struct ExecContext {
+    pub catalog: Arc&lt;Catalog&gt;,
+    pub store: Arc&lt;dyn PageStore&gt;,
+    pub txn_manager: Arc&lt;TransactionManager&gt;,
+    pub current_txn: Mutex&lt;Option&lt;Arc&lt;Transaction&gt;&gt;&gt;,
+    pub failed_txn: Mutex&lt;bool&gt;,
+    pub wal: Option&lt;Arc&lt;dyn WalHook&gt;&gt;,
+    pub memory_pages: usize,
+}
 
 pub mod sort {                                                 // MS6
     /// External merge sort: sorted runs spilled via the page store's temp
-    /// pages, k-way merge; stays within `memory_pages` buffer pages.
+    /// pages (serialized with `schema`), k-way merge (`k = max(2, memory_pages - 1)`).
     pub struct ExternalSorter { /* ... */ }
+    impl ExternalSorter {
+        pub fn new(store: Arc&lt;dyn PageStore&gt;, schema: Schema,
+                   memory_pages: usize, keys: Vec&lt;(usize, bool)&gt;) -&gt; Self;
+        pub fn push(&amp;mut self, row: Vec&lt;Value&gt;) -&gt; Result&lt;()&gt;;
+        pub fn finish(self) -&gt; Result&lt;Vec&lt;Vec&lt;Value&gt;&gt;&gt;;
+        pub fn spilled_runs(&amp;self) -&gt; usize;
+    }
 }</code></pre>
   <p>Comparisons everywhere in this milestone go through the three-valued comparison you
   built in Milestone 1:</p>
@@ -179,31 +219,51 @@ impl Value {
         names (<code>customer.id</code> and <code>orders.id</code>) are legal in the combined
         schema — they are disambiguated by qualifier at bind time, and an unqualified
         ambiguous name is a bind error.</li>
-    <li><strong>HashJoin keys.</strong> <code>left_keys[i]</code> pairs with
+    <li><strong>HashJoin build/probe convention and keys.</strong> Per
+        <code>crates/exec/src/plan.rs</code>, <code>HashJoin</code> builds its hash table on the
+        <strong>left</strong> input using <code>left_keys</code> and probes with the
+        <strong>right</strong> input using <code>right_keys</code> (output rows remain
+        <code>left ++ right</code>). <code>left_keys[i]</code> pairs with
         <code>right_keys[i]</code>; the planner extracts these pairs from equality conjuncts
         of the <code>ON</code> clause. Rows whose key evaluates to <code>NULL</code> on
         either side never appear in the output, because <code>=</code> with a
         <code>NULL</code> operand yields unknown, not true.<sup class="cite"><a href="#ref-9">9</a></sup></li>
-    <li><strong><code>AggExpr</code>.</strong> Defined in the starter <code>exec</code>
-        crate next to <code>plan</code>: it names which of the five aggregate functions to
-        compute and carries the bound argument expression it applies to
-        (<code>COUNT(*)</code> carries none).</li>
-    <li><strong>Aggregate output schema.</strong> Group-by expressions first (in
-        <code>GROUP BY</code> order), then one column per aggregate (in projection order) —
-        a course choice, same caveat as the join schema. With an empty <code>group_by</code>,
+    <li><strong><code>AggExpr</code> and <code>COUNT(*)</code>.</strong>
+        <code>COUNT(*)</code> parses as <code>Expr::Function("count", vec![])</code> (lowercase
+        function name) and binds to <code>AggExpr { func: AggFunc::Count, arg: None }</code>;
+        all other aggregates carry <code>arg: Some(BoundExpr)</code>.</li>
+    <li><strong>Aggregate output schema and <code>BoundExpr::InputRef</code>.</strong>
+        <code>LogicalPlan::Aggregate</code> emits <code>[group_by_0, …, group_by_{g-1}, agg_0, …, agg_{a-1}]</code>
+        — group-by columns first (in <code>GROUP BY</code> order), then one column per aggregate.
+        Ancestor <code>Projection</code> and <code>Sort</code> nodes reference those output slots
+        via <code>BoundExpr::InputRef { index, data_type }</code> (for example, aggregate
+        <em>k</em> sits at <code>index = g + k</code>). With an empty <code>group_by</code>,
         the operator computes one global group.</li>
+    <li><strong>Implicit <code>Integer → Float</code> widening.</strong> As documented on
+        <code>Binder::bind</code>, an <code>Integer</code> expression widens implicitly to
+        <code>Float</code> (e.g. by inserting <code>BoundExpr::Cast(..., DataType::Float)</code>
+        during binding, or numeric promotion during evaluation) when inserted into or assigned to
+        a <code>Float</code> column (such as <code>INSERT INTO orders ... VALUES (..., 80, ...)</code>
+        for <code>o_total FLOAT</code>) or combined with a <code>Float</code> in arithmetic or
+        comparisons (such as <code>WHERE o_total &gt; 100</code>). Both
+        <code>ms6_joins_agg_sort.slt</code> and <code>crates/exec/tests/exec.rs</code> rely on
+        this widening.</li>
     <li><strong>Grouping vs. joining on <code>NULL</code>.</strong> Grouping compares keys by
         <em>distinctness</em>, not by <code>=</code>: two <code>NULL</code>s are “not
         distinct” from each other,<sup class="cite"><a href="#ref-9">9</a></sup> so all rows
         with a <code>NULL</code> group key collapse into a single group — the opposite of
         join keys, which use <code>=</code> and never match.</li>
-    <li><strong><code>ORDER BY</code> and <code>NULL</code>.</strong> FerricDB sorts
-        <code>NULL</code> as if larger than every non-null value, matching PostgreSQL’s
-        default (<code>NULLS LAST</code> for ascending, <code>NULLS FIRST</code> for
-        descending);<sup class="cite"><a href="#ref-10">10</a></sup> we do not implement the
-        <code>NULLS FIRST/LAST</code> syntax. This rule also turns
-        <code>sql_cmp</code>’s <code>Option&lt;Ordering&gt;</code> into the total order a
-        sort needs.</li>
+    <li><strong><code>ORDER BY</code> and <code>NULL</code> (course convention).</strong>
+        <strong>NULLs order LAST in both <code>ASC</code> and <code>DESC</code></strong>
+        (consistent across Milestone&nbsp;4's <code>ms4_order_by_limit_and_null_ordering</code>,
+        <code>ms4_crud.slt</code>, <code>crates/exec/src/plan.rs</code>, and
+        <code>crates/exec/src/sort.rs</code>). Contrast this with PostgreSQL's default, which
+        treats <code>NULL</code> as larger than every non-null value (<code>NULLS LAST</code> for
+        <code>ASC</code>, <code>NULLS FIRST</code> for <code>DESC</code>).<sup class="cite"><a href="#ref-10">10</a></sup>
+        We do not implement explicit <code>NULLS FIRST/LAST</code> syntax; placing
+        <code>NULL</code> strictly after every non-null value regardless of direction turns
+        <code>sql_cmp</code>'s <code>Option&lt;Ordering&gt;</code> into the total order a sort
+        needs.</li>
     <li><strong>Memory budget.</strong> <code>ExecContext</code> carries a memory budget for
         sort/hash, denominated in <em>buffer pages</em> (<code>memory_pages</code> ×
         <code>PAGE_SIZE</code> bytes, with <code>PAGE_SIZE = 8192</code> from
@@ -283,22 +343,35 @@ impl Value {
     <li><strong>Grow the grammar: <code>GROUP BY</code> and aggregate calls.</strong>
       <code>GROUP BY</code> parses a comma-separated expression list between
       <code>WHERE</code> and <code>ORDER BY</code>. In the Pratt expression parser, an
-      identifier followed by <code>(</code> becomes <code>Expr::Function(name, args)</code>.
-      Represent <code>COUNT(*)</code> as a zero-argument <code>count</code> call — a course
-      choice, since the AST has no star expression.</li>
-    <li><strong>Bind joins.</strong> Walk the <code>TableRef</code> tree and build the
-      combined schema (left columns, then right). Resolve qualified names through the alias
+      identifier followed by <code>(</code> becomes <code>Expr::Function(name, args)</code>
+      (lowercased). Parse <code>COUNT(*)</code> as <code>Expr::Function("count".into(), vec![])</code>
+      — the course convention documented in <code>api-spec.md</code>.</li>
+    <li><strong>Bind joins and implicit widening.</strong> Walk the <code>TableRef</code> tree and build the
+      combined scope (each base table in <code>FROM</code> gets an incrementing
+      <code>table_idx</code>: 0, 1, …). Resolve qualified names through the alias
       or table name; reject unqualified names that match more than one column with
-      <code>Error::Bind</code>. Bind the <code>ON</code> expression against the combined
-      schema — after binding, column references are positional, so a right-side column’s
-      index is offset by the left child’s column count. Get this offset right once, here,
-      and the executors never think about names again.</li>
+      <code>Error::Bind</code>. Bind the <code>ON</code> expression into
+      <code>BoundExpr::Column { table: table_idx, column: col_idx, data_type }</code> where
+      <code>col_idx</code> stays the column's ordinal within its own table's schema — do
+      <strong>not</strong> add the left child's column count inside the binder! Instead,
+      <code>Planner::create_executor</code> resolves each <code>(table_idx, col_idx)</code> to a
+      flat slot against each operator's child layout (<code>left ++ right</code> for
+      <code>NestedLoopJoin</code> and operators above a join, and <code>left</code> /
+      <code>right</code> individually for <code>HashJoin</code>'s build/probe key expressions; this
+      also keeps Milestone&nbsp;7 join reordering and predicate pushdown working cleanly). Also make
+      sure your binder/evaluator performs implicit <code>Integer → Float</code> widening in
+      <code>INSERT</code>, <code>UPDATE</code>, arithmetic, and comparisons (exercised by
+      <code>ms6_joins_agg_sort.slt</code> and <code>exec.rs</code>).</li>
     <li><strong>Bind aggregates.</strong> Recognize <code>count/sum/avg/min/max</code>
-      case-insensitively in <code>Expr::Function</code>. Enforce three rules: aggregates
+      case-insensitively in <code>Expr::Function</code> (binding <code>Function("count", [])</code>
+      to <code>AggExpr { func: AggFunc::Count, arg: None }</code>). Enforce three rules: aggregates
       cannot nest; aggregates may not appear in <code>WHERE</code> (that is what
       <code>HAVING</code> would be for — FerricDB doesn’t have it); and every projection
-      expression must either be an aggregate or appear in <code>GROUP BY</code>. Emitting
-      clear <code>Error::Bind</code> messages now saves you slt-debugging later.</li>
+      expression must either be an aggregate or appear in <code>GROUP BY</code>. Rewrite
+      projection and <code>ORDER BY</code> references to grouped keys and aggregates into
+      <code>BoundExpr::InputRef { index, data_type }</code> pointing into the
+      <code>[group_by…, aggregates…]</code> row emitted by <code>LogicalPlan::Aggregate</code>.
+      Emitting clear <code>Error::Bind</code> messages now saves you slt-debugging later.</li>
     <li><strong><code>NestedLoopJoin</code> executor.</strong> On <code>open()</code>, open
       both children and materialize the inner (right) side into a <code>Vec</code> of rows —
       the same trick PostgreSQL uses in its materialized nested loop, where the inner table
@@ -314,19 +387,20 @@ impl Value {
     <li><strong><code>HashJoin</code> executor.</strong> Two phases, matching PostgreSQL’s
       in-memory hash join: the build phase inserts every build-side tuple into the hash
       table, then the probe phase streams the other side and compares each tuple against the
-      matching bucket.<sup class="cite"><a href="#ref-4">4</a></sup> Build on the
-      <em>right</em> child (course convention; Milestone 7’s optimizer learns to put the
-      smaller input there, which is what you want when loading a partition into
-      memory<sup class="cite"><a href="#ref-6">6</a></sup>):
+      matching bucket.<sup class="cite"><a href="#ref-4">4</a></sup> Following
+      <code>crates/exec/src/plan.rs</code>, build on the <strong>left</strong> child
+      (<code>left_keys</code>) and probe with the <strong>right</strong> child
+      (<code>right_keys</code>) — Milestone 7’s optimizer puts the smaller input on the left,
+      which is what you want when loading a build side into memory:<sup class="cite"><a href="#ref-6">6</a></sup>
       <pre><code>-- build phase                                (interdb §3.5.3, CS186 note 9)
-for each build-side row:
-    k := evaluate right_keys
+for each build-side (left) row:
+    k := evaluate left_keys
     if any value in k is NULL: skip row        -- NULL never joins
     table[hash(k)].push(row)
 
 -- probe phase
-for each probe-side row:
-    k := evaluate left_keys
+for each probe-side (right) row:
+    k := evaluate right_keys
     if any value in k is NULL: skip row
     for each build row in table[hash(k)] whose keys equal k:
         emit left row ++ right row</code></pre>
@@ -361,29 +435,35 @@ while input has rows:
     sort them in memory
     write the run to freshly allocated pages       -- the final partial run too!
 
--- merge passes
+-- merge passes: k = max(2, B - 1) so run count always shrinks
 while more than one run remains:
-    take up to B-1 runs; open one cursor per run (1 page each)
+    take up to k runs; open one cursor per run (1 page each)
     repeatedly move the smallest head tuple to the output page
-    flush the output page as it fills              -- this is the B-th page</code></pre>
+    flush the output page as it fills              -- the B-th page (for B &gt;= 3)</code></pre>
       Account for the budget in <em>bytes of serialized tuples against B ×
-      PAGE_SIZE</em>, not in row counts — rows vary in width. For the run pages themselves,
-      you already own a fine format: a run is a chain of slotted pages
-      (<code>HeapPage</code>) allocated through the <code>PageStore</code>, so runs flow
-      through the buffer pool like any other page (PostgreSQL spills sort data to temporary
-      files instead;<sup class="cite"><a href="#ref-3">3</a></sup> using ordinary pages is a
-      course simplification — whether you reclaim them afterwards is up to you, the tests
-      don’t check). Sort with a comparator built from <code>sql_cmp</code>, the per-key
-      <code>desc</code> flags, and the NULL-sorts-last rule from the spec section — that
-      combination is total, so <code>sort_by</code> and <code>BinaryHeap</code> are both
-      happy.</li>
+      PAGE_SIZE</em> (using <code>ferricdb_storage::tuple::serialize</code> with the
+      <code>schema</code> passed to <code>ExternalSorter::new</code>), not in row counts — rows
+      vary in width. Track how many runs have been written to disk so
+      <code>spilled_runs()</code> returns <code>0</code> when the whole input fits in one batch
+      and a positive count whenever spilling occurred. For the run pages themselves, you already
+      own a fine format: a run is a chain of slotted pages (<code>HeapPage</code>) allocated
+      through the <code>PageStore</code>, so runs flow through the buffer pool like any other
+      page (PostgreSQL spills sort data to temporary files instead;<sup class="cite"><a href="#ref-3">3</a></sup>
+      using ordinary pages is a course simplification — whether you reclaim them afterwards is up
+      to you, the tests don’t check). Sort with a comparator built from <code>sql_cmp</code>,
+      the per-key <code>desc</code> flags, and FerricDB’s <strong>NULLs-last in both ASC and
+      DESC</strong> rule — that combination is total, so <code>sort_by</code> and
+      <code>BinaryHeap</code> are both happy.</li>
     <li><strong><code>ExternalSorter</code>: k-way merge.</strong> Open a cursor per run,
       each holding one page in memory; repeatedly emit the minimum (a
       <code>BinaryHeap&lt;Reverse&lt;…&gt;&gt;</code> keyed by your comparator works well);
       when a cursor exhausts its page, load that run’s next page.<sup class="cite"><a href="#ref-5">5</a></sup>
-      Merge at most B−1 runs at once — the last budget page is the output buffer — and if
-      pass 0 produced more runs than that, merge in multiple passes: total passes are
-      1 + ⌈log<sub>B−1</sub>⌈N/B⌉⌉ and total I/O is 2N × that,<sup class="cite"><a href="#ref-5">5</a></sup>
+      Set the merge fan-in to <strong><code>k = max(2, B − 1)</code></strong> (clamped to at
+      least 2 so even an artificially tiny budget cannot infinite-loop with fan-in 1; textbook
+      <code>(B − 1)</code>-way merging requires <code>memory_pages &gt;= 3</code>, and
+      <code>ms6_external_sort_under_tiny_budget</code> uses <code>memory_pages = 4</code> for a
+      3-way merge). If pass 0 produced more than <em>k</em> runs, merge in multiple passes: total
+      passes are 1 + ⌈log<sub>k</sub>⌈N/B⌉⌉ and total I/O is 2N × that,<sup class="cite"><a href="#ref-5">5</a></sup>
       which the tiny-budget test will make you feel. Figure 3 walks through B = 4, N = 24.</li>
     <li><strong>Wire it into the planner and <code>Sort</code> executor.</strong> Fold the
       bound <code>FROM</code> tree into a left-deep join chain. For each <code>ON</code>
@@ -402,8 +482,14 @@ while more than one run remains:
 
   <figure>
     <svg viewBox="0 0 960 350" role="img">
-      <title>Hash join: a build phase inserts rows into a hash table keyed on the join column; a probe phase streams the other input; rows with NULL keys are skipped on both sides.</title>
-      <text x="125" y="34" text-anchor="middle" class="d-text">build side · orders (right)</text>
+      <title>Hash join: a build phase inserts left-input rows into a hash table keyed on left_keys; a probe phase streams the right input on right_keys; rows with NULL keys are skipped on both sides.</title>
+      <defs>
+        <marker id="hj-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+      </defs>
+      <text x="125" y="34" text-anchor="middle" class="d-text">build side · orders (left)</text>
       <rect x="20" y="46" width="210" height="192" rx="8" class="d-box"/>
       <rect x="35" y="60" width="180" height="24" rx="4" class="d-box"/>
       <text x="125" y="76" text-anchor="middle" class="d-mono-sm">o_custkey = 1 · row a</text>
@@ -416,13 +502,13 @@ while more than one run remains:
       <rect x="35" y="188" width="180" height="24" rx="4" class="d-box"/>
       <text x="125" y="204" text-anchor="middle" class="d-mono-sm">o_custkey = 3 · row e</text>
 
-      <text x="495" y="34" text-anchor="middle" class="d-text">hash table on key</text>
+      <text x="495" y="34" text-anchor="middle" class="d-text">hash table on left_keys</text>
       <rect x="375" y="46" width="240" height="150" rx="8" class="d-box-hl"/>
       <text x="495" y="86" text-anchor="middle" class="d-mono">h(1) → [a, d]</text>
       <text x="495" y="126" text-anchor="middle" class="d-mono">h(2) → [b]</text>
       <text x="495" y="166" text-anchor="middle" class="d-mono">h(3) → [e]</text>
 
-      <text x="832" y="34" text-anchor="middle" class="d-text">probe side · customer (left)</text>
+      <text x="832" y="34" text-anchor="middle" class="d-text">probe side · customer (right)</text>
       <rect x="725" y="46" width="215" height="128" rx="8" class="d-box"/>
       <rect x="740" y="60" width="185" height="24" rx="4" class="d-box"/>
       <text x="832" y="76" text-anchor="middle" class="d-mono-sm">c_custkey = 1 · row c1</text>
@@ -431,39 +517,41 @@ while more than one run remains:
       <rect x="740" y="124" width="185" height="24" rx="4" class="d-box"/>
       <text x="832" y="140" text-anchor="middle" class="d-mono-sm">c_custkey = 3 · row c3</text>
 
-      <path d="M 230 110 H 375" class="d-line"/>
-      <path d="M 366 104 L 375 110 L 366 116" class="d-line"/>
-      <text x="300" y="100" text-anchor="middle" class="d-text-sm">① build: insert</text>
-      <path d="M 725 110 H 615" class="d-line"/>
-      <path d="M 624 104 L 615 110 L 624 116" class="d-line"/>
-      <text x="672" y="100" text-anchor="middle" class="d-text-sm">② probe</text>
+      <path d="M 230 110 H 372" fill="none" class="d-line" marker-end="url(#hj-arrow)"/>
+      <text x="300" y="100" text-anchor="middle" class="d-text-sm">① build (left)</text>
+      <path d="M 725 110 H 618" fill="none" class="d-line" marker-end="url(#hj-arrow)"/>
+      <text x="672" y="100" text-anchor="middle" class="d-text-sm">② probe (right)</text>
 
       <rect x="375" y="272" width="240" height="58" rx="8" class="d-box-good"/>
-      <text x="495" y="294" text-anchor="middle" class="d-text-sm">output</text>
-      <text x="495" y="316" text-anchor="middle" class="d-mono-sm">(c1,a) (c1,d) (c3,e)</text>
-      <path d="M 495 196 V 272" class="d-line"/>
-      <path d="M 489 263 L 495 272 L 501 263" class="d-line"/>
+      <text x="495" y="294" text-anchor="middle" class="d-text-sm">output (left ++ right)</text>
+      <text x="495" y="316" text-anchor="middle" class="d-mono-sm">(a,c1) (d,c1) (e,c3)</text>
+      <path d="M 495 196 V 269" fill="none" class="d-line" marker-end="url(#hj-arrow)"/>
 
       <rect x="20" y="272" width="210" height="58" rx="8" class="d-box-warn"/>
       <text x="125" y="296" text-anchor="middle" class="d-text-sm">NULL keys skipped:</text>
       <text x="125" y="316" text-anchor="middle" class="d-mono-sm">rows c, c2 → no output</text>
-      <path d="M 125 238 V 272" class="d-line" stroke-dasharray="4 3"/>
+      <path d="M 125 238 V 272" fill="none" class="d-line" stroke-dasharray="4 3"/>
     </svg>
-    <figcaption>Figure 2 — HashJoin on <code>c_custkey = o_custkey</code>. Build inserts
-    every non-null-keyed row into a bucketed map; probe streams the other side and emits one
-    output row per equal-key match. Rows c and c2 carry <code>NULL</code> keys and are
-    skipped on both sides — <code>NULL = NULL</code> is unknown, never
-    true.<sup class="cite"><a href="#ref-9">9</a></sup></figcaption>
+    <figcaption>Figure 2 — <code>HashJoin</code> on <code>o_custkey = c_custkey</code> (build left,
+    probe right). Build inserts every non-null-keyed left row into a bucketed map; probe streams the
+    right side and emits one <code>left ++ right</code> output row per equal-key match. Rows c and
+    c2 carry <code>NULL</code> keys and are skipped on both sides — <code>NULL = NULL</code> is
+    unknown, never true.<sup class="cite"><a href="#ref-9">9</a></sup></figcaption>
   </figure>
 
   <figure>
     <svg viewBox="0 0 960 400" role="img">
       <title>External merge sort with a four-page budget over a 24-page input: pass 0 creates six sorted runs of four pages, pass 1 merges three runs at a time into two runs of twelve pages, pass 2 merges those into one sorted output.</title>
+      <defs>
+        <marker id="sort-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
+                markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+      </defs>
       <rect x="330" y="14" width="300" height="42" rx="8" class="d-box"/>
       <text x="480" y="40" text-anchor="middle" class="d-text">unsorted input · N = 24 pages</text>
-      <path d="M 480 56 V 96" class="d-line"/>
-      <path d="M 474 87 L 480 96 L 486 87" class="d-line"/>
-      <text x="40" y="90" class="d-text-sm">pass 0 · fill B = 4 pages, sort, spill → ⌈24/4⌉ = 6 runs</text>
+      <path d="M 480 56 V 93" fill="none" class="d-line" marker-end="url(#sort-arrow)"/>
+      <text x="40" y="84" class="d-text-sm">pass 0 · fill B = 4 pages, sort, spill → ⌈24/4⌉ = 6 runs</text>
 
       <rect x="40"  y="100" width="130" height="36" rx="6" class="d-box-good"/>
       <text x="105" y="123" text-anchor="middle" class="d-mono-sm">R1 · 4p</text>
@@ -478,29 +566,27 @@ while more than one run remains:
       <rect x="790" y="100" width="130" height="36" rx="6" class="d-box-good"/>
       <text x="855" y="123" text-anchor="middle" class="d-mono-sm">R6 · 4p</text>
 
-      <text x="40" y="182" class="d-text-sm">pass 1 · merge B − 1 = 3 runs per group (1 page per cursor + 1 output page)</text>
-      <path d="M 105 136 V 168 H 275 V 200" class="d-line"/>
-      <path d="M 255 136 V 200" class="d-line"/>
-      <path d="M 405 136 V 168 H 275" class="d-line" fill="none"/>
-      <path d="M 555 136 V 168 H 685 V 200" class="d-line"/>
-      <path d="M 705 136 V 200" class="d-line"/>
-      <path d="M 855 136 V 168 H 685" class="d-line"/>
-      <rect x="150" y="200" width="250" height="36" rx="6" class="d-box-good"/>
-      <text x="275" y="223" text-anchor="middle" class="d-mono-sm">R7 · 12 pages (R1+R2+R3)</text>
-      <rect x="560" y="200" width="250" height="36" rx="6" class="d-box-good"/>
-      <text x="685" y="223" text-anchor="middle" class="d-mono-sm">R8 · 12 pages (R4+R5+R6)</text>
+      <path d="M 105 136 V 156 H 405 V 136" fill="none" class="d-line"/>
+      <path d="M 255 136 V 201" fill="none" class="d-line" marker-end="url(#sort-arrow)"/>
+      <path d="M 555 136 V 156 H 855 V 136" fill="none" class="d-line"/>
+      <path d="M 705 136 V 201" fill="none" class="d-line" marker-end="url(#sort-arrow)"/>
+      <text x="480" y="176" text-anchor="middle" class="d-text-sm">pass 1 · merge k = max(2, B − 1) = 3 runs/group</text>
+      <text x="480" y="192" text-anchor="middle" class="d-text-sm">(1 page/cursor + 1 output page)</text>
+      <rect x="130" y="204" width="250" height="36" rx="6" class="d-box-good"/>
+      <text x="255" y="227" text-anchor="middle" class="d-mono-sm">R7 · 12 pages (R1+R2+R3)</text>
+      <rect x="580" y="204" width="250" height="36" rx="6" class="d-box-good"/>
+      <text x="705" y="227" text-anchor="middle" class="d-mono-sm">R8 · 12 pages (R4+R5+R6)</text>
 
-      <text x="40" y="282" class="d-text-sm">pass 2 · merge the 2 remaining runs</text>
-      <path d="M 275 236 V 268 H 480 V 300" class="d-line"/>
-      <path d="M 685 236 V 268 H 480" class="d-line"/>
-      <path d="M 474 291 L 480 300 L 486 291" class="d-line"/>
-      <rect x="330" y="300" width="300" height="42" rx="8" class="d-box-hl"/>
-      <text x="480" y="326" text-anchor="middle" class="d-text">sorted output · 24 pages</text>
-      <text x="480" y="378" text-anchor="middle" class="d-text-sm">3 passes total = 1 + ⌈log₃ 6⌉ → 2 × 24 × 3 = 144 page reads + writes</text>
+      <path d="M 255 240 V 274 H 705 V 240" fill="none" class="d-line"/>
+      <path d="M 480 274 V 307" fill="none" class="d-line" marker-end="url(#sort-arrow)"/>
+      <text x="40" y="296" class="d-text-sm">pass 2 · merge the 2 remaining runs</text>
+      <rect x="330" y="310" width="300" height="42" rx="8" class="d-box-hl"/>
+      <text x="480" y="336" text-anchor="middle" class="d-text">sorted output · 24 pages</text>
+      <text x="480" y="384" text-anchor="middle" class="d-text-sm">3 passes total = 1 + ⌈log₃ 6⌉ → 2 × 24 × 3 = 144 page reads + writes</text>
     </svg>
     <figcaption>Figure 3 — External merge sort with budget B = 4 pages over N = 24 pages of
-    input. Pass 0 produces ⌈N/B⌉ = 6 sorted runs; each merge pass combines B − 1 = 3 runs;
-    total passes 1 + ⌈log<sub>B−1</sub>⌈N/B⌉⌉ = 3, for 2N × 3 = 144 page
+    input. Pass 0 produces ⌈N/B⌉ = 6 sorted runs; each merge pass combines k = max(2, B − 1) = 3 runs;
+    total passes 1 + ⌈log<sub>3</sub> 6⌉ = 3, for 2N × 3 = 144 page
     I/Os.<sup class="cite"><a href="#ref-5">5</a></sup></figcaption>
   </figure>
 
@@ -518,36 +604,58 @@ while more than one run remains:
   </div>
 
   <h2 id="sec-tests">Test plan</h2>
-  <p>The starter workspace ships this milestone’s tests marked
-  <code>#[ignore = "milestone 6"]</code>, named with the <code>ms6_</code> prefix. The
-  <code>--include-ignored</code> flag runs them without disturbing the rest of the suite;
-  once the milestone is green you may delete the <code>#[ignore]</code> attributes so they
-  run in a plain <code>cargo test</code> from then on.</p>
-  <pre><code># all Milestone 6 unit/integration tests (joins, aggregation, sort)
+  <p>The starter workspace ships Milestone 6 tests across three crates, all marked
+  <code>#[ignore = "milestone 6"]</code>. Do <strong>not</strong> delete the
+  <code>#[ignore]</code> attributes: per <code>course/ferricdb/README.md</code>, run them with
+  <code>--include-ignored</code> so plain <code>cargo test --workspace</code> stays green in CI:</p>
+  <pre><code># SQL grammar tests (ms6_join_and_group_by_parse, ms6_cross_join_and_comma_from)
+cargo test -p ferricdb-sql -- --include-ignored ms6_
+
+# executor and external-sorter tests (4 tests)
 cargo test -p ferricdb-exec -- --include-ignored ms6_
 
-# end-to-end SQL: the sqllogictest harness picks up ms6_joins_agg_sort.slt
-cargo test -p ferricdb -- slt_all
+# end-to-end SQL via the sqllogictest harness (note --include-ignored!)
+cargo test -p ferricdb -- --include-ignored ms6_slt_joins_agg_sort
+cargo test -p ferricdb -- --include-ignored slt_all
 
-# regression: everything from earlier milestones must stay green
+# regression: earlier milestone suites (explicit --include-ignored; plain cargo test skips ignored tests)
+cargo test -p ferricdb-storage -- --include-ignored ms1_
+cargo test -p ferricdb-buffer  -- --include-ignored ms2_
+cargo test -p ferricdb-sql     -- --include-ignored ms3_
+cargo test -p ferricdb-catalog -- --include-ignored ms3_
+cargo test -p ferricdb-exec    -- --include-ignored ms3_
+cargo test -p ferricdb-exec    -- --include-ignored ms4_
+cargo test -p ferricdb-index   -- --include-ignored ms5_
+cargo test -p ferricdb-exec    -- --include-ignored ms5_
+cargo test -p ferricdb         -- --include-ignored ms4_slt_crud
 cargo test --workspace</code></pre>
-  <p>What the <code>ms6_</code> group exercises, so you can build in the same order:</p>
+  <p>What the provided tests exercise, in build order:</p>
   <ul>
-    <li><strong>Join tests</strong> — nested-loop results for equi and non-equi predicates,
-        cross joins, hash-join agreement with nested-loop on the same input, duplicate join
-        keys fanning out, and <code>NULL</code>-keyed rows producing nothing.</li>
-    <li><strong>Aggregation tests</strong> — grouped and global aggregates, <code>NULL</code>
-        inputs being ignored, the zero-row global aggregate row, and <code>AVG</code>
-        precision on integer columns.</li>
-    <li><strong>Sort tests</strong> — the important one constructs an <code>ExecContext</code>
-        with an artificially tiny memory budget (a few pages) so even a modest input is
-        forced through run generation and a multi-pass merge, then asserts the spilled
-        result is byte-for-byte equal to the in-memory sort of the same input, including
-        <code>NULL</code> ordering and multi-key <code>DESC</code>.</li>
-    <li><strong><code>ms6_joins_agg_sort.slt</code></strong> — TPC-H-inspired mini queries
-        over small <code>customer</code>/<code>orders</code> tables: joins under filters,
-        <code>GROUP BY</code> with several aggregates, and <code>ORDER BY</code> over the
-        join, checked against expected output by the sqllogictest harness.</li>
+    <li><strong><code>ferricdb-sql</code></strong> — <code>ms6_join_and_group_by_parse</code>
+        checks <code>JOIN … ON</code>, aliases, <code>GROUP BY</code>, and <code>COUNT(*)</code>;
+        <code>ms6_cross_join_and_comma_from</code> checks <code>CROSS JOIN</code> and comma-separated
+        <code>FROM</code> lists.</li>
+    <li><strong><code>ms6_inner_join_drops_orphans</code></strong> — inner join over
+        <code>c</code>/<code>o</code> drops orphaned orders, plus cross-join row count
+        (<code>SELECT COUNT(*) FROM c, o</code>).</li>
+    <li><strong><code>ms6_group_by_aggregates</code></strong> — grouped <code>COUNT(*)</code>
+        and <code>SUM(total)</code> over a join (with implicit <code>Integer → Float</code>
+        widening on insert), plus zero-row global aggregates returning <code>0</code> for
+        <code>COUNT(*)</code> and <code>NULL</code> for <code>SUM/MIN/MAX/AVG</code>.</li>
+    <li><strong><code>ms6_external_sorter_spills_runs</code></strong> — drives
+        <code>ExternalSorter</code> directly with 1,500 scrambled rows plus a <code>NULL</code>
+        under a 4-page (32&nbsp;KB) budget, asserting <code>spilled_runs() &gt; 0</code>, exact
+        sorted output, and <code>NULL</code> sorted last.</li>
+    <li><strong><code>ms6_external_sort_under_tiny_budget</code></strong> — executes
+        <code>SELECT k FROM big ORDER BY k</code> over 2,000 wide rows with
+        <code>memory_pages = 4</code> (3-way merge) and compares the spilled output against the
+        default in-memory budget.</li>
+    <li><strong><code>ms6_slt_joins_agg_sort</code> &amp; <code>slt_all</code></strong> — runs
+        <code>tests/slt/ms6_joins_agg_sort.slt</code> (TPC-H-inspired queries over
+        <code>customer</code>/<code>orders</code>: joins under filters, <code>GROUP BY</code>
+        aggregates, <code>AVG</code>, multi-key <code>ORDER BY</code>, <code>LIMIT</code>, and
+        <code>COUNT(*)</code> vs <code>COUNT(col)</code> with <code>NULL</code>s) and then all
+        <code>.slt</code> files together.</li>
   </ul>
   <p>Debugging tip: when an slt query disagrees, re-run its pieces in the REPL and shrink —
   drop the <code>ORDER BY</code>, then the <code>GROUP BY</code>, then swap
@@ -609,37 +717,46 @@ cargo test --workspace</code></pre>
     the pass-count math predicts.</p>
   </div>
   <div class="callout pitfall">
-    <span class="callout-title">Pitfall — join output schema: ordering and duplicate names</span>
-    <p><em>Why:</em> after binding, every column reference is a bare offset into the combined
-    row. If the binder assumes left-then-right but an executor concatenates right-then-left —
-    or forgets to add the left child’s column count to right-side offsets — every reference
-    to the right table reads the wrong slot. And both children may legitimately contain a
-    column named <code>id</code>; the combined schema keeps both, disambiguated only by
-    qualifier at bind time. <em>Symptom:</em> values from the wrong table in query results,
-    type errors deep in expression evaluation, or projections that “work” on
-    <code>SELECT *</code> but break the moment column order changes.</p>
+    <span class="callout-title">Pitfall — join output schema: ordering, <code>table_idx</code> resolution, and duplicate names</span>
+    <p><em>Why:</em> <code>Binder</code> keeps every column reference as
+    <code>(table_idx, col_idx)</code> (each table's own schema ordinal), and
+    <code>Planner::create_executor</code> resolves those pairs into flat row offsets against each
+    operator's input layout. If a join executor concatenates right-then-left while
+    <code>create_executor</code> assumes left-then-right — or if you offset right-side columns in
+    the binder instead of at lowering time, breaking <code>HashJoin::right_keys</code> and
+    Milestone&nbsp;7 join reordering — every reference to the right table reads the wrong slot. And
+    both children may legitimately contain a column named <code>id</code>; the combined schema keeps
+    both, disambiguated only by qualifier at bind time. <em>Symptom:</em> out-of-bounds panics in
+    <code>HashJoin</code> key evaluation, values from the wrong table in query results, type errors
+    deep in expression evaluation, or projections that “work” on <code>SELECT *</code> but break the
+    moment column order changes.</p>
   </div>
 
   <h2 id="sec-done">Definition of done</h2>
   <ul>
-    <li><code>cargo test -p ferricdb-exec -- --include-ignored ms6_</code> passes — every
-        provided Milestone 6 test is green.</li>
-    <li><code>cargo test -p ferricdb -- slt_all</code> passes, including
-        <code>ms6_joins_agg_sort.slt</code> (TPC-H-inspired mini queries over the small
-        <code>customer</code>/<code>orders</code> tables).</li>
-    <li>The external-sort test passes under its artificially tiny memory budget, and its
-        output is exactly equal to the in-memory sort result on the same input.</li>
+    <li><code>cargo test -p ferricdb-sql -- --include-ignored ms6_</code> and
+        <code>cargo test -p ferricdb-exec -- --include-ignored ms6_</code> pass in full (keeping
+        the <code>#[ignore]</code> attributes intact).</li>
+    <li><code>cargo test -p ferricdb -- --include-ignored ms6_slt_joins_agg_sort</code> and
+        <code>cargo test -p ferricdb -- --include-ignored slt_all</code> pass, including
+        <code>ms6_joins_agg_sort.slt</code> (TPC-H-inspired mini queries over
+        <code>customer</code>/<code>orders</code>).</li>
+    <li><code>ms6_external_sorter_spills_runs</code> proves <code>spilled_runs() &gt; 0</code>
+        under a 4-page budget, and <code>ms6_external_sort_under_tiny_budget</code> matches the
+        in-memory sort result identically (with NULLs last in both <code>ASC</code> and
+        <code>DESC</code>).</li>
     <li><code>NestedLoopJoin</code> produces correct results for non-equality
         <code>ON</code> predicates and for cross joins; the planner routes pure equi-join
-        <code>ON</code> clauses to <code>HashJoin</code> and everything else to
-        <code>NestedLoopJoin</code>.</li>
+        <code>ON</code> clauses to <code>HashJoin</code> (build left, probe right) and everything
+        else to <code>NestedLoopJoin</code>.</li>
     <li>Aggregates ignore <code>NULL</code> inputs, <code>COUNT(*)</code> counts rows, and a
         global aggregate over zero rows returns one row of <code>COUNT = 0</code> and
         <code>NULL</code>s.<sup class="cite"><a href="#ref-8">8</a></sup></li>
     <li><code>ExternalSorter</code> never holds more than <code>memory_pages</code> pages’
         worth of tuple bytes, spills every run — including the final partial one — through
-        the <code>PageStore</code>, and merges at most B − 1 runs per pass.</li>
-    <li><code>cargo test --workspace</code> stays green: no regressions in Milestones 0–5.</li>
+        the <code>PageStore</code>, and merges up to <code>k = max(2, B − 1)</code> runs per pass.</li>
+    <li>Earlier <code>ms1_</code>–<code>ms5_</code> suites (via <code>--include-ignored</code>) and
+      the baseline <code>cargo test --workspace</code> stay green: no regressions in Milestones 0–5.</li>
   </ul>
 
   <h2 id="sec-quiz">Check your understanding</h2>
@@ -707,13 +824,13 @@ cargo test --workspace</code></pre>
     <ul>
       <li>The rest of interdb §3.5 — how the planner chooses among the three join
           algorithms and represents them as plan nodes; a preview of Milestone 7.
-          <a href="https://www.interdb.jp/pg/pgsql03/05.html">interdb.jp §3.5</a></li>
+          <a href="https://www.interdb.jp/pg/pgsql03/05.html" rel="external">interdb.jp §3.5</a></li>
       <li>CS186 Note 10 “Query Optimization” — cost-based join ordering, the reason your
           planner’s hash-vs-nested-loop rule is only a placeholder.
-          <a href="https://cs186berkeley.net/notes/note10/">cs186berkeley.net/notes/note10</a></li>
+          <a href="https://cs186berkeley.net/notes/note10/" rel="external">cs186berkeley.net/notes/note10</a></li>
       <li><code>std::collections::BinaryHeap</code> — the k-way merge’s best friend; note
           it is a max-heap, hence <code>Reverse</code>.
-          <a href="https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html">doc.rust-lang.org</a></li>
+          <a href="https://doc.rust-lang.org/std/collections/struct.BinaryHeap.html" rel="external">doc.rust-lang.org</a></li>
     </ul>
 
     <nav class="prevnext">
@@ -726,6 +843,7 @@ cargo test --workspace</code></pre>
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "index"],
     current: ["executor"],

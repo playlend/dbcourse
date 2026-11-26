@@ -8,7 +8,7 @@ use bytes::BytesMut;
 use ferricdb_common::Error;
 use ferricdb_server::protocol::{
     read_backend_message, read_message, write_frontend_message, write_message, BackendMessage,
-    FieldDescription, FrontendMessage, PROTOCOL_VERSION,
+    FieldDescription, FrontendMessage, PROTOCOL_VERSION, SSL_REQUEST_CODE,
 };
 
 fn frontend_roundtrip(msg: FrontendMessage, startup: bool) {
@@ -258,4 +258,168 @@ fn ms10_two_messages_in_one_buffer_parse_in_order() {
     let second = read_message(&mut buf, false).unwrap().unwrap();
     assert_eq!(second, FrontendMessage::Terminate);
     assert!(buf.is_empty());
+}
+
+#[test]
+#[ignore = "milestone 10"]
+fn ms10_ssl_request_roundtrip_and_exact_bytes() {
+    let mut buf = BytesMut::new();
+    write_frontend_message(&mut buf, &FrontendMessage::SslRequest).unwrap();
+    let expected = [
+        0x00,
+        0x00,
+        0x00,
+        0x08, // Int32 length = 8
+        ((SSL_REQUEST_CODE >> 24) & 0xff) as u8,
+        ((SSL_REQUEST_CODE >> 16) & 0xff) as u8,
+        ((SSL_REQUEST_CODE >> 8) & 0xff) as u8,
+        (SSL_REQUEST_CODE & 0xff) as u8,
+    ];
+    assert_eq!(&buf[..], &expected[..]);
+
+    let decoded = read_message(&mut buf, true).unwrap().unwrap();
+    assert_eq!(decoded, FrontendMessage::SslRequest);
+    assert!(buf.is_empty());
+}
+
+#[test]
+#[ignore = "milestone 10"]
+fn ms10_negative_length_and_bad_startup_version_error() {
+    // Negative Int32 length (-1) must error immediately, not wait for 4 GiB.
+    let mut neg = BytesMut::from(&[b'Q', 0xFF, 0xFF, 0xFF, 0xFF][..]);
+    assert!(matches!(
+        read_message(&mut neg, false),
+        Err(Error::Protocol(_))
+    ));
+
+    // Unknown startup protocol version (neither 196608 nor SSL_REQUEST_CODE).
+    let mut bad_ver = BytesMut::from(&[0x00, 0x00, 0x00, 0x08, 0x00, 0x02, 0x00, 0x00][..]);
+    assert!(matches!(
+        read_message(&mut bad_ver, true),
+        Err(Error::Protocol(_))
+    ));
+}
+
+#[tokio::test]
+#[ignore = "milestone 10"]
+async fn ms10_server_ssl_decline_and_simple_query_over_tcp() {
+    use ferricdb_buffer::{BufferPoolManager, ClockReplacer};
+    use ferricdb_catalog::Catalog;
+    use ferricdb_exec::ExecContext;
+    use ferricdb_server::{Server, ServerConfig};
+    use ferricdb_storage::{DiskManager, PageStore};
+    use ferricdb_txn::TransactionManager;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    let dir = tempfile::tempdir().unwrap();
+    let disk = DiskManager::open(&dir.path().join("srv.db")).unwrap();
+    let pool: Arc<dyn PageStore> = Arc::new(BufferPoolManager::new(
+        32,
+        disk,
+        Box::new(ClockReplacer::new(32)),
+    ));
+    let catalog = Arc::new(Catalog::bootstrap(Arc::clone(&pool)).unwrap());
+    let ctx = Arc::new(ExecContext::new(
+        catalog,
+        pool,
+        Arc::new(TransactionManager::new()),
+    ));
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Server::new(
+        ServerConfig {
+            addr: addr.to_string(),
+            password: None,
+        },
+        ctx,
+    );
+    let srv_handle = tokio::spawn(async move {
+        let _ = server.serve(listener).await;
+    });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // 1. Send SSLRequest; server declines cleanly with 'N'.
+    let mut out = BytesMut::new();
+    write_frontend_message(&mut out, &FrontendMessage::SslRequest).unwrap();
+    stream.write_all(&out).await.unwrap();
+    let mut ssl_reply = [0u8; 1];
+    stream.read_exact(&mut ssl_reply).await.unwrap();
+    assert_eq!(ssl_reply, [b'N'], "server must decline SSLRequest with 'N'");
+
+    // 2. Send StartupMessage and read until ReadyForQuery('I').
+    out.clear();
+    write_frontend_message(
+        &mut out,
+        &FrontendMessage::StartupMessage {
+            params: vec![("user".into(), "ferris".into())],
+        },
+    )
+    .unwrap();
+    stream.write_all(&out).await.unwrap();
+
+    let mut in_buf = BytesMut::new();
+    let mut saw_auth_ok = false;
+    let mut saw_ready = false;
+    while !saw_ready {
+        while let Some(msg) = read_backend_message(&mut in_buf).unwrap() {
+            match msg {
+                BackendMessage::AuthenticationOk => saw_auth_ok = true,
+                BackendMessage::ReadyForQuery { txn_status } => {
+                    assert_eq!(txn_status, b'I');
+                    assert!(saw_auth_ok);
+                    saw_ready = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        if saw_ready {
+            break;
+        }
+        let n = stream.read_buf(&mut in_buf).await.unwrap();
+        assert!(n > 0, "server closed before ReadyForQuery");
+    }
+
+    // 3. Send a simple query and verify DataRow + CommandComplete + ReadyForQuery.
+    out.clear();
+    write_frontend_message(
+        &mut out,
+        &FrontendMessage::Query {
+            sql: "SELECT 1 + 1;".into(),
+        },
+    )
+    .unwrap();
+    stream.write_all(&out).await.unwrap();
+
+    let mut saw_two = false;
+    let mut done = false;
+    while !done {
+        let n = stream.read_buf(&mut in_buf).await.unwrap();
+        assert!(n > 0, "server closed mid-query");
+        while let Some(msg) = read_backend_message(&mut in_buf).unwrap() {
+            match msg {
+                BackendMessage::DataRow { values } => {
+                    if values == vec![Some(b"2".to_vec())] {
+                        saw_two = true;
+                    }
+                }
+                BackendMessage::ReadyForQuery { .. } => {
+                    done = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_two, "server must return DataRow([\"2\"])");
+
+    // 4. Terminate cleanly.
+    out.clear();
+    write_frontend_message(&mut out, &FrontendMessage::Terminate).unwrap();
+    stream.write_all(&out).await.unwrap();
+    srv_handle.abort();
 }

@@ -42,7 +42,7 @@
       <li><a href="#sec-tests">Test plan</a></li>
       <li><a href="#sec-pitfalls">Common pitfalls</a></li>
       <li><a href="#sec-done">Definition of done</a></li>
-      <li><a href="#sec-quiz">Check yourself</a></li>
+      <li><a href="#sec-quiz">Check your understanding</a></li>
       <li><a href="#sec-sources">Primary sources</a></li>
       <li><a href="#sec-deeper">Go deeper</a></li>
     </ol>
@@ -106,74 +106,93 @@
 
   <h3 id="spec-tree">The tree (crates/index)</h3>
   <p>You implement package <code>ferricdb-index</code> in <code>course/ferricdb/crates/index</code>.
-  The public surface, from the API spec:</p>
+  The public surface, quoted verbatim from <code>course/ferricdb/docs/api-spec.md</code> (note that
+  <code>open</code> and <code>root_page</code> are already implemented in the starter stub):</p>
   <pre><code>// crates/index/src/lib.rs — public surface to implement
 
-/// Disk-resident B+Tree mapping a single-column key to RecordIds.
-/// One node = one page. Keys are Values of one DataType.
+/// Disk-resident B+Tree mapping a single-column key to RecordIds, ordered by
+/// composite `(key, rid)` (PostgreSQL heap-TID tie-breaker design: supports
+/// non-unique secondary indexes AND Milestone 8 MVCC out-of-place updates).
+/// One node = one page. Rejects Value::Null, Float(NaN), and mismatched types.
 pub struct BPlusTree { /* Arc&lt;dyn PageStore&gt;, root PageId, key type */ }
 impl BPlusTree {
     pub fn create(store: std::sync::Arc&lt;dyn PageStore&gt;, key_type: DataType) -&gt; Result&lt;Self&gt;;
     pub fn open(store: std::sync::Arc&lt;dyn PageStore&gt;, root: PageId, key_type: DataType) -&gt; Self;
     pub fn root_page(&amp;self) -&gt; PageId;
-    pub fn insert(&amp;mut self, key: &amp;Value, rid: RecordId) -&gt; Result&lt;()&gt;;   // splits as needed
-    pub fn get(&amp;self, key: &amp;Value) -&gt; Result&lt;Option&lt;RecordId&gt;&gt;;
-    pub fn delete(&amp;mut self, key: &amp;Value) -&gt; Result&lt;bool&gt;;                // lazy delete OK
+    pub fn insert(&amp;mut self, key: &amp;Value, rid: RecordId) -&gt; Result&lt;()&gt;;   // errors only on duplicate (key, rid)
+    pub fn get(&amp;self, key: &amp;Value) -&gt; Result&lt;Vec&lt;RecordId&gt;&gt;;              // all matching rids, sorted
+    pub fn delete(&amp;mut self, key: &amp;Value, rid: RecordId) -&gt; Result&lt;bool&gt;; // removes exact (key, rid)
     pub fn range(
         &amp;self,
         lower: std::ops::Bound&lt;Value&gt;,
         upper: std::ops::Bound&lt;Value&gt;,
     ) -&gt; Result&lt;RangeIter&gt;;   // Iterator&lt;Item = Result&lt;(Value, RecordId)&gt;&gt;, leaf-chain walk
-    /// Test hook: verify sortedness, balance, and key-range invariants.
+    /// Test hook: verify sortedness, balance, leaf-chain, and key-range invariants.
     pub fn check_invariants(&amp;self) -&gt; Result&lt;()&gt;;
 }</code></pre>
 
   <p>Semantic notes:</p>
   <ul>
-    <li><strong>Two node kinds.</strong> Internal nodes hold <em>K</em> keys and <em>K</em>+1
-        child page pointers and exist only to route searches; leaf nodes hold keys paired with
-        <code>RecordId</code>s. All entries live at the leaf level — that separation is what makes
-        this a B+Tree rather than a B-Tree.<sup class="cite"><a href="#ref-1">1</a></sup><sup
+    <li><strong>Two node kinds.</strong> Internal nodes hold <em>K</em> separator entries and
+        <em>K</em>+1 child page pointers and exist only to route searches; leaf nodes hold
+        <code>(key, RecordId)</code> entries. All entries live at the leaf level — that separation
+        is what makes this a B+Tree rather than a B-Tree.<sup class="cite"><a href="#ref-1">1</a></sup><sup
         class="cite"><a href="#ref-2">2</a></sup></li>
     <li><strong>Balance.</strong> Every leaf sits at the same depth, and the tree gets taller only
         when the root itself splits.<sup class="cite"><a href="#ref-1">1</a></sup> Your
-        <code>check_invariants</code> must verify both.</li>
-    <li><strong>Unique keys.</strong> Keys are unique, following BusTub, where re-inserting an
-        existing key leaves the tree unchanged and reports failure.<sup class="cite"><a
-        href="#ref-3">3</a></sup> In this milestone you index the primary key and unique-valued
-        secondary columns; decide and document what your <code>insert</code> does on a duplicate
-        (error out or overwrite) — just make it deliberate.</li>
-    <li><strong>Keys are <code>Value</code>s of one <code>DataType</code></strong>, fixed at
-        <code>create</code>/<code>open</code>. Compare them with <code>Value::sql_cmp</code>, and
-        never let a <code>Null</code> key reach the tree (see the pitfalls).</li>
+        <code>check_invariants</code> must verify both, along with the leaf sibling chain and
+        key-range containment.</li>
+    <li><strong>Composite <code>(key, rid)</code> ordering (PostgreSQL style).</strong> Unlike
+        BusTub's unique-key-only B+Tree,<sup class="cite"><a href="#ref-3">3</a></sup> FerricDB
+        orders every entry by the composite pair <code>(key, rid)</code> — the same heap-TID
+        tie-breaker PostgreSQL uses. <code>insert</code> allows multiple distinct
+        <code>RecordId</code>s under the same <code>key</code> (needed both for non-unique secondary
+        indexes like <code>CREATE INDEX idx_items_grp ON items (grp)</code> and for Milestone 8
+        MVCC out-of-place <code>UPDATE</code>s, where two live versions of one row temporarily share
+        the same indexed key) and rejects only an <em>exact duplicate</em> <code>(key, rid)</code>
+        pair with <code>Err(Error::Execution)</code>. <code>get(&amp;key)</code> returns all
+        matching <code>RecordId</code>s in ascending order (<code>Vec&lt;RecordId&gt;</code>), and
+        <code>delete(&amp;key, rid)</code> removes only the exact <code>(key, rid)</code> entry so
+        Milestone 8's <code>VACUUM</code> can prune a dead tuple version without touching a newer
+        version that shares the same key.</li>
+    <li><strong>Key validation &amp; strict total order.</strong> Keys are <code>Value</code>s of
+        one <code>DataType</code>, fixed at <code>create</code>/<code>open</code>. Reject
+        <code>Value::Null</code>, <code>Value::Float(NaN)</code>, and mismatched
+        <code>DataType</code>s with <code>Err(Error::Execution)</code> rather than panicking. Once
+        <code>Null</code> and <code>NaN</code> are excluded, <code>Value::sql_cmp</code> is a strict
+        total order on keys, and <code>(key, rid)</code> is a strict total order on entries
+        (<code>RecordId</code> implements <code>Ord</code>).</li>
     <li><strong>Lazy delete is acceptable</strong> as a first version: remove the leaf entry and
         leave underfull nodes alone. CMU requires merge/redistribution<sup class="cite"><a
         href="#ref-3">3</a></sup>; we defer that to the stretch step, honestly trading disk space
         for a much smaller state space while you stabilize splits.</li>
     <li><strong><code>range</code> takes standard <code>std::ops::Bound</code> pairs</strong>, so
         it must handle <code>Included</code>, <code>Excluded</code>, and <code>Unbounded</code> on
-        each side, and it must walk the leaf sibling chain rather than re-descending from the
-        root per key.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+        each side, walking the leaf sibling chain in ascending <code>(key, rid)</code> order rather
+        than re-descending from the root per key.<sup class="cite"><a href="#ref-3">3</a></sup></li>
   </ul>
 
   <h3 id="spec-layout">Node layout on the page</h3>
   <p>How you arrange bytes inside a node is your design decision, but you should steal the shape
   SQLite uses: after the page header comes a <em>cell pointer array</em> of 2-byte offsets kept in
-  key order, while the cells themselves are packed from the end of the page toward the middle;
-  the space between the two is free.<sup class="cite"><a href="#ref-2">2</a></sup> Inserting into
-  a sorted position then shifts only 2-byte pointers, never whole cells. SQLite's interior pages
-  additionally keep the right-most child pointer in the page header rather than in a cell, so
-  <em>K</em> cells plus one header field give the <em>K</em>+1 children.<sup class="cite"><a
-  href="#ref-2">2</a></sup> The first 16 bytes of every FerricDB page are already reserved by
-  Milestone 1 (pageLSN, page-type tag, padding) — use that type tag to mark pages as index leaf
-  or index internal.</p>
+  <code>(key, rid)</code> order, while the cells themselves are packed from the end of the page
+  toward the middle; the space between the two is free.<sup class="cite"><a href="#ref-2">2</a></sup>
+  Inserting into a sorted position then shifts only 2-byte pointers, never whole cells. SQLite's
+  interior pages additionally keep the right-most child pointer in the page header rather than in a
+  cell, so <em>K</em> cells plus one header field give the <em>K</em>+1 children.<sup class="cite"><a
+  href="#ref-2">2</a></sup> Because duplicate keys can span multiple leaves, store the full
+  composite <code>(key, rid)</code> separator in internal cells too — that keeps every routing
+  comparison strictly unambiguous. The first 16 bytes of every FerricDB page are already reserved by
+  Milestone 1 (<code>pageLSN</code>, <code>page_type</code>, reserved) — stamp them with
+  <code>PAGE_TYPE_BTREE_LEAF</code> (2) and <code>PAGE_TYPE_BTREE_INTERNAL</code> (3) via
+  <code>Page::set_page_type</code>.</p>
 
   <figure>
     <svg viewBox="0 0 920 310" role="img">
       <title>Byte layout of leaf and internal B+Tree node pages: a reserved 16-byte page header,
-      a node header, a cell pointer array growing forward, free space, and cells packed backward
-      from the end of the page. An arrow shows a cell pointer holding the byte offset of its
-      cell.</title>
+      a node header, a cell pointer array growing forward in composite (key, rid) order, free space,
+      and cells packed backward from the end of the page. An arrow shows a cell pointer holding the
+      byte offset of its cell.</title>
       <defs>
         <marker id="fig2-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7"
                 markerHeight="7" orient="auto">
@@ -190,7 +209,7 @@ impl BPlusTree {
       <text x="191" y="82" class="d-mono-sm" text-anchor="middle">count · prev · next</text>
       <rect x="266" y="42" width="170" height="56" rx="4" class="d-box-hl"></rect>
       <text x="351" y="66" class="d-text-sm" text-anchor="middle">cell pointer array</text>
-      <text x="351" y="82" class="d-mono-sm" text-anchor="middle">2-B offsets, key-sorted</text>
+      <text x="351" y="82" class="d-mono-sm" text-anchor="middle">2-B ptrs, (key,rid) order</text>
       <rect x="436" y="42" width="170" height="56" rx="4" class="d-box"
             stroke-dasharray="5 4"></rect>
       <text x="521" y="66" class="d-text-sm" text-anchor="middle">free space</text>
@@ -214,12 +233,12 @@ impl BPlusTree {
       <text x="191" y="248" class="d-mono-sm" text-anchor="middle">count · right-most child</text>
       <rect x="266" y="208" width="170" height="56" rx="4" class="d-box-hl"></rect>
       <text x="351" y="232" class="d-text-sm" text-anchor="middle">cell pointer array</text>
-      <text x="351" y="248" class="d-mono-sm" text-anchor="middle">2-B offsets, key-sorted</text>
+      <text x="351" y="248" class="d-mono-sm" text-anchor="middle">2-B ptrs, (key,rid) order</text>
       <rect x="436" y="208" width="170" height="56" rx="4" class="d-box"
             stroke-dasharray="5 4"></rect>
       <text x="521" y="232" class="d-text-sm" text-anchor="middle">free space</text>
       <rect x="606" y="208" width="294" height="56" rx="4" class="d-box-good"></rect>
-      <text x="753" y="232" class="d-text-sm" text-anchor="middle">cells: (key, child PageId)</text>
+      <text x="753" y="232" class="d-text-sm" text-anchor="middle">cells: ((key, rid), child PageId)</text>
       <text x="753" y="248" class="d-mono-sm" text-anchor="middle">K cells + header child = K+1 children</text>
       <text x="20"  y="282" class="d-mono-sm">byte 0</text>
       <text x="900" y="282" class="d-mono-sm" text-anchor="end">byte 8191</text>
@@ -227,26 +246,29 @@ impl BPlusTree {
     <figcaption>Figure 2 — Suggested node layouts, adapted from SQLite's b-tree page format:<sup
     class="cite"><a href="#ref-2">2</a></sup> a sorted array of 2-byte cell pointers grows
     forward, cells grow backward, and an internal node keeps its right-most child pointer in the
-    node header.</figcaption>
+    node header. Carrying the 6-byte <code>RecordId</code> tie-breaker in internal separators keeps
+    routing unambiguous even when duplicate keys span multiple leaves.</figcaption>
   </figure>
 
   <p>A worked fanout example with course numbers, so you can sanity-check your own layout. Take an
-  <code>INTEGER</code> key: an internal cell is an 8-byte key plus a 4-byte child
-  <code>PageId</code>, plus its 2-byte cell pointer — 14 bytes per entry. With 8,192-byte pages
-  and 32 bytes of headers, that is ⌊8,160&nbsp;/&nbsp;14⌋&nbsp;≈&nbsp;582 children per internal
-  node. A leaf cell is an 8-byte key plus a 6-byte <code>RecordId</code> (u32 page, u16 slot) plus
-  the 2-byte pointer — 16 bytes, so ≈&nbsp;510 entries per leaf. A height-3 tree — root, one
-  internal level, leaves — then addresses about 582&nbsp;×&nbsp;582&nbsp;×&nbsp;510&nbsp;≈
-  173&nbsp;million keys, reachable in three page reads. That is the whole argument for B+Trees:
-  logarithmic point lookups with a base in the hundreds, plus ordered traversal that a hash table
-  cannot give you.<sup class="cite"><a href="#ref-1">1</a></sup> <code>TEXT</code> keys are
-  variable-length, so do not hard-code a max cell count: a node is “full” when the incoming cell
-  no longer fits in free space, exactly like <code>PageFull</code> in Milestone 1.</p>
+  <code>INTEGER</code> key: an internal cell is an 8-byte key plus a 6-byte <code>RecordId</code>
+  tie-breaker plus a 4-byte child <code>PageId</code>, plus its 2-byte cell pointer — 20 bytes per
+  entry. With 8,192-byte pages and 32 bytes of headers, that is ⌊8,160&nbsp;/&nbsp;20⌋&nbsp;=&nbsp;408
+  separators (409 children) per internal node. A leaf cell is an 8-byte key plus a 6-byte
+  <code>RecordId</code> (<code>u32</code> page, <code>u16</code> slot) plus the 2-byte pointer — 16
+  bytes, so ≈&nbsp;510 entries per leaf. A height-3 tree — root, one internal level, leaves — then
+  addresses about 409&nbsp;×&nbsp;409&nbsp;×&nbsp;510&nbsp;≈&nbsp;85&nbsp;million entries, reachable
+  in three page reads. That is the whole argument for B+Trees: logarithmic point lookups with a base
+  in the hundreds, plus ordered traversal that a hash table cannot give you.<sup class="cite"><a
+  href="#ref-1">1</a></sup> <code>TEXT</code> keys are variable-length, so do not hard-code a max
+  cell count: a node is “full” when the incoming cell no longer fits in free space, exactly like
+  <code>PageFull</code> in Milestone 1 (and note that <code>ms5_text_keys_height_three_internal_splits</code>
+  uses 159-byte text keys specifically to force ~120 leaves and height-3 internal splits within 4,000 inserts).</p>
 
   <h3 id="spec-integration">Integration surface (crates/sql, crates/catalog, crates/exec)</h3>
   <p>The tree alone is invisible to SQL. Three existing crates gain small, already-stubbed pieces
-  this milestone:</p>
-  <pre><code>// crates/sql — ast::Statement gains one variant:
+  this milestone (quoted verbatim from <code>api-spec.md</code>):</p>
+  <pre><code>// crates/sql — ast::Statement gains one variant (already declared in ast.rs):
 CreateIndex { name: String, table: String, column: String },       // MS5
 
 // crates/catalog — every index is a catalog object:
@@ -260,16 +282,23 @@ impl Catalog {
 }
 
 // crates/exec — plan::LogicalPlan gains one variant:
-IndexScan { table: TableInfo, index: IndexInfo,
+IndexScan { table_idx: usize, table: TableInfo, index: IndexInfo,
             lower: Bound&lt;Value&gt;, upper: Bound&lt;Value&gt; },             // MS5</code></pre>
   <p>A complete b-tree is reachable from its root page alone, so the root page number is the
   identity of the index — SQLite stores exactly that in its schema table.<sup class="cite"><a
   href="#ref-2">2</a></sup> FerricDB does the same: <code>IndexInfo.root_page</code> in the
-  catalog. When a root split changes the root (see pitfalls), <code>set_index_root</code> is how
-  the new identity gets persisted. The planner rule this milestone is deliberately naive: if the
-  filter constrains an indexed column with <code>=</code>, <code>&lt;</code>, <code>&lt;=</code>,
-  <code>&gt;</code>, or <code>&gt;=</code>, emit <code>IndexScan</code> with the matching bounds;
-  otherwise <code>SeqScan</code>. Whether the index is actually the cheaper choice is
+  catalog. In <code>crates/catalog</code>, persist index definitions across reopens alongside
+  <code>__tables</code> and <code>__columns</code> — e.g., in a fixed-page-id <code>__indexes</code>
+  system heap file allocated at bootstrap (or an extra catalog page linked from your catalog
+  bootstrap header) storing <code>(oid, name, table, column, root_page)</code> tuples. When a root
+  split moves the root (see pitfalls), <code>set_index_root</code> updates both the in-memory cache
+  and the on-disk record (for example by tombstoning the old <code>__indexes</code> tuple and
+  inserting the updated row). Notice that <code>LogicalPlan::IndexScan</code> has <em>no</em>
+  <code>filter</code> field: the planner extracts bounds for an indexed column from
+  <code>=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, or <code>&gt;=</code>
+  conjuncts and emits <code>IndexScan</code>, keeping any residual predicates as a
+  <code>LogicalPlan::Filter</code> node <em>above</em> the <code>IndexScan</code>. Whether the index
+  is actually cheaper than <code>SeqScan</code> is
   <a href="../milestone-07/index.html">Milestone 7</a>'s cost-model problem, not yours today.</p>
 
   <h2 id="sec-guidance">Step-by-step guidance</h2>
@@ -282,15 +311,16 @@ IndexScan { table: TableInfo, index: IndexInfo,
       and next-leaf <code>PageId</code>s; for internal nodes — cell count, free-space offset,
       right-most child. Write the layout as a comment block at the top of the module and treat it
       as a contract. Decide your separator convention now too: FerricDB pages use “child
-      <em>i</em> holds keys &lt; separator <em>i</em>; keys ≥ the last separator go to the
-      right-most child”, but any convention works if search and split agree on it (SQLite routes
-      with ≤/&gt; instead<sup class="cite"><a href="#ref-2">2</a></sup>).</p></li>
+      <em>i</em> holds entries &lt; separator <em>i</em> (comparing composite <code>(key, rid)</code>);
+      entries ≥ the last separator go to the right-most child”, but any convention works if search
+      and split agree on it (SQLite routes with ≤/&gt; instead<sup class="cite"><a href="#ref-2">2</a></sup>).</p></li>
 
     <li><p><strong>Build typed page views, then unit-test them in isolation.</strong> Mirror the
-      <code>HeapPage</code> pattern from Milestone 1: private <code>LeafNode</code>/<code>
-      InternalNode</code> structs that <code>init</code> or <code>attach</code> over a
-      <code>&amp;mut Page</code> and expose cell-level operations — <code>key_at(i)</code>,
-      <code>insert_at(i, cell)</code>, and a binary search returning
+      <code>HeapPage</code>/<code>HeapPageRef</code> pattern from Milestone 1: private
+      <code>LeafNode</code>/<code>InternalNode</code> structs that <code>init</code> or
+      <code>attach</code> over a <code>&amp;mut Page</code> (plus read-only views for
+      <code>with_page</code>) and expose cell-level operations — <code>entry_at(i)</code> returning
+      <code>(Value, RecordId)</code>, <code>insert_at(i, cell)</code>, and a binary search returning
       <code>Result&lt;usize, usize&gt;</code> like the standard library's. Use binary search from
       the start; CMU warns that linear scans of 500-entry nodes will blow your time budget.<sup
       class="cite"><a href="#ref-3">3</a></sup> You can test “insert sorted, search, split at
@@ -298,79 +328,107 @@ IndexScan { table: TableInfo, index: IndexInfo,
 
     <li><p><strong>Write <code>check_invariants</code> and a debug dump before insert.</strong>
       This inverts the obvious order on purpose. The checker is a recursive walk that verifies:
-      keys strictly ascending within every node, every child's keys inside the parent's separator
-      range, every leaf at the same depth, and the leaf chain visiting keys in globally sorted
-      order. BusTub ships a tree-printer tool for exactly this reason<sup class="cite"><a
-      href="#ref-3">3</a></sup>; your <code>Display</code>-style dump of “page id → keys per
-      level” is 30 lines and will save you hours. Call the checker after <em>every</em> mutation
-      in your own tests.</p></li>
+      <code>(key, rid)</code> pairs strictly ascending within every node (no exact duplicates),
+      every child's entries inside the parent's separator bounds, every leaf at the same depth,
+      and the leaf chain visiting exactly the leaves reachable from the root in globally sorted
+      <code>(key, rid)</code> order. BusTub ships a tree-printer tool for exactly this reason<sup
+      class="cite"><a href="#ref-3">3</a></sup>; your <code>Display</code>-style dump of “page id
+      → entries per level” is 30 lines and will save you hours. Call the checker after
+      <em>every</em> mutation in your own tests.</p></li>
 
-    <li><p><strong>Point search.</strong> <code>get</code> descends from the root: binary-search
-      the internal node's separators to choose a child, repeat until a leaf, binary-search the
-      leaf for an exact match. Deserialize only the key you are probing (you stored its cell
-      offset; you know the key <code>DataType</code>), and compare with
-      <code>Value::sql_cmp</code>. If your search visits more nodes than the tree's height,
-      something is wrong.</p></li>
+    <li><p><strong>Point lookup (<code>get</code>).</strong> Because multiple distinct
+      <code>RecordId</code>s can share the same <code>key</code> — and may even span across
+      adjacent leaf pages — <code>get(&amp;key)</code> descends to the first leaf that could hold
+      <code>(key, RecordId { page_id: 0, slot: 0 })</code>, binary-searches to the first matching
+      entry, and collects every entry with that <code>key</code> (hopping to the next sibling leaf
+      if the run reaches the end of the page) until a strictly larger key or end-of-chain is
+      reached — or equivalently delegates to
+      <code>range(Bound::Included(key.clone()), Bound::Included(key.clone()))</code>. Validate
+      <code>key</code> up front (reject <code>Null</code>, <code>NaN</code>, and wrong
+      <code>DataType</code>) and compare with <code>Value::sql_cmp</code>.</p></li>
 
-    <li><p><strong>Insert, then the leaf split.</strong> While descending, record the path as a
+    <li><p><strong>Insert, then the leaf split.</strong> Validate <code>key</code> first, then
+      descend by composite <code>(key, rid)</code> while recording the path as a
       <code>Vec&lt;(PageId, usize)&gt;</code> of (node, chosen-child slot) — this replaces parent
       pointers and is the same role BusTub's write-set context plays.<sup class="cite"><a
-      href="#ref-3">3</a></sup> If the leaf has room, insert and stop. Otherwise: allocate a new
-      page from the <code>PageStore</code>, move the upper half of the cells into it, stitch the
-      leaf chain (new node inherits the old <code>next</code>; old node points at the new one),
-      and insert the new leaf's <em>first key</em> into the parent at the recorded slot —
-      <em>copied</em> up, so it still exists in the leaf (Figure 3). A useful timing rule from
-      CMU: split a leaf when it is full <em>after</em> insertion, split an internal node when
-      full <em>before</em> insertion — it avoids nasty overflow corner cases.<sup class="cite"><a
+      href="#ref-3">3</a></sup> In the target leaf, binary-search for <code>(key, rid)</code>: if
+      that exact pair is already present, return <code>Err(Error::Execution)</code> without
+      modifying the tree (same <code>key</code> with a different <code>rid</code> is allowed!). If
+      the leaf has room, insert and stop. Otherwise: allocate a new page from the
+      <code>PageStore</code>, move the upper half of the cells into it, stitch the leaf chain (new
+      node inherits the old <code>next</code>; old node points at the new one), and insert the new
+      leaf's <em>first <code>(key, rid)</code> entry</em> into the parent at the recorded slot —
+      <em>copied</em> up, so it still exists in the leaf (Figure 3). Because FerricDB supports
+      variable-length <code>TEXT</code> keys, test fullness by checking whether the incoming cell
+      plus its 2-byte pointer fits in <code>free_space</code> — if not, materialize the sorted cell
+      list with the new entry included and split it cleanly in memory.<sup class="cite"><a
       href="#ref-3">3</a></sup></p></li>
 
     <li><p><strong>Internal splits and the root split.</strong> Inserting the separator can
       overflow the parent; split it by moving the upper half of its cells to a new internal node
-      and <em>pushing</em> the middle key up — it moves to the grandparent and appears in neither
-      half (Figure 3). Recurse up your recorded path. When the node that overflows is the root,
-      allocate a fresh root holding one separator and two children: this is the only way the tree
-      ever gets taller, and it is what keeps every leaf at the same depth.<sup class="cite"><a
-      href="#ref-1">1</a></sup> <code>BPlusTree</code> must report the new root via
-      <code>root_page()</code>, and whoever owns the catalog entry must persist it with
+      and <em>pushing</em> the middle separator up — it moves to the grandparent and appears in
+      neither half (Figure 3). Recurse up your recorded path. When the node that overflows is the
+      root, allocate a fresh root holding one separator and two children: this is the only way the
+      tree ever gets taller, and it is what keeps every leaf at the same depth.<sup class="cite"><a
+      href="#ref-1">1</a></sup> <code>BPlusTree</code> updates <code>self.root</code> (already
+      exposed by <code>root_page()</code>), and whoever owns the catalog entry must persist it with
       <code>set_index_root</code> — BusTub has the identical requirement with its header
       page.<sup class="cite"><a href="#ref-3">3</a></sup> After this step, run the fuzz test for
       the first time.</p></li>
 
-    <li><p><strong>Delete — lazily.</strong> Find the leaf, remove the cell (shift the 2-byte
-      pointers, reclaim the space or leave a gap and compact later), return whether the key was
-      present. Do <em>not</em> merge underfull nodes yet. Consequences you must handle: your
-      invariant checker cannot enforce minimum occupancy, and a leaf may become completely empty
-      while staying in the chain — the range iterator has to skip it without yielding anything.
-      Textbook B+Trees keep every node at least half full<sup class="cite"><a
-      href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-3">3</a></sup>; note in a comment
-      that you are relaxing this, and by how much your fuzz runs actually degrade.</p></li>
+    <li><p><strong>Delete — lazily, by exact <code>(key, rid)</code>.</strong> Validate
+      <code>key</code>, descend by composite <code>(key, rid)</code> to the leaf, and remove only
+      that exact cell (shifting the 2-byte pointers), returning <code>Ok(true)</code> if it was
+      present and <code>Ok(false)</code> otherwise — leaving any sibling entries with the same
+      <code>key</code> and different <code>RecordId</code>s untouched. Do <em>not</em> merge
+      underfull nodes yet. Consequences you must handle: your invariant checker cannot enforce
+      minimum occupancy, and a leaf may become completely empty while staying in the chain — the
+      range iterator has to skip it without yielding anything. Textbook B+Trees keep every node at
+      least half full<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a
+      href="#ref-3">3</a></sup>; note in a comment that you are relaxing this, and by how much your
+      fuzz runs actually degrade.</p></li>
 
-    <li><p><strong>The range iterator.</strong> <code>range(lower, upper)</code> seeks once: for
-      <code>Unbounded</code>, descend to the left-most leaf; for
-      <code>Included(v)</code>/<code>Excluded(v)</code>, descend to <em>v</em>'s leaf and
-      binary-search the starting slot (mind the exclusive case). <code>next()</code> yields
-      <code>(key, rid)</code>, advances the slot, and when it runs off the end of a leaf, hops to
-      the sibling through the next-leaf pointer — sibling pointers exist precisely to make
-      in-order scans cheap.<sup class="cite"><a href="#ref-3">3</a></sup> Check the upper bound on
-      every yielded key and stop past it. Keep the iterator's state minimal — current
-      <code>PageId</code> plus slot index, re-fetching the page per step through
-      <code>with_page</code> — so you never hold a page pinned across the whole scan.</p></li>
+    <li><p><strong>The range iterator.</strong> <code>range(lower, upper)</code> validates any
+      bounded endpoints and seeks once: for <code>Unbounded</code>, descend to the left-most leaf;
+      for <code>Included(v)</code>, seek to <code>(v, min RecordId)</code> so all duplicate keys
+      equal to <code>v</code> are included; for <code>Excluded(v)</code>, seek past
+      <code>(v, max RecordId)</code> (or advance past all entries with <code>key == v</code>).
+      <code>next()</code> yields <code>(key, rid)</code> in ascending composite order, advances the
+      slot, and when it runs off the end of a leaf, hops to the sibling through the next-leaf
+      pointer (skipping empty leaves) — sibling pointers exist precisely to make in-order scans
+      cheap.<sup class="cite"><a href="#ref-3">3</a></sup> Check the upper bound on every yielded
+      key and stop past it (an empty or inverted range yields zero items, not an error). Keep the
+      iterator's state minimal — current <code>PageId</code> plus slot index, re-fetching the page
+      per step through <code>with_page</code> — so you never hold a page pinned across the whole
+      scan.</p></li>
 
-    <li><p><strong>Integrate with SQL.</strong> Five sub-tasks, each small:
-      (a)&nbsp;parse <code>CREATE INDEX name ON table (column)</code> into
-      <code>ast::Statement::CreateIndex</code>, and let the binder verify the table and column
-      exist; (b)&nbsp;execute it: <code>BPlusTree::create</code>, backfill by scanning the heap
-      and inserting <code>(key, rid)</code> for every live row, then
-      <code>catalog.create_index(...)</code> with the final root; (c)&nbsp;maintain indexes in the
-      write executors — <code>Insert</code> adds to every index in
-      <code>TableInfo.indexes</code>, <code>Delete</code> removes, <code>Update</code> removes the
-      old key and inserts the new one when the indexed column changed; (d)&nbsp;have
-      <code>Update</code>/<code>Delete</code> drain their input <code>RecordId</code>s into a
-      buffer <em>before</em> writing, so a scan never observes its own writes (the classic
-      self-updating-scan trap); (e)&nbsp;implement the <code>IndexScan</code> executor:
-      <code>open()</code> builds the range iterator from the plan's bounds, <code>next()</code>
-      resolves each <code>RecordId</code> through the heap and re-applies the full predicate as a
-      residual filter, which keeps the planner rule simple and always correct.</p></li>
+    <li><p><strong>Integrate with SQL, catalog, and executor.</strong> Six small sub-tasks across
+      three crates:
+      (a)&nbsp;in <code>crates/sql</code>, parse <code>CREATE INDEX name ON table (column)</code>
+      into <code>ast::Statement::CreateIndex</code> (<code>Keyword::Index</code> and
+      <code>Keyword::On</code> are already in the lexer enum);
+      (b)&nbsp;in <code>crates/catalog</code>, implement <code>create_index</code> (validating
+      table, column, and unique index name) and <code>set_index_root</code>, persisting index
+      metadata in a system heap page (e.g. <code>__indexes</code>) so indexes and updated roots
+      survive reopen;
+      (c)&nbsp;in <code>crates/exec</code>, bind <code>CreateIndex</code> and execute it:
+      <code>BPlusTree::create</code>, backfill by scanning the heap and inserting every non-NULL
+      <code>(key, rid)</code>, then register the tree with
+      <code>catalog.create_index(..., tree.root_page())</code>;
+      (d)&nbsp;maintain every index in <code>TableInfo.indexes</code> inside the write executors —
+      <code>Insert</code> adds <code>(key, rid)</code>, <code>Delete</code> removes
+      <code>(key, rid)</code>, <code>Update</code> removes <code>(old_key, old_rid)</code> and
+      inserts <code>(new_key, new_rid)</code> (calling <code>catalog.set_index_root</code> whenever
+      <code>tree.root_page()</code> changes!);
+      (e)&nbsp;keep the Halloween guard from Milestone 4 intact so <code>Update</code>/<code>Delete</code>
+      never observe their own writes;
+      (f)&nbsp;in the planner, detect equality/range predicates on an indexed column and emit
+      <code>LogicalPlan::IndexScan { table_idx, table, index, lower, upper }</code> — because
+      <code>IndexScan</code> has <em>no</em> <code>filter</code> field, wrap it in a
+      <code>LogicalPlan::Filter</code> node above it whenever residual predicates remain. The
+      <code>IndexScan</code> executor builds a <code>RangeIter</code> in <code>open()</code> and
+      resolves each <code>RecordId</code> through the table's <code>HeapFile</code> in
+      <code>next()</code>.</p></li>
 
     <li><p><strong>Stretch: rebalance and latch crabbing.</strong> Real deletion: on underflow,
       borrow a cell from a sibling (updating the parent separator) or merge with it (removing the
@@ -455,50 +513,70 @@ IndexScan { table: TableInfo, index: IndexInfo,
     <figcaption>Figure 3 — The split rule that corrupts more student B+Trees than any other.
     Leaves copy the separator up because every entry must remain findable at the leaf level;<sup
     class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup>
-    internal keys only route, so an internal split pushes the middle key up and out.</figcaption>
+    internal keys only route, so an internal split pushes the middle separator up and out. (Shown
+    with bare integer keys for clarity; with composite entries, the separator carried upward is the
+    full <code>(key, rid)</code> pair.)</figcaption>
   </figure>
 
   <h2 id="sec-tests">Test plan</h2>
-  <p>The starter workspace ships every Milestone 5 test marked
-  <code>#[ignore = "milestone 5"]</code> with an <code>ms5_</code> name prefix. You do not edit
-  the tests to activate them: <code>--include-ignored</code> runs ignored tests too, and the
-  <code>ms5_</code> filter selects just this milestone's group. (Once you are done, you may also
-  delete the <code>#[ignore]</code> attributes so plain <code>cargo test</code> keeps guarding
-  the crate.)</p>
-  <pre><code># from course/ferricdb/ — the tree itself: unit, property, and fuzz tests
+  <p>The starter workspace ships Milestone 5 tests across four crates, all marked
+  <code>#[ignore = "milestone 5"]</code> with an <code>ms5_</code> name prefix. Do <strong>not</strong>
+  delete the <code>#[ignore]</code> attributes: per the workspace <code>README.md</code>, run them
+  with <code>--include-ignored ms5_</code> so plain <code>cargo test --workspace</code> stays green
+  in CI:</p>
+  <pre><code># from course/ferricdb/ — the B+Tree itself (9 tests: point ops, duplicates, splits, fuzz, range, reopen)
 cargo test -p ferricdb-index -- --include-ignored ms5_
 
-# end-to-end SQL behaviour (CREATE INDEX, index maintenance, IndexScan),
-# via the sqllogictest files crates/ferricdb/tests/slt/ms5_*.slt
-cargo test -p ferricdb slt_all</code></pre>
+# catalog index persistence (ms5_create_index_and_set_root_persist)
+cargo test -p ferricdb-catalog -- --include-ignored ms5_
+
+# SQL parser support (ms5_create_index_parse)
+cargo test -p ferricdb-sql -- --include-ignored ms5_
+
+# end-to-end CREATE INDEX, index maintenance, and IndexScan execution
+cargo test -p ferricdb-exec -- --include-ignored ms5_</code></pre>
   <div class="table-wrap">
     <table>
       <thead>
-        <tr><th>Coverage area</th><th>How it is checked</th></tr>
+        <tr><th>Crate / test(s)</th><th>What is checked</th></tr>
       </thead>
       <tbody>
-        <tr><td>Point operations</td><td><code>ms5_</code> unit tests: insert/get/delete round
-            trips at single-node scale, duplicate handling, empty-tree edge cases.</td></tr>
-        <tr><td>Splits and root growth</td><td><code>ms5_</code> tests insert far past one page's
-            capacity in ascending, descending, and shuffled orders, then verify every key is
-            findable and <code>root_page()</code> changed.</td></tr>
-        <tr><td>Structural invariants</td><td><code>ms5_btree_invariants_fuzz</code>: a
-            seeded-random interleaving of inserts and deletes that calls your own
-            <code>check_invariants</code> after every batch — sorted keys, uniform leaf depth,
-            key-range containment. A seed is printed so failures replay deterministically.</td></tr>
-        <tr><td>Range iteration</td><td><code>ms5_</code> tests compare <code>range()</code>
-            output against a <code>BTreeMap</code> oracle for all nine bound combinations,
-            including scans that cross many leaves.</td></tr>
-        <tr><td>SQL integration</td><td><code>ms5_*.slt</code> files: the same predicate is run
-            with and without an index and must return identical rows — the “index scan ≡ seq
-            scan” cross-check.</td></tr>
+        <tr><td><code>ferricdb-index</code><br><code>ms5_point_get_hit_and_miss</code>,<br><code>ms5_non_unique_keys_and_exact_duplicate_error</code></td>
+            <td>Point lookups, multiple distinct <code>RecordId</code>s stored under the same key
+            returned in ascending order, exact <code>(key, rid)</code> duplicate rejected with
+            <code>Err</code>, and targeted <code>delete(key, rid)</code> removing only that version.</td></tr>
+        <tr><td><code>ferricdb-index</code><br><code>ms5_sequential_ascending_inserts_split_correctly</code>,<br><code>ms5_sequential_descending_inserts_split_correctly</code>,<br><code>ms5_text_keys_height_three_internal_splits</code></td>
+            <td>2,000 ascending/descending integer inserts and 4,000 shuffled 159-byte
+            <code>TEXT</code> keys forcing both leaf splits and height&nbsp;≥&nbsp;3 internal node
+            splits, plus a 500-key multi-leaf range scan.</td></tr>
+        <tr><td><code>ferricdb-index</code><br><code>ms5_btree_invariants_fuzz</code></td>
+            <td>2,500 seeded-random inserts and deletes checked against a
+            <code>BTreeSet&lt;(i64, RecordId)&gt;</code> oracle, calling
+            <code>check_invariants()</code> every 100 operations and verifying the final full
+            <code>range()</code> matches the model in <code>(key, rid)</code> order.</td></tr>
+        <tr><td><code>ferricdb-index</code><br><code>ms5_float_boolean_and_invalid_keys</code>,<br><code>ms5_range_bounds_combinations</code>,<br><code>ms5_reopen_by_root_page</code></td>
+            <td><code>Float</code>/<code>Boolean</code> keys plus rejection of <code>NaN</code>,
+            <code>Null</code>, and wrong <code>DataType</code>; 1,200-key multi-leaf range scans
+            across <code>Included</code>/<code>Excluded</code>/<code>Unbounded</code> and
+            empty/inverted bounds; persistence and reopen from <code>root_page()</code> after root
+            splits.</td></tr>
+        <tr><td><code>ferricdb-catalog</code> &amp; <code>ferricdb-sql</code><br><code>ms5_create_index_and_set_root_persist</code>,<br><code>ms5_create_index_parse</code></td>
+            <td><code>CREATE INDEX</code> parsing; catalog registration, <code>set_index_root</code>
+            updates surviving reopen, and error checks on unknown tables, unknown columns, and
+            duplicate index names.</td></tr>
+        <tr><td><code>ferricdb-exec</code><br><code>ms5_create_index_and_index_scan_execution</code></td>
+            <td>End-to-end <code>CREATE INDEX</code> on both unique (<code>id</code>) and
+            non-unique (<code>grp</code>) columns, backfill + subsequent <code>INSERT</code>
+            maintenance, and point/range/non-unique <code>IndexScan</code> queries.</td></tr>
       </tbody>
     </table>
   </div>
   <p>Write your own tests before trusting the provided ones: after step 5 you should already have
-  a hand-rolled “insert 10,000 sequential integers, get each one back” test. And keep the fuzz
-  test running in a loop while you develop deletion — it is the test that finds split-boundary
-  bugs the deterministic tests miss.</p>
+  a hand-rolled “insert 10,000 sequential integers, get each one back” test, plus a cross-check
+  asserting that <code>IndexScan</code> and <code>SeqScan</code> return identical rows after
+  <code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code>. Keep
+  <code>ms5_btree_invariants_fuzz</code> running while you develop deletion — it finds
+  split-boundary bugs the deterministic tests miss.</p>
 
   <h2 id="sec-pitfalls">Common pitfalls</h2>
 
@@ -547,47 +625,59 @@ cargo test -p ferricdb slt_all</code></pre>
     magic link between them; only your executors keep them in agreement. It is easy to wire index
     inserts into <code>INSERT</code> and stop there. <strong>Symptom:</strong> an
     <code>IndexScan</code> returns a <code>RecordId</code> whose tuple is dead (deleted row still
-    indexed) or misses rows whose indexed column was updated — which is exactly what the
-    “index scan ≡ seq scan” slt cross-checks are designed to catch. Route every write through a
-    single helper that touches the heap and <em>all</em> of <code>TableInfo.indexes</code>, and
-    remember that an <code>UPDATE</code> of an indexed column is a delete-then-insert in the
-    tree.</p>
+    indexed) or misses rows whose indexed column was updated — which is caught immediately when you
+    cross-check <code>IndexScan</code> against <code>SeqScan</code> (and in
+    <code>ms5_create_index_and_index_scan_execution</code> for post-create inserts). Route every
+    write through a single helper that touches the heap and <em>all</em> of
+    <code>TableInfo.indexes</code>, and remember that <em>any</em> <code>UPDATE</code> (even on an
+    unindexed column, because <code>HeapFile</code> updates out of place to a new
+    <code>RecordId</code>) deletes <code>(old_key, old_rid)</code> and inserts
+    <code>(new_key, new_rid)</code> in every index on the table.</p>
   </div>
 
   <div class="callout pitfall">
-    <span class="callout-title">Pitfall — comparing Values of the wrong type</span>
+    <span class="callout-title">Pitfall — comparing Values of the wrong type, NULL, or NaN</span>
     <p><strong>Why it happens:</strong> node search compares a probe key against stored keys with
     <code>Value::sql_cmp</code>, which returns <code>Option&lt;Ordering&gt;</code> — it is
-    <code>None</code> when either side is <code>Null</code>, and mixed types (probing a
-    <code>Text</code> tree with an <code>Integer</code>) have no meaningful ordering.
-    <strong>Symptom:</strong> a panic on <code>unwrap()</code> deep inside binary search if you
-    are lucky; interleaved, unsorted keys and a corrupted tree if you are not. Enforce the
-    boundary once: the tree rejects keys whose <code>data_type()</code> differs from the tree's
-    <code>key_type</code>, the binder has already coerced literals, and rows with a
-    <code>Null</code> in the indexed column are skipped at insert (document this choice next to
-    the code).</p>
+    <code>None</code> when either side is <code>Null</code>, and <code>Float(NaN)</code> or mixed
+    types (probing a <code>Text</code> tree with an <code>Integer</code>) have no meaningful SQL
+    ordering. <strong>Symptom:</strong> a panic on <code>unwrap()</code> deep inside binary search
+    if you are lucky; interleaved, unsorted entries and a corrupted tree if you are not. Enforce
+    the boundary once at every public entry point: reject <code>Value::Null</code>,
+    <code>Value::Float(f)</code> where <code>f.is_nan()</code>, and keys whose
+    <code>data_type()</code> differs from the tree's <code>key_type</code> with
+    <code>Err(Error::Execution)</code>; at the SQL executor layer, skip inserting index entries for
+    rows whose indexed column is <code>Null</code> (tested by
+    <code>ms5_float_boolean_and_invalid_keys</code>).</p>
   </div>
 
   <h2 id="sec-done">Definition of done</h2>
   <ul>
-    <li><code>cargo test -p ferricdb-index -- --include-ignored ms5_</code> passes in full,
-        including <code>ms5_btree_invariants_fuzz</code> — the seeded insert/delete fuzz run that
-        validates sorted keys, uniform leaf depth, and key-range containment through your own
-        <code>check_invariants</code>.</li>
-    <li><code>CREATE INDEX</code> works end to end: it backfills from existing heap rows and the
-        index appears in the catalog with a live root page.</li>
-    <li>Index scans return exactly the same rows as sequential scans for the same predicate —
-        the <code>ms5_*.slt</code> cross-check files pass under <code>slt_all</code>.</li>
+    <li>All four Milestone 5 test suites pass with <code>--include-ignored ms5_</code> (keeping the
+        <code>#[ignore]</code> attributes intact): <code>ferricdb-index</code> (all 9 tests,
+        including <code>ms5_non_unique_keys_and_exact_duplicate_error</code>,
+        <code>ms5_text_keys_height_three_internal_splits</code>, and
+        <code>ms5_btree_invariants_fuzz</code>), <code>ferricdb-catalog</code>
+        (<code>ms5_create_index_and_set_root_persist</code>), <code>ferricdb-sql</code>
+        (<code>ms5_create_index_parse</code>), and <code>ferricdb-exec</code>
+        (<code>ms5_create_index_and_index_scan_execution</code>).</li>
+    <li><code>CREATE INDEX</code> works end to end: it parses, backfills from existing heap rows,
+        persists in the catalog across reopen, and supports both unique and non-unique secondary
+        indexes.</li>
+    <li>Index scans return exactly the same rows as sequential scans for the same predicate, with
+        any residual predicates enforced by a <code>Filter</code> node above
+        <code>IndexScan</code>.</li>
     <li>The planner emits <code>IndexScan</code> for equality and range predicates on an indexed
         column, and still emits <code>SeqScan</code> for everything else.</li>
     <li><code>INSERT</code>, <code>UPDATE</code>, and <code>DELETE</code> maintain every index on
         the table; a reopened database (fresh <code>BPlusTree::open</code> from
         <code>IndexInfo.root_page</code>) still answers correctly after root splits.</li>
-    <li>You can explain, without notes, why the leaf split copies its separator up and the
-        internal split pushes it up.</li>
+    <li>You can explain, without notes, why the leaf split copies its separator up, why the
+        internal split pushes it up, and why composite <code>(key, rid)</code> ordering is needed
+        for both non-unique indexes and MVCC updates.</li>
   </ul>
 
-  <h2 id="sec-quiz">Check yourself</h2>
+  <h2 id="sec-quiz">Check your understanding</h2>
 
   <fieldset class="quiz" data-explain="A B+Tree keeps every entry at the leaf level — internal keys only route. So a leaf split copies the separator up: it becomes a router in the parent AND remains the first key of the right leaf. Only internal splits remove the pushed key from the children.">
     <legend class="quiz-q">After a leaf split, where does the separator key live?</legend>
@@ -616,7 +706,7 @@ cargo test -p ferricdb slt_all</code></pre>
   </fieldset>
 
   <fieldset class="quiz" data-explain="The iterator descends once to the leaf containing the lower bound, then follows next-leaf sibling pointers, checking each key against the upper bound. That single descent plus a linked-list walk is the whole point of chaining the leaves.">
-    <legend class="quiz-q">Executing <code>WHERE k BETWEEN 10 AND 20</code> through the index —
+    <legend class="quiz-q">Executing <code>WHERE k &gt;= 10 AND k &lt;= 20</code> through the index —
     how many times does the scan descend from the root?</legend>
     <label><input type="radio" name="q-ms5-range"> Once per matching key.</label>
     <label><input type="radio" name="q-ms5-range"> Twice — once for each bound.</label>
@@ -655,11 +745,6 @@ cargo test -p ferricdb slt_all</code></pre>
         <a href="https://doc.rust-lang.org/std/ops/enum.Bound.html" rel="external">https://doc.rust-lang.org/std/ops/enum.Bound.html</a></li>
     </ul>
 
-    <h2 id="sec-milestone">Milestone link</h2>
-    <p>Next on the path: <a href="../../modules/m07-joins-sorting-aggregation/index.html">M07 ·
-    Joins, Sorting, Aggregation</a>, then <a href="../milestone-06/index.html">Milestone 6</a> —
-    the executor learns to join, sort, and aggregate.</p>
-
     <nav class="prevnext">
       <a href="../../modules/m04-data-structures-indexes/index.html"><span class="dir">← Previous</span> M04 · B+Trees (and Friends)</a>
       <a class="next" href="../../modules/m07-joins-sorting-aggregation/index.html"><span class="dir">Next →</span> M07 · Joins, Sorting, Aggregation</a>
@@ -670,6 +755,7 @@ cargo test -p ferricdb slt_all</code></pre>
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     done: ["heap", "disk", "buffer", "frontend", "catalog", "planner", "executor"],
     current: ["index"],

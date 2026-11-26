@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Milestone 3 · SQL Front-End: Lexer, Parser, AST, Catalog, Binder — FerricDB Course</title>
+<title>Milestone 3 · SQL Front-End, Catalog, and Binder — FerricDB Course</title>
 <link rel="stylesheet" href="../../assets/style.css">
 <script>
 (function(){try{var t=localStorage.getItem("ferricdb-theme");if(t)document.documentElement.setAttribute("data-theme",t);}catch(e){}})();
@@ -24,9 +24,10 @@
 </header>
 
 <main>
-  <h1>Milestone 3 · SQL Front-End: Lexer, Parser, AST, Catalog, Binder</h1>
-  <p class="subtitle">Teach FerricDB to read: a hand-written lexer and parser, a system catalog
-  stored inside the database itself, and a binder that turns names into checked references.</p>
+  <h1>Milestone 3 · SQL Front-End, Catalog, and Binder</h1>
+  <p class="subtitle">Teach FerricDB to read and remember schemas: a hand-written SQL lexer and
+  recursive-descent + Pratt parser, a self-hosted system catalog persisted in heap pages, and a
+  binder that turns names into checked, typed references.</p>
 
   <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
   all specification content is readable without it.</p></noscript>
@@ -38,6 +39,8 @@
       <li><a href="#sec-reading">Required reading</a></li>
       <li><a href="#sec-arch">Where this fits</a></li>
       <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-pratt">Grammar &amp; 8-level Pratt precedence</a></li>
+      <li><a href="#sec-catalog-binder">Catalog bootstrap &amp; binder design</a></li>
       <li><a href="#sec-guidance">Step-by-step guidance</a></li>
       <li><a href="#sec-tests">Test plan</a></li>
       <li><a href="#sec-pitfalls">Common pitfalls</a></li>
@@ -48,72 +51,124 @@
     </ol>
   </div>
 
-  <p>This is the widest milestone in the course — three crates get real code — but none of it
-  touches concurrency or subtle byte layouts, so it moves faster than its size suggests. At the
-  end, the REPL stops echoing: <code>.ast SELECT 1 + 2 * 3;</code> prints a real parse tree,
-  <code>CREATE TABLE</code> writes real catalog rows into real heap pages through your buffer
-  pool, and <code>.tables</code> finally has something to say.</p>
+  <p>Milestone&nbsp;3 is the widest milestone in the course — three workspace crates receive real
+  code: <code>ferricdb-sql</code>, <code>ferricdb-catalog</code>, and the binder module inside
+  <code>ferricdb-exec</code>. Unlike Milestone&nbsp;2, none of this code fights multi-threaded
+  latching or raw byte alignment, so each piece tests cleanly in isolation and builds steady
+  momentum. By the end, the REPL stops echoing raw strings: <code>.ast SELECT 1 + 2 * 3;</code>
+  renders a parse tree, <code>CREATE TABLE</code> writes catalog rows into heap pages through your
+  Milestone&nbsp;2 buffer pool, <code>.tables</code> and <code>.schema</code> inspect them across
+  restarts, and the binder rejects bad columns and type errors before execution even exists.</p>
 
   <h2 id="sec-objectives">Learning objectives</h2>
   <ul>
-    <li><strong>Implement</strong> a hand-written SQL lexer: case-insensitive keywords, maximal
-      munch, SQL string escapes, positions for errors.</li>
-    <li><strong>Implement</strong> a recursive-descent statement parser with a Pratt expression
-      parser — the sqlparser-rs architecture in miniature.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Design</strong> a catalog that stores table and column metadata in the database
-      itself, bootstrap pages included.</li>
-    <li><strong>Implement</strong> a binder that resolves names and types against the catalog and
-      rejects nonsense with useful errors.</li>
-    <li><strong>Wire</strong> the REPL: <code>.ast</code>, <code>.tables</code>,
-      <code>.schema</code>, and executable <code>CREATE TABLE</code>/<code>DROP TABLE</code>.</li>
+    <li><strong>Implement</strong> a hand-written SQL lexer covering case-insensitive keywords,
+      lowercase-folded identifiers, <code>--</code> line comments, <code>''</code> string escaping,
+      and greedy maximal-munch two-character operators.</li>
+    <li><strong>Implement</strong> a recursive-descent statement parser paired with an 8-level
+      Pratt expression parser — matching the <code>sqlparser-rs</code> design and contrasting with
+      SQLite's Lemon-generated parser.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>Design and implement</strong> a self-hosted <code>Catalog</code> whose own
+      <code>__tables</code> and <code>__columns</code> tables live in heap pages behind a fixed
+      page-0 bootstrap header, mirroring PostgreSQL's compiled-in catalog bootstrap.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li><strong>Implement</strong> the <code>Binder</code> that resolves table and column names to
+      <code>(table_idx, col_idx)</code> pairs, checks types bottom-up with implicit
+      <code>Integer → Float</code> widening, and rejects invalid queries with descriptive
+      <code>Error::Bind</code> messages.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Wire</strong> the REPL end-to-end across <code>DiskManager → BufferPoolManager → Catalog</code>
+      for <code>.open</code>, <code>.tables</code>, <code>.schema</code>, <code>.ast</code>, and
+      persistent DDL.<sup class="cite"><a href="#ref-4">4</a></sup></li>
   </ul>
 
   <h2 id="sec-reading">Required reading</h2>
   <ul>
     <li><a href="../../modules/m05-sql-parsing/index.html">M05 · SQL Front-End</a> — the concept
-      module: Pratt parsing with a worked trace, AST design, the binder's contract. The live
-      demo there is a reference implementation of a subset of your parser.</li>
-    <li>sqlparser-rs design notes — Pratt/TDOP expressions inside recursive-descent statements;
-      the architecture you are reproducing.
-      <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">github.com/apache/datafusion-sqlparser-rs</a></li>
-    <li>SQLite, "Architecture of SQLite" — the contrasting front-end (Lemon-generated parser,
-      bytecode output). <a href="https://sqlite.org/arch.html" rel="external">sqlite.org/arch.html</a></li>
-    <li>cstack, Part 2 — the smallest possible front-end/engine split, worth 10 minutes before
-      you build the real one.
-      <a href="https://cstack.github.io/db_tutorial/parts/part2.html" rel="external">cstack.github.io/db_tutorial/parts/part2.html</a></li>
+      module covering lexing, recursive descent, Pratt parsing with a worked trace, AST design, and
+      the binder contract.</li>
+    <li><code>apache/datafusion-sqlparser-rs</code> — Pratt/TDOP expression parsing inside
+      hand-written recursive descent, the architecture FerricDB reproduces.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li>Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, §3.1 — how PostgreSQL separates a
+      schema-free parser from a catalog-backed analyzer (our binder).<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li>PostgreSQL Documentation, “System Catalogs” — <code>pg_class</code> and
+      <code>pg_attribute</code>, the production ancestors of <code>__tables</code> and
+      <code>__columns</code>.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li>SQLite, “Architecture of SQLite” and cstack, Part&nbsp;2 — two contrasting front-end/engine
+      splits (SQLite's generated parser targeting bytecode; cstack's minimal metacommand vs.
+      statement preparation boundary).<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-4">4</a></sup></li>
   </ul>
 
   <h2 id="sec-arch">Where this fits</h2>
   <figure>
     <div id="arch-diagram"></div>
-    <figcaption>Figure 1 — the SQL front-end and the catalog light up. Storage and the buffer
-    pool below are finished; the planner above arrives in Milestone 4.</figcaption>
+    <figcaption>Figure 1 — FerricDB architecture. Both the SQL front-end (lexer, parser, binder)
+    and the system catalog come online here, sitting atop the finished storage and buffer-pool
+    layers. Notice the bidirectional arrow between front-end and catalog: only the binder consults
+    the catalog; the parser stays schema-free.</figcaption>
   </figure>
 
   <h2 id="sec-spec">Specification</h2>
+  <p>All public types and signatures below are quoted verbatim from
+  <code>course/ferricdb/docs/api-spec.md</code> and the starter crates. The AST enums, catalog info
+  structs, and bound-statement types are already declared in the starter workspace — keep their
+  shapes identical because the tests and Milestones&nbsp;4–10 depend on them verbatim.</p>
 
-  <h3>Grammar scope</h3>
-  <p>Exactly these statements (execution of the transaction statements waits for Milestone 8;
-  parsing them costs you five lines now and saves a grammar migration later):</p>
-  <pre><code>CREATE TABLE name (col type [NOT NULL] [PRIMARY KEY], …)
-DROP TABLE name
-INSERT INTO name [(cols…)] VALUES (exprs…) [, (exprs…)…]
-SELECT exprs… FROM name [WHERE expr] [ORDER BY expr [ASC|DESC], …] [LIMIT n]
-UPDATE name SET col = expr [, …] [WHERE expr]
-DELETE FROM name [WHERE expr]
-BEGIN | COMMIT | ROLLBACK</code></pre>
-  <p>Types: <code>BOOLEAN</code>, <code>INTEGER</code>, <code>FLOAT</code>, <code>TEXT</code>.
-  Expressions: literals, column references (optionally qualified), unary <code>-</code>/<code>NOT</code>,
-  binary arithmetic/comparison/<code>AND</code>/<code>OR</code>, <code>IS [NOT] NULL</code>,
-  <code>CAST(expr AS type)</code>, parentheses.</p>
+  <h3>1. Crate <code>crates/sql</code> (<code>ferricdb-sql</code>)</h3>
+  <pre><code>// crates/sql/src/lib.rs &amp; ast.rs — verbatim public API
 
-  <h3>Public API (crates/sql)</h3>
-  <pre><code>pub enum Token { /* keywords, idents, literals, operators, punctuation */ }
+pub enum Keyword { Select, From, Where, Group, Order, By, Asc, Desc, Limit, Insert,
+                   Into, Values, Update, Set, Delete, Create, Drop, Table, Index, On,
+                   Primary, Key, As, Join, Inner, Cross, Begin, Commit, Rollback,
+                   Analyze, Explain, Vacuum, Not, Null, And, Or, Is, Cast,
+                   Boolean, Int, Integer, Float, Double, Text, Varchar }
+
+pub enum Token { Keyword(Keyword), Ident(String), StringLit(String), IntegerLit(i64),
+                 FloatLit(f64), BoolLit(bool), Eq, NotEq, Lt, LtEq, Gt, GtEq,
+                 Plus, Minus, Star, Slash, Percent, LParen, RParen, Comma, Semicolon, Dot }
+
 pub struct Lexer;
 impl Lexer { pub fn tokenize(input: &amp;str) -&gt; Result&lt;Vec&lt;Token&gt;&gt;; }
 
-pub mod ast { /* Statement, ColumnDef, Select, TableRef, Expr, UnaryOp, BinaryOp —
-                 the full definitions live in the stubs and match the module page */ }
+pub mod ast {
+    pub enum Statement {
+        CreateTable { name: String, columns: Vec&lt;ColumnDef&gt; },
+        DropTable { name: String },
+        Insert { table: String, columns: Option&lt;Vec&lt;String&gt;&gt;, rows: Vec&lt;Vec&lt;Expr&gt;&gt; },
+        Select(Box&lt;Select&gt;),
+        Update { table: String, set: Vec&lt;(String, Expr)&gt;, filter: Option&lt;Expr&gt; },
+        Delete { table: String, filter: Option&lt;Expr&gt; },
+        Begin, Commit, Rollback,
+        CreateIndex { name: String, table: String, column: String },       // MS5
+        Analyze { table: Option&lt;String&gt; },                                  // MS7
+        Explain { analyze: bool, inner: Box&lt;Statement&gt; },                   // MS7
+        Vacuum,                                                             // MS8
+    }
+    pub struct ColumnDef { pub name: String, pub data_type: DataType,
+                           pub nullable: bool, pub primary_key: bool }
+    pub enum SelectItem { Wildcard, Expr { expr: Expr, alias: Option&lt;String&gt; } }
+    pub struct Select {
+        pub projection: Vec&lt;SelectItem&gt;,
+        pub from: Vec&lt;TableRef&gt;,                // joins from MS6
+        pub filter: Option&lt;Expr&gt;,
+        pub group_by: Vec&lt;Expr&gt;,                // MS6
+        pub order_by: Vec&lt;(Expr, bool /*desc*/)&gt;,
+        pub limit: Option&lt;u64&gt;,
+    }
+    pub enum TableRef {
+        Table { name: String, alias: Option&lt;String&gt; },
+        Join { left: Box&lt;TableRef&gt;, right: Box&lt;TableRef&gt;,
+               kind: JoinKind, on: Option&lt;Expr&gt; },                          // MS6
+    }
+    pub enum JoinKind { Inner, Cross }
+    pub enum Expr {
+        Literal(Value), Column(Option&lt;String&gt; /*qualifier*/, String),
+        Unary(UnaryOp, Box&lt;Expr&gt;), Binary(Box&lt;Expr&gt;, BinaryOp, Box&lt;Expr&gt;),
+        IsNull(Box&lt;Expr&gt;, bool /*negated*/), Cast(Box&lt;Expr&gt;, DataType),
+        Function(String, Vec&lt;Expr&gt;),            // lowercase; COUNT(*) = Function("count", vec![])
+    }
+    pub enum UnaryOp { Not, Neg }
+    pub enum BinaryOp { And, Or, Eq, NotEq, Lt, LtEq, Gt, GtEq,
+                        Add, Sub, Mul, Div, Rem }
+}
 
 /// Recursive-descent statement parser + Pratt expression parser.
 pub struct Parser;
@@ -122,12 +177,21 @@ impl Parser {
     pub fn parse_expr(sql: &amp;str) -&gt; Result&lt;ast::Expr&gt;;   // test convenience
 }</code></pre>
 
-  <h3>Public API (crates/catalog)</h3>
-  <pre><code>pub struct TableInfo { pub oid: Oid, pub name: String, pub schema: Schema,
+  <h3>2. Crate <code>crates/catalog</code> (<code>ferricdb-catalog</code>)</h3>
+  <pre><code>// crates/catalog/src/lib.rs — verbatim public API
+
+pub struct IndexInfo { pub oid: Oid, pub name: String, pub table: String,
+                       pub column: String, pub root_page: PageId }
+pub struct TableInfo { pub oid: Oid, pub name: String, pub schema: Schema,
                        pub first_page: PageId, pub indexes: Vec&lt;IndexInfo&gt; }
 
-/// System catalog, itself stored in heap pages (bootstrap: fixed page ids
-/// for __tables / __columns; the catalog reads itself at open).
+#[derive(Clone, Debug, Default)]
+pub struct ColumnStats { pub min: Option&lt;Value&gt;, pub max: Option&lt;Value&gt;,
+                         pub distinct_estimate: u64, pub null_count: u64 }
+#[derive(Clone, Debug, Default)]
+pub struct TableStats { pub row_count: u64, pub page_count: u32,
+                        pub columns: Vec&lt;ColumnStats&gt; }
+
 pub struct Catalog { /* Arc&lt;dyn PageStore&gt;, cached maps */ }
 impl Catalog {
     pub fn bootstrap(store: std::sync::Arc&lt;dyn PageStore&gt;) -&gt; Result&lt;Self&gt;; // create-or-open
@@ -135,144 +199,734 @@ impl Catalog {
     pub fn drop_table(&amp;self, name: &amp;str) -&gt; Result&lt;()&gt;;
     pub fn table(&amp;self, name: &amp;str) -&gt; Result&lt;TableInfo&gt;;
     pub fn tables(&amp;self) -&gt; Result&lt;Vec&lt;TableInfo&gt;&gt;;
+    pub fn create_index(&amp;self, name: &amp;str, table: &amp;str, column: &amp;str,
+                        root_page: PageId) -&gt; Result&lt;Oid&gt;;                  // MS5
+    pub fn set_index_root(&amp;self, index_oid: Oid, root: PageId) -&gt; Result&lt;()&gt;; // MS5
+    pub fn stats(&amp;self, table: &amp;str) -&gt; Result&lt;Option&lt;TableStats&gt;&gt;;         // MS7
+    pub fn set_stats(&amp;self, table: &amp;str, stats: TableStats) -&gt; Result&lt;()&gt;;  // MS7
 }</code></pre>
 
-  <h3>Public API (crates/exec, binder module)</h3>
-  <pre><code>/// Name/type resolution against the catalog; produces bound statements
-/// whose column references are (table index, column index) pairs.
+  <h3>3. Module <code>crates/exec/src/binder.rs</code> (<code>ferricdb-exec::binder</code>)</h3>
+  <pre><code>// crates/exec/src/binder.rs — verbatim public API
+
+pub enum BoundExpr {
+    Literal(Value),
+    Column { table: usize, column: usize, data_type: DataType },
+    /// Flat offset into immediate child's output (post-Aggregate in MS6).
+    InputRef { index: usize, data_type: DataType },
+    Unary(UnaryOp, Box&lt;BoundExpr&gt;),
+    Binary(Box&lt;BoundExpr&gt;, BinaryOp, Box&lt;BoundExpr&gt;),
+    IsNull(Box&lt;BoundExpr&gt;, bool),
+    Cast(Box&lt;BoundExpr&gt;, DataType),
+    Function(String, Vec&lt;BoundExpr&gt;),
+}
+pub enum AggFunc { Count, Sum, Avg, Min, Max }                              // MS6
+pub struct AggExpr { pub func: AggFunc, pub arg: Option&lt;BoundExpr&gt; }        // MS6
+pub enum BoundTableRef {
+    Table(TableInfo),
+    Join { left: Box&lt;BoundTableRef&gt;, right: Box&lt;BoundTableRef&gt;,
+           kind: JoinKind, on: Option&lt;BoundExpr&gt; },                         // MS6
+}
+pub struct BoundSelect {
+    pub from: Vec&lt;BoundTableRef&gt;,
+    pub projection: Vec&lt;(BoundExpr, String)&gt;,
+    pub filter: Option&lt;BoundExpr&gt;,
+    pub group_by: Vec&lt;BoundExpr&gt;,
+    pub aggregates: Vec&lt;AggExpr&gt;,
+    pub order_by: Vec&lt;(BoundExpr, bool)&gt;,
+    pub limit: Option&lt;u64&gt;,
+    pub schema: Schema,
+}
+pub enum BoundStatement {
+    CreateTable { name: String, schema: Schema, primary_key: Option&lt;usize&gt; },
+    DropTable { name: String },
+    Insert { table: TableInfo, rows: Vec&lt;Vec&lt;BoundExpr&gt;&gt; },
+    Select(Box&lt;BoundSelect&gt;),
+    Update { table: TableInfo, set: Vec&lt;(usize, BoundExpr)&gt;, filter: Option&lt;BoundExpr&gt; },
+    Delete { table: TableInfo, filter: Option&lt;BoundExpr&gt; },
+    Begin, Commit, Rollback,
+    CreateIndex { name: String, table: TableInfo, column: usize },          // MS5
+    Analyze { table: Option&lt;TableInfo&gt; },                                   // MS7
+    Explain { analyze: bool, inner: Box&lt;BoundStatement&gt; },                  // MS7
+    Vacuum,                                                                 // MS8
+}
 pub struct Binder&lt;'a&gt; { /* &amp;'a Catalog */ }
 impl&lt;'a&gt; Binder&lt;'a&gt; {
     pub fn new(catalog: &amp;'a Catalog) -&gt; Self;
     pub fn bind(&amp;self, stmt: ast::Statement) -&gt; Result&lt;BoundStatement&gt;;
 }</code></pre>
+  <p><em>Course escape hatch:</em> if you ever get blocked on the
+  parser, you may temporarily adapt the <code>sqlparser</code> crate behind <code>Parser</code> —
+  though building the ~350-line hand-written lexer and parser is the core learning goal and matches
+  the provided tests directly.<sup class="cite"><a href="#ref-1">1</a></sup></p>
 
-  <p>Behavioral contract: the parser never touches the catalog (grammatical nonsense about
-  nonexistent tables must parse); the binder rejects unknown tables/columns, ambiguous or
-  type-mismatched expressions, and INSERT arity errors, each with a message naming the
-  offender.<sup class="cite"><a href="#ref-2">2</a></sup> Escape hatch: you may swap your parser
-  for the sqlparser-rs crate and translate its AST into <code>ast::Statement</code> — the rest of
-  the milestone is unchanged — but the hand-written path is the recommended one; the module
-  teaches everything you need.</p>
+  <h2 id="sec-pratt">Grammar &amp; 8-level Pratt precedence</h2>
+  <p>Exact lexical and syntactic rules pinned by <code>crates/sql/src/lib.rs</code> and
+  <code>crates/sql/tests/parser.rs</code>:</p>
+
+  <h3>Lexical rules</h3>
+  <ul>
+    <li><strong>Whitespace &amp; comments:</strong> ASCII whitespace separates tokens and is
+      discarded. <code>--</code> starts a line comment discarding everything up to the next
+      <code>\n</code> or end of input (distinct from single <code>-</code>, which lexes as
+      <code>Token::Minus</code>).</li>
+    <li><strong>Keywords vs. identifiers:</strong> words matching
+      <code>[a-zA-Z_][a-zA-Z0-9_]*</code> are matched case-insensitively against
+      <code>Keyword</code> (<code>SELECT</code>, <code>select</code>, and <code>SeLeCt</code> all
+      produce <code>Token::Keyword(Keyword::Select)</code>). Non-keyword words become
+      <code>Token::Ident</code> <strong>folded to lowercase</strong> (matching PostgreSQL's
+      unquoted identifier folding; quoted identifiers are not part of the course grammar).
+      <code>TRUE</code> and <code>FALSE</code> (any case) lex directly to
+      <code>Token::BoolLit(bool)</code>; <code>NULL</code> stays <code>Keyword::Null</code> because
+      it appears both as a literal and inside <code>NOT NULL</code> / <code>IS [NOT] NULL</code>.</li>
+    <li><strong>Literals:</strong> single-quoted strings <code>'...'</code> preserve interior case
+      and unescape doubled quotes <code>''</code> to a single <code>'</code> (SQL standard, not
+      <code>\'</code>). Digit runs lex to <code>Token::IntegerLit(i64)</code> (a leading
+      <code>-</code> is <em>never</em> consumed as part of the literal — it is always
+      <code>Token::Minus</code>); <code>digits.digits</code> lexes to
+      <code>Token::FloatLit(f64)</code>.</li>
+    <li><strong>Maximal munch &amp; errors:</strong> two-character operators (<code>&lt;=</code>,
+      <code>&gt;=</code>, <code>&lt;&gt;</code>, <code>!=</code>) are matched greedily before
+      single-character ones; both <code>&lt;&gt;</code> and <code>!=</code> produce
+      <code>Token::NotEq</code>. <code>Token</code> carries <strong>no source positions</strong> in
+      this course (error messages quote the offending text instead). Unterminated strings,
+      <code>i64</code> overflow, a lone <code>!</code>, or unrecognized characters (<code>#</code>,
+      <code>@</code>) return <code>Err(Error::Parse(...))</code> and never panic.</li>
+  </ul>
+
+  <h3>Statement grammar (Milestone 3 scope)</h3>
+  <pre><code>script       := { ";" } [ statement { ";" { ";" } statement } ] { ";" }
+statement    := create_table | drop_table | insert | select | update | delete
+              | "BEGIN" | "COMMIT" | "ROLLBACK"
+
+create_table := "CREATE" "TABLE" ident "(" column_def { "," column_def } ")"
+column_def   := ident type { "PRIMARY" "KEY" | "NOT" "NULL" | "NULL" }
+type         := "BOOLEAN" | "INT" | "INTEGER" | "FLOAT" | "DOUBLE" | "TEXT" | "VARCHAR"
+drop_table   := "DROP" "TABLE" ident
+
+insert       := "INSERT" "INTO" ident [ "(" ident { "," ident } ")" ]
+                "VALUES" "(" expr { "," expr } ")" { "," "(" expr { "," expr } ")" }
+
+select       := "SELECT" select_item { "," select_item }
+                [ "FROM" table_ref { "," table_ref } ]
+                [ "WHERE" expr ]
+                [ "ORDER" "BY" expr [ "ASC" | "DESC" ] { "," expr [ "ASC" | "DESC" ] } ]
+                [ "LIMIT" integer_literal ]
+select_item  := "*" | expr [ "AS" ident ]
+table_ref    := ident [ [ "AS" ] ident ]       // JOIN clauses arrive in MS6
+
+update       := "UPDATE" ident "SET" ident "=" expr { "," ident "=" expr } [ "WHERE" expr ]
+delete       := "DELETE" "FROM" ident [ "WHERE" expr ]</code></pre>
+
+  <p>Key grammar details tested directly in <code>parser.rs</code>:</p>
+  <ul>
+    <li><strong>Multi-statement scripts:</strong> <code>Parser::parse</code> skips empty and stray
+      semicolons (<code>""</code> and <code>" ; ; "</code> return <code>Ok(vec![])</code>;
+      <code>"BEGIN; COMMIT;"</code> returns two statements).</li>
+    <li><strong>Type synonyms &amp; <code>PRIMARY KEY</code>:</strong> <code>INT</code>/<code>INTEGER</code>
+      → <code>DataType::Integer</code>, <code>FLOAT</code>/<code>DOUBLE</code> →
+      <code>DataType::Float</code>, <code>TEXT</code>/<code>VARCHAR</code> →
+      <code>DataType::Text</code>, <code>BOOLEAN</code> → <code>DataType::Boolean</code>. Column
+      options may appear in any order after the type, and <code>PRIMARY KEY</code> always implies
+      <code>nullable: false</code>.</li>
+    <li><strong>Optional <code>FROM</code> and wildcard:</strong> <code>SELECT 1 + 1</code> parses
+      with <code>from: vec![]</code>; <code>SELECT * FROM t</code> produces
+      <code>vec![SelectItem::Wildcard]</code>; <code>ORDER BY</code> defaults to ascending
+      (<code>desc: false</code>); comma-separated <code>FROM a, b</code> keeps separate entries in
+      <code>Select::from</code>.</li>
+    <li><strong>Functions &amp; <code>COUNT(*)</code>:</strong> function calls lowercase-fold the
+      function name, and <code>COUNT(*)</code> parses as
+      <code>Expr::Function("count".into(), vec![])</code> — ready for Milestone&nbsp;6 aggregates.</li>
+    <li><strong>Standalone expressions:</strong> <code>Parser::parse_expr</code> parses one
+      expression and rejects any trailing unconsumed tokens (<code>"1 + 2 3"</code> must return
+      <code>Err(Error::Parse)</code>).</li>
+  </ul>
+
+  <h3>Unified 8-level Pratt binding-power table</h3>
+  <p>Your Pratt expression parser must match the exact binding-power table declared in
+  <code>crates/sql/src/ast.rs</code> and <code>lib.rs</code> (higher number binds tighter; every
+  infix operator is left-associative, recursing on its right-hand side with <code>bp + 1</code>):<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Power</th>
+          <th>Fixity</th>
+          <th>Operators</th>
+          <th>RHS <code>min_bp</code> / grouping example</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>1</strong></td>
+          <td>Infix (left)</td>
+          <td><code>OR</code></td>
+          <td><code>2</code> — <code>a OR b AND c</code> ⇒ <code>a OR (b AND c)</code></td>
+        </tr>
+        <tr>
+          <td><strong>2</strong></td>
+          <td>Infix (left)</td>
+          <td><code>AND</code></td>
+          <td><code>3</code> — <code>NOT a AND b</code> ⇒ <code>(NOT a) AND b</code></td>
+        </tr>
+        <tr>
+          <td><strong>3</strong></td>
+          <td>Prefix</td>
+          <td><code>NOT</code></td>
+          <td><code>3</code> — <code>NOT active IS NULL</code> ⇒ <code>NOT (active IS NULL)</code></td>
+        </tr>
+        <tr>
+          <td><strong>4</strong></td>
+          <td>Postfix</td>
+          <td><code>IS NULL</code>, <code>IS NOT NULL</code></td>
+          <td>— — <code>a = 1 IS NULL</code> ⇒ <code>(a = 1) IS NULL</code></td>
+        </tr>
+        <tr>
+          <td><strong>5</strong></td>
+          <td>Infix (left)</td>
+          <td><code>=</code>, <code>&lt;&gt;</code>, <code>!=</code>, <code>&lt;</code>, <code>&lt;=</code>, <code>&gt;</code>, <code>&gt;=</code></td>
+          <td><code>6</code> — <code>a + 1 &gt; b</code> ⇒ <code>(a + 1) &gt; b</code></td>
+        </tr>
+        <tr>
+          <td><strong>6</strong></td>
+          <td>Infix (left)</td>
+          <td><code>+</code>, <code>-</code></td>
+          <td><code>7</code> — <code>a - b - c</code> ⇒ <code>(a - b) - c</code></td>
+        </tr>
+        <tr>
+          <td><strong>7</strong></td>
+          <td>Infix (left)</td>
+          <td><code>*</code>, <code>/</code>, <code>%</code></td>
+          <td><code>8</code> — <code>1 + 2 * 3</code> ⇒ <code>1 + (2 * 3)</code></td>
+        </tr>
+        <tr>
+          <td><strong>8</strong></td>
+          <td>Prefix</td>
+          <td><code>-</code> (unary negation)</td>
+          <td><code>8</code> — <code>-x + 1</code> ⇒ <code>(-x) + 1</code>, <code>-2 * 3</code> ⇒ <code>(-2) * 3</code></td>
+        </tr>
+        <tr>
+          <td><em>9 (atom)</em></td>
+          <td>Primary</td>
+          <td>literals, <code>[qual.]col</code>, <code>CAST(e AS t)</code>, <code>fn(args)</code>, <code>COUNT(*)</code>, <code>(e)</code></td>
+          <td>Parentheses reset <code>min_bp = 0</code> and vanish from the AST.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <figure>
+    <svg viewBox="0 0 940 370" role="img">
+      <title>Front-end pipeline and Pratt parse tree for SELECT id, name AS who FROM users WHERE age &gt;= 18 AND NOT active IS NULL, showing tokens flowing into the parser, exact binding powers in the WHERE tree, and resolved (table_idx, col_idx) pairs emitted by the binder.</title>
+      <defs>
+        <marker id="ms3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <!-- Top pipeline -->
+      <rect x="20" y="16" width="185" height="56" rx="6" class="d-box"/>
+      <text x="112" y="38" text-anchor="middle" class="d-text" font-weight="600">SQL Text</text>
+      <text x="112" y="57" text-anchor="middle" class="d-mono-sm">"SELECT id, name…"</text>
+
+      <rect x="235" y="16" width="185" height="56" rx="6" class="d-box-hl"/>
+      <text x="327" y="38" text-anchor="middle" class="d-text" font-weight="600">Lexer</text>
+      <text x="327" y="57" text-anchor="middle" class="d-mono-sm">Vec&lt;Token&gt; (no spans)</text>
+
+      <rect x="450" y="16" width="205" height="56" rx="6" class="d-box-hl"/>
+      <text x="552" y="38" text-anchor="middle" class="d-text" font-weight="600">Parser (RD + Pratt)</text>
+      <text x="552" y="57" text-anchor="middle" class="d-mono-sm">ast::Statement::Select</text>
+
+      <rect x="685" y="16" width="235" height="56" rx="6" class="d-box-good"/>
+      <text x="802" y="38" text-anchor="middle" class="d-text" font-weight="600">Binder + Catalog</text>
+      <text x="802" y="57" text-anchor="middle" class="d-mono-sm">BoundStatement::Select</text>
+
+      <path d="M 205 44 H 235" class="d-line-hl" marker-end="url(#ms3-arr)"/>
+      <path d="M 420 44 H 450" class="d-line-hl" marker-end="url(#ms3-arr)"/>
+      <path d="M 655 44 H 685" class="d-line-hl" marker-end="url(#ms3-arr)"/>
+
+      <!-- Left lower panel: Pratt parse tree -->
+      <rect x="20" y="96" width="470" height="258" rx="8" class="d-box"/>
+      <text x="255" y="117" text-anchor="middle" class="d-text-sm" font-weight="650">Pratt parse tree: WHERE age &gt;= 18 AND NOT active IS NULL</text>
+
+      <!-- Root AND -->
+      <rect x="200" y="132" width="110" height="32" rx="5" class="d-box-hl"/>
+      <text x="255" y="152" text-anchor="middle" class="d-mono" font-weight="600">AND (bp 2)</text>
+
+      <!-- Left child >= -->
+      <rect x="78" y="198" width="104" height="32" rx="5" class="d-box-hl"/>
+      <text x="130" y="218" text-anchor="middle" class="d-mono" font-weight="600">&gt;= (bp 5)</text>
+
+      <rect x="38" y="268" width="76" height="30" rx="5" class="d-box"/>
+      <text x="76" y="287" text-anchor="middle" class="d-mono-sm">col: age</text>
+
+      <rect x="146" y="268" width="76" height="30" rx="5" class="d-box"/>
+      <text x="184" y="287" text-anchor="middle" class="d-mono-sm">lit: 18</text>
+
+      <!-- Right child NOT -> IS NULL -> active -->
+      <rect x="327" y="198" width="106" height="32" rx="5" class="d-box-hl"/>
+      <text x="380" y="218" text-anchor="middle" class="d-mono" font-weight="600">NOT (bp 3)</text>
+
+      <rect x="313" y="256" width="134" height="32" rx="5" class="d-box-warn"/>
+      <text x="380" y="276" text-anchor="middle" class="d-mono" font-weight="600">IS NULL (bp 4)</text>
+
+      <rect x="332" y="314" width="96" height="28" rx="5" class="d-box"/>
+      <text x="380" y="332" text-anchor="middle" class="d-mono-sm">col: active</text>
+
+      <!-- Tree edges -->
+      <path d="M 230 164 L 130 198" class="d-line" marker-end="url(#ms3-arr)"/>
+      <path d="M 280 164 L 380 198" class="d-line" marker-end="url(#ms3-arr)"/>
+      <path d="M 116 230 L 76 268" class="d-line" marker-end="url(#ms3-arr)"/>
+      <path d="M 144 230 L 184 268" class="d-line" marker-end="url(#ms3-arr)"/>
+      <path d="M 380 230 V 256" class="d-line" marker-end="url(#ms3-arr)"/>
+      <path d="M 380 288 V 314" class="d-line" marker-end="url(#ms3-arr)"/>
+
+      <!-- Right lower panel: BoundSelect -->
+      <rect x="510" y="96" width="410" height="258" rx="8" class="d-box-good"/>
+      <text x="715" y="117" text-anchor="middle" class="d-text-sm" font-weight="650">Binder output: BoundSelect (resolved against users)</text>
+
+      <rect x="524" y="130" width="382" height="38" rx="5" class="d-box"/>
+      <text x="534" y="146" class="d-text-sm" font-weight="600">from (table_idx 0):</text>
+      <text x="534" y="161" class="d-mono-sm">Table(TableInfo { oid: 1, name: "users", first_page: 3 })</text>
+
+      <rect x="524" y="176" width="382" height="58" rx="5" class="d-box"/>
+      <text x="534" y="192" class="d-text-sm" font-weight="600">projection:</text>
+      <text x="534" y="208" class="d-mono-sm">Column { table: 0, column: 0, Integer } → "id"</text>
+      <text x="534" y="224" class="d-mono-sm">Column { table: 0, column: 1, Text }    → "who"</text>
+
+      <rect x="524" y="242" width="382" height="58" rx="5" class="d-box"/>
+      <text x="534" y="258" class="d-text-sm" font-weight="600">filter (verified Boolean):</text>
+      <text x="534" y="274" class="d-mono-sm">Binary(Col(0,2,Int) &gt;= Lit(18), And,</text>
+      <text x="534" y="290" class="d-mono-sm">  Unary(Not, IsNull(Col(0,3,Bool), false)))</text>
+
+      <rect x="524" y="308" width="382" height="34" rx="5" class="d-box-hl"/>
+      <text x="715" y="329" text-anchor="middle" class="d-mono-sm" font-weight="600">schema: [ id: Integer, who: Text ]</text>
+    </svg>
+    <figcaption>Figure 2 — End-to-end Milestone&nbsp;3 front-end trace. The Pratt parser applies the
+    8-level binding-power table (notice <code>IS NULL</code> at bp&nbsp;4 binding tighter than
+    prefix <code>NOT</code> at bp&nbsp;3, which in turn binds tighter than <code>AND</code> at
+    bp&nbsp;2); the binder then rewrites every column name into a typed
+    <code>(table_idx, col_idx)</code> pair.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup></figcaption>
+  </figure>
+
+  <h2 id="sec-catalog-binder">Catalog bootstrap &amp; binder design</h2>
+
+  <h3>Self-hosted catalog bootstrap (pages 0, 1, and 2)</h3>
+  <p>A real database does not keep its table definitions in a sidecar JSON file — it stores them
+  inside the database file itself so one page store, one buffer pool, and (later) one WAL cover
+  everything. That creates an apparent chicken-and-egg problem: to read the schema of table
+  <code>users</code>, you scan the <code>__tables</code> and <code>__columns</code> tables, but how
+  do you know the schema and page location of <code>__tables</code> and <code>__columns</code>?
+  PostgreSQL breaks the circle with compiled-in bootstrap descriptors for <code>pg_class</code> and
+  <code>pg_attribute</code>.<sup class="cite"><a href="#ref-5">5</a></sup> FerricDB uses the same
+  pattern with three fixed page ids:</p>
+  <ul>
+    <li><strong>Page&nbsp;0 — Catalog Header Page:</strong> an 8&nbsp;KB page that preserves the
+      universal 16-byte reserved page header at bytes <code>0..16</code> (<code>pageLSN</code>,
+      <code>page_type</code>, <code>reserved</code> — required so Milestone&nbsp;9's buffer-pool
+      <code>LogFlusher::flush_until(page.lsn())</code> never reads magic bytes as an LSN), followed
+      at byte offset <code>16</code> by an 8-byte magic/version tag (e.g. <code>b"FRDBCAT1"</code>
+      at <code>16..24</code>), <code>next_oid: u32</code> (<code>24..28</code>),
+      <code>tables_first_page: PageId</code> (= 1, <code>28..32</code>),
+      <code>columns_first_page: PageId</code> (= 2, <code>32..36</code>),
+      plus two reserved <code>PageId</code> slots for <code>indexes_first_page</code> (Milestone&nbsp;5,
+      <code>36..40</code>) and <code>stats_first_page</code> (Milestone&nbsp;7, <code>40..44</code>),
+      initialized to <code>INVALID_PAGE_ID</code>. Reserving those two 4-byte slots on Page&nbsp;0
+      today means Milestones&nbsp;5 and&nbsp;7 can add <code>__indexes</code> and
+      <code>__stats</code> heap files without changing the database file format.</li>
+    <li><strong>Page&nbsp;1 — <code>__tables</code> <code>HeapFile</code>:</strong> compile-time
+      constant schema <code>(oid INTEGER, name TEXT, first_page INTEGER)</code>.</li>
+    <li><strong>Page&nbsp;2 — <code>__columns</code> <code>HeapFile</code>:</strong> compile-time
+      constant schema <code>(table_oid INTEGER, ordinal INTEGER, name TEXT, type_tag INTEGER, nullable BOOLEAN)</code>,
+      where <code>type_tag</code> maps <code>Boolean=0, Integer=1, Float=2, Text=3</code>.</li>
+  </ul>
+  <p><code>Catalog::bootstrap(store)</code> inspects <code>store.num_pages()</code>. On a fresh
+  store (<code>num_pages() == 0</code>), it allocates pages 0, 1, and 2 in order, writes the Page&nbsp;0
+  header with <code>next_oid = 1</code>, initializes pages 1 and 2 via <code>HeapPage::init</code>,
+  and returns an empty <code>CatalogCache</code>. On an existing store (<code>num_pages() &gt; 0</code>),
+  it reads and validates Page&nbsp;0's magic tag, scans <code>__tables</code> and
+  <code>__columns</code> through ordinary <code>HeapFile::open</code> iterators, groups columns by
+  <code>table_oid</code> sorted by <code>ordinal</code>, and rebuilds <code>CatalogCache</code>.
+  One invariant trips up many first drafts: <strong><code>Catalog::tables()</code> must return
+  user tables only — never <code>__tables</code> or <code>__columns</code></strong>. On a freshly
+  bootstrapped database, <code>catalog.tables()?</code> must return an empty <code>Vec</code>.</p>
+
+  <figure>
+    <svg viewBox="0 0 940 315" role="img">
+      <title>Self-hosted catalog layout on pages 0, 1, and 2: Page 0 holds the fixed catalog header pointing to __tables on Page 1 and __columns on Page 2; rows in __tables point to user table heap files such as users on Page 3.</title>
+      <defs>
+        <marker id="ms3-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <!-- Page 0: Catalog Header -->
+      <rect x="20" y="24" width="206" height="264" rx="8" class="d-box-hl"/>
+      <text x="123" y="45" text-anchor="middle" class="d-text" font-weight="650">Page 0 (fixed)</text>
+      <text x="123" y="61" text-anchor="middle" class="d-text-sm">Catalog Header</text>
+
+      <rect x="30" y="72" width="186" height="24" rx="4" class="d-box-warn"/>
+      <text x="123" y="88" text-anchor="middle" class="d-mono-sm">0..16: reserved (pageLSN)</text>
+
+      <rect x="30" y="101" width="186" height="24" rx="4" class="d-box"/>
+      <text x="123" y="117" text-anchor="middle" class="d-mono-sm">16..24: "FRDBCAT1"</text>
+
+      <rect x="30" y="130" width="186" height="24" rx="4" class="d-box"/>
+      <text x="123" y="146" text-anchor="middle" class="d-mono-sm">24..28: next_oid: 2</text>
+
+      <rect x="30" y="159" width="186" height="24" rx="4" class="d-box-good"/>
+      <text x="123" y="175" text-anchor="middle" class="d-mono-sm">28..32: tables_page: 1</text>
+
+      <rect x="30" y="188" width="186" height="24" rx="4" class="d-box-good"/>
+      <text x="123" y="204" text-anchor="middle" class="d-mono-sm">32..36: columns_page: 2</text>
+
+      <rect x="30" y="217" width="186" height="24" rx="4" class="d-box" stroke-dasharray="4 3"/>
+      <text x="123" y="233" text-anchor="middle" class="d-mono-sm">36..40: indexes: ∞ (MS5)</text>
+
+      <rect x="30" y="246" width="186" height="24" rx="4" class="d-box" stroke-dasharray="4 3"/>
+      <text x="123" y="262" text-anchor="middle" class="d-mono-sm">40..44: stats: ∞ (MS7)</text>
+
+      <!-- Page 1: __tables -->
+      <rect x="266" y="24" width="214" height="118" rx="8" class="d-box-good"/>
+      <text x="373" y="46" text-anchor="middle" class="d-text" font-weight="650">Page 1 · __tables</text>
+      <text x="373" y="63" text-anchor="middle" class="d-text-sm">HeapFile (const schema)</text>
+      <rect x="278" y="76" width="190" height="54" rx="4" class="d-box"/>
+      <text x="288" y="95" class="d-mono-sm">slot 0: (oid=1,</text>
+      <text x="288" y="111" class="d-mono-sm">  name="users",</text>
+      <text x="288" y="125" class="d-mono-sm">  first_page=3)</text>
+
+      <!-- Page 2: __columns -->
+      <rect x="266" y="160" width="214" height="128" rx="8" class="d-box-good"/>
+      <text x="373" y="182" text-anchor="middle" class="d-text" font-weight="650">Page 2 · __columns</text>
+      <text x="373" y="199" text-anchor="middle" class="d-text-sm">HeapFile (const schema)</text>
+      <rect x="278" y="210" width="190" height="66" rx="4" class="d-box"/>
+      <text x="286" y="227" class="d-mono-sm">s0: (1, 0, "id",   Int,  F)</text>
+      <text x="286" y="244" class="d-mono-sm">s1: (1, 1, "name", Text, F)</text>
+      <text x="286" y="261" class="d-mono-sm">s2: (1, 2, "age",  Int,  T)</text>
+
+      <!-- Page 3: user table -->
+      <rect x="554" y="24" width="366" height="118" rx="8" class="d-box"/>
+      <text x="737" y="46" text-anchor="middle" class="d-text" font-weight="650">Page 3 · user table "users"</text>
+      <text x="737" y="63" text-anchor="middle" class="d-text-sm">Ordinary HeapFile (allocated by create_table)</text>
+      <rect x="568" y="76" width="338" height="54" rx="4" class="d-box"/>
+      <text x="580" y="96" class="d-mono-sm">slot 0: (1, "ada", 36)</text>
+      <text x="580" y="115" class="d-mono-sm">slot 1: (2, "bob", 29)  ·  next_page → …</text>
+
+      <!-- In-memory CatalogCache -->
+      <rect x="554" y="160" width="366" height="128" rx="8" class="d-box-warn"/>
+      <text x="737" y="182" text-anchor="middle" class="d-text" font-weight="650">In-memory CatalogCache (Mutex)</text>
+      <text x="568" y="206" class="d-mono-sm">bootstrap(): num_pages==0 → format p0, p1, p2</text>
+      <text x="568" y="224" class="d-mono-sm">             num_pages&gt;0  → scan p1 &amp; p2</text>
+      <text x="568" y="248" class="d-text-sm">tables() returns user tables only (never __tables / __columns).</text>
+      <text x="568" y="268" class="d-text-sm">All catalog I/O flows through Arc&lt;dyn PageStore&gt;.</text>
+
+      <!-- Arrows -->
+      <path d="M 226 171 H 246 V 96 H 266" class="d-line-hl" marker-end="url(#ms3-arr2)"/>
+      <path d="M 226 200 H 266" class="d-line-hl" marker-end="url(#ms3-arr2)"/>
+      <path d="M 480 88 H 554" class="d-line-hl" marker-end="url(#ms3-arr2)"/>
+      <text x="517" y="80" text-anchor="middle" class="d-text-sm">first_page</text>
+      <path d="M 480 226 H 554" class="d-line" stroke-dasharray="5 4" marker-end="url(#ms3-arr2)"/>
+      <text x="517" y="218" text-anchor="middle" class="d-text-sm">scan on open</text>
+    </svg>
+    <figcaption>Figure 3 — Self-hosted catalog bootstrap layout. Page&nbsp;0 anchors the system
+    tables at fixed page ids so <code>Catalog::bootstrap</code> can open any database without
+    external metadata files, while reserving slots for Milestone&nbsp;5 indexes and Milestone&nbsp;7
+    statistics.<sup class="cite"><a href="#ref-5">5</a></sup></figcaption>
+  </figure>
+
+  <h3>Binder responsibilities &amp; implicit numeric widening</h3>
+  <p>The parser knows syntax but not schemas; the binder (<code>crates/exec/src/binder.rs</code>)
+  plays PostgreSQL's analyzer role — checking every name and type against <code>Catalog</code> and
+  producing a <code>BoundStatement</code> whose executor never has to touch string column names
+  again:<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  <ul>
+    <li><strong><code>FROM</code>-list flattening &amp; scope table:</strong> walk
+      <code>Select::from</code> left to right, assigning each base table an incrementing
+      <code>table_idx</code> (0, 1, …) and recording its exposed qualifier (alias if given, else
+      table name) alongside its <code>TableInfo</code>.</li>
+    <li><strong>Qualified vs. unqualified lookup:</strong> for <code>q.col</code>, find the scope
+      entry matching <code>q</code> and look up <code>col</code> in its schema. For unqualified
+      <code>col</code>, search every scope entry: 0 matches ⇒ <code>Err(Error::Bind)</code> naming
+      the missing column; 2+ matches ⇒ <code>Err(Error::Bind)</code> reporting an ambiguous column;
+      1 match ⇒ <code>BoundExpr::Column { table, column, data_type }</code>.</li>
+    <li><strong>Wildcard expansion &amp; aliases:</strong> expand <code>SelectItem::Wildcard</code>
+      into every column of every table in scope in FROM-list order. Output column names follow the
+      alias if present, else the column name, else a synthesized name (e.g. <code>col0</code>).</li>
+    <li><strong>Bottom-up type checking &amp; implicit <code>Integer → Float</code> widening:</strong>
+      infer the <code>Option&lt;DataType&gt;</code> of each expression (<code>None</code> for bare
+      <code>Value::Null</code>). Arithmetic operators require numeric operands; if one side is
+      <code>Integer</code> and the other is <code>Float</code>, implicitly widen the integer to
+      <code>Float</code> (for example by wrapping it in <code>BoundExpr::Cast(expr, DataType::Float)</code>)
+      and infer <code>Float</code>. Comparisons require compatible types (same type,
+      <code>Integer</code>/<code>Float</code> with numeric widening, or <code>NULL</code>) and yield
+      <code>Boolean</code>. Notice why numeric widening matters immediately:
+      <code>ms3_binder_resolves_and_rejects</code> binds <code>WHERE score &gt; 10</code> where
+      <code>score</code> is <code>FLOAT</code> and <code>10</code> is <code>INTEGER</code>, and
+      Milestone&nbsp;6 inserts integer literals into a <code>FLOAT</code> column!</li>
+    <li><strong>Statement-level checks:</strong> reject non-boolean <code>WHERE</code> predicates
+      (<code>WHERE id</code> fails with <code>Error::Bind</code>); reject <code>INSERT</code> row
+      arity mismatches, unknown target columns, omitted <code>NOT NULL</code> columns, or
+      incompatible value types (reordering explicit column lists into full table-schema order and
+      filling omitted nullable columns with <code>BoundExpr::Literal(Value::Null)</code>); verify
+      every <code>UPDATE SET</code> column exists and matches its expression type (allowing
+      <code>Integer → Float</code>); reject aggregate calls in Milestone&nbsp;3 (Milestone&nbsp;6
+      lowers them into <code>AggExpr</code> and <code>BoundExpr::InputRef</code>).</li>
+  </ul>
 
   <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <p>Tackle the three crates in order: <code>sql</code> → <code>catalog</code> → <code>exec::binder</code> →
+  <code>repl</code>. Each layer compiles and tests independently before the next starts.</p>
+
   <ol>
-    <li><strong>Lexer first, tests continuously.</strong> It is pure string processing —
-      <code>ms3_</code> lexer tests can be green within the hour. Get keyword case-insensitivity,
-      <code>&gt;=</code> maximal munch, and <code>''</code> string escaping right here so the
-      parser never sees the mess.</li>
-    <li><strong>Parser skeleton: peek/expect.</strong> Build the token cursor with
-      <code>peek()</code>/<code>next()</code>/<code>expect(tok)</code> helpers, then
-      <code>parse_statement</code> dispatching on the first keyword. Do <code>CREATE TABLE</code>
-      first — flat clause structure, no expressions — and run <code>.ast</code> against it early
-      for morale.</li>
-    <li><strong>Pratt core next.</strong> Implement <code>parse_expr(min_bp)</code> exactly as
-      the module traces it: prefix position, then the infix loop with the binding-power table
-      (OR 1, AND 2, NOT 3, comparisons 4, additive 5, multiplicative 6, unary minus 7),
-      recursing with <code>bp + 1</code> for left-associativity. The precedence tests encode the
-      module's traces — <code>1 + 2 * 3</code>, <code>a OR b AND c</code>, chains of minus.</li>
-    <li><strong>Finish the statement grammar.</strong> SELECT is the largest; take its clauses
-      one at a time (projection with <code>AS</code> aliases, FROM, WHERE, ORDER BY, LIMIT).
-      INSERT with multi-row VALUES, UPDATE with the SET list, DELETE, DROP, and the three
-      one-keyword transaction statements follow quickly.</li>
-    <li><strong>Catalog: constants before code.</strong> Write down the fixed schemas of
-      <code>__tables</code> (oid, name, first_page) and <code>__columns</code> (table_oid,
-      ordinal, name, type, nullable) as Rust constants, and pin their page ids (this course:
-      page 1 and page 2; page 0 is the database header). <code>bootstrap</code> then has two
-      branches: fresh store → format both heaps and insert the rows describing the catalog
-      tables themselves; existing store → scan both heaps and build the in-memory maps. That
-      self-description is the chicken-and-egg — solved by the constants, exactly as Postgres
-      solves it with compiled-in bootstrap schemas for <code>pg_class</code> and
-      <code>pg_attribute</code>.<sup class="cite"><a href="#ref-2">2</a></sup></li>
-    <li><strong>Everything through the pool.</strong> The catalog's heaps are ordinary
-      <code>HeapFile</code>s over <code>Arc&lt;dyn PageStore&gt;</code> — your Milestone 2 buffer
-      pool. No direct <code>DiskManager</code> access from here to the end of the course.</li>
-    <li><strong>Binder last.</strong> Walk each statement: resolve the table via
-      <code>catalog.table()</code>, build a scope of (index, name, type) for its columns, resolve
-      every <code>Expr::Column</code> against the scope, type expressions bottom-up, and emit
-      <code>BoundStatement</code>. Boring by design — every interesting decision was made when
-      you defined the AST and the catalog.</li>
-    <li><strong>Wire the REPL.</strong> <code>.ast</code> pretty-prints
-      <code>Parser::parse</code> output (write a small indent-per-level <code>Debug</code>-style
-      formatter — the M05 demo shows the shape). <code>CREATE TABLE</code>/<code>DROP TABLE</code>
-      execute directly against the catalog: your first statements that <em>do</em> something.
-      <code>.tables</code> and <code>.schema</code> read it back.</li>
+    <li><strong>Build <code>Lexer::tokenize</code> first.</strong>
+      Walk the input with a <code>Peekable&lt;Chars&gt;</code> or byte/char index cursor. Handle
+      whitespace and <code>--</code> line comments in the outer loop, then dispatch on the current
+      character: letter/<code>_</code> → scan word, match uppercased against <code>Keyword</code> /
+      <code>TRUE</code> / <code>FALSE</code>, else emit lowercase <code>Ident</code>;
+      <code>'</code> → scan string with <code>''</code> unescaping (error on EOF); ASCII digit →
+      scan digits, peeking for <code>.</code> followed by another digit to decide <code>FloatLit</code>
+      vs. <code>IntegerLit</code>; two-char operators before one-char operators. Make all five
+      <code>ms3_lexer_*</code> tests green in an hour.</li>
+
+    <li><strong>Build the token cursor and statement recursive descent.</strong>
+      Wrap <code>&amp;[Token]</code> in a private cursor struct with <code>peek()</code>,
+      <code>next()</code>, <code>eat(&amp;Token)</code>, and <code>expect(&amp;Token)</code>.
+      Remember: never advance past a token before checking it! Implement the outer
+      <code>parse</code> loop skipping empty <code>Semicolon</code>s, then dispatch on the leading
+      <code>Keyword</code>: start with <code>BEGIN</code>/<code>COMMIT</code>/<code>ROLLBACK</code>,
+      <code>DROP TABLE</code>, and <code>CREATE TABLE</code> (mapping type synonyms and folding
+      <code>PRIMARY KEY</code> into <code>nullable: false</code>).</li>
+
+    <li><strong>Implement the Pratt expression core.</strong>
+      Follow the classic Pratt / TDOP algorithm<sup class="cite"><a href="#ref-1">1</a></sup> with
+      your 8-level binding-power table:
+      <pre><code>parse_expr(min_bp):
+    // 1. Prefix / primary position (nud)
+    lhs ← match next token:
+        NOT    → Unary(Not, parse_expr(3))
+        '-'    → Unary(Neg, parse_expr(8))
+        '('    → e ← parse_expr(0); expect(')'); e
+        CAST   → expect('('); e ← parse_expr(0); expect(AS); t ← parse_type(); expect(')'); Cast(e, t)
+        lit    → Literal(v)
+        ident  → if peek == '(' → parse_func_call(ident)   // COUNT(*) → Function("count", [])
+                 else if peek == '.' → consume '.'; Column(Some(ident), expect_ident())
+                 else → Column(None, ident)
+
+    // 2. Postfix &amp; infix loop (led)
+    loop:
+        if peek == IS and 4 &gt;= min_bp:
+            consume IS; neg ← eat(NOT); expect(NULL)
+            lhs ← IsNull(lhs, neg); continue
+        if let Some((op, bp)) = infix_bp(peek):
+            if bp &lt; min_bp: break
+            consume operator
+            rhs ← parse_expr(bp + 1)         // left-associative
+            lhs ← Binary(lhs, op, rhs)
+        else: break
+    return lhs</code></pre>
+      Run all four expression-precedence tests (<code>ms3_precedence_arithmetic</code>,
+      <code>ms3_precedence_logic_and_comparison</code>, <code>ms3_left_associativity</code>,
+      <code>ms3_unary_minus_is_null_cast_qualified</code>) plus <code>ms3_invalid_sql_errors_not_panics</code>.</li>
+
+    <li><strong>Finish <code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>.</strong>
+      In <code>SELECT</code>, parse clauses strictly in SQL order: projection list (handling
+      <code>*</code> and optional <code>AS alias</code>), optional <code>FROM</code>, optional
+      <code>WHERE</code>, optional <code>ORDER BY</code> (each key defaulting to
+      <code>desc = false</code>), optional <code>LIMIT</code>. Verify all 17 <code>ms3_</code> tests
+      in <code>ferricdb-sql</code> pass before opening <code>crates/catalog</code>.</li>
+
+    <li><strong>Implement <code>Catalog</code> in <code>crates/catalog</code>.</strong>
+      Define the compile-time schemas of <code>__tables</code> and <code>__columns</code> and the
+      Page&nbsp;0 header byte layout as private constants at the top of <code>lib.rs</code>. Use
+      <code>HeapFile::open</code> and <code>ferricdb_storage::tuple::{serialize, deserialize}</code>
+      for all catalog reads and writes — everything flows through <code>Arc&lt;dyn PageStore&gt;</code>,
+      never raw <code>DiskManager</code>. In <code>create_table</code>: reject duplicate names with
+      <code>Error::Catalog</code>, allocate the user table's heap via <code>HeapFile::create</code>,
+      assign <code>oid</code> and persist updated <code>next_oid</code> to Page&nbsp;0, insert rows
+      into <code>__tables</code> and <code>__columns</code>, and update <code>CatalogCache</code>.
+      In <code>drop_table</code>: verify the table exists, delete its matching rows from
+      <code>__tables</code> and <code>__columns</code> via <code>HeapFile::delete</code>, and remove
+      it from <code>CatalogCache</code>.</li>
+
+    <li><strong>Implement <code>Binder::bind</code> in <code>crates/exec/src/binder.rs</code>.</strong>
+      Write a private <code>bind_expr(&amp;self, expr, scope) -&gt; Result&lt;(BoundExpr, Option&lt;DataType&gt;)&gt;</code>
+      helper so type checking and column resolution happen in a single bottom-up pass. Ensure every
+      error returns <code>Error::Bind</code> naming the offending table, column, or types (convert
+      missing-table <code>Error::Catalog</code> lookups into <code>Error::Bind</code> so
+      <code>ms3_binder_resolves_and_rejects</code> sees <code>Err(Error::Bind(_))</code>!).</li>
+
+    <li><strong>Wire the REPL (<code>crates/ferricdb/src/repl.rs</code>).</strong>
+      Following cstack's clean metacommand-vs-statement dispatch boundary:<sup class="cite"><a href="#ref-4">4</a></sup>
+      <ul>
+        <li>On startup and on <code>.open &lt;path&gt;</code>, build
+          <code>DiskManager → Arc&lt;BufferPoolManager&gt; → Arc&lt;Catalog&gt;</code> via
+          <code>Catalog::bootstrap</code> (calling <code>flush_all()</code> on the previous store
+          before switching files).</li>
+        <li>Implement <code>.tables</code> (list names from <code>catalog.tables()</code>),
+          <code>.schema &lt;table&gt;</code> (print each column's name, type, and
+          <code>NOT NULL</code> from <code>catalog.table(name)</code>), and
+          <code>.ast &lt;sql&gt;</code> (call <code>Parser::parse</code> and pretty-print the AST).</li>
+        <li>For SQL input ending in <code>;</code>, parse with <code>Parser::parse</code> and bind
+          with <code>Binder::new(&amp;catalog)</code>. Execute <code>BoundStatement::CreateTable</code>
+          and <code>BoundStatement::DropTable</code> directly against <code>catalog</code> (followed
+          by <code>store.flush_all()</code> so DDL persists across restarts); for other valid bound
+          statements, print a short status line noting execution arrives in Milestone&nbsp;4.</li>
+      </ul>
+    </li>
   </ol>
 
   <h2 id="sec-tests">Test plan</h2>
-  <pre><code>cargo test -p ferricdb-sql     -- --include-ignored ms3_
+  <p>Milestone&nbsp;3 tests span <strong>all three crates</strong> — do not stop after
+  <code>ferricdb-sql</code> and <code>ferricdb-catalog</code>; make sure you also run the binder
+  test in <code>ferricdb-exec</code>:</p>
+  <pre><code># 1. Lexer, statement grammar, Pratt precedence, invalid corpus (17 ms3_ tests)
+cargo test -p ferricdb-sql     -- --include-ignored ms3_
+
+# 2. Self-hosted catalog bootstrap, DDL, reopen persistence (5 ms3_ tests)
 cargo test -p ferricdb-catalog -- --include-ignored ms3_
 
-# regressions
+# 3. Binder name/type resolution and rejection (ms3_binder_resolves_and_rejects)
+cargo test -p ferricdb-exec    -- --include-ignored ms3_
+
+# Regressions from Milestones 1 and 2
 cargo test -p ferricdb-storage -- --include-ignored ms1_
 cargo test -p ferricdb-buffer  -- --include-ignored ms2_</code></pre>
-  <p>The sql group covers the lexer cases, a valid corpus asserting exact ASTs across the whole
-  grammar scope, the precedence suite, and an invalid corpus (about ten broken statements) that
-  must produce <code>Err</code> — a panicking parser fails the milestone even if everything else
-  passes. The catalog group covers bootstrap-fresh vs bootstrap-reopen, create/list/drop
-  round-trips, duplicate-name rejection, and schema fidelity across reopen (types and
-  nullability intact). A handful of parses for Milestone 6 grammar (JOIN, GROUP BY, aggregate
-  calls) sit in the same files marked <code>#[ignore = "milestone 6"]</code> — leave them; they
-  are tomorrow's shopping list, not today's.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Crate</th>
+          <th><code>ms3_</code> tests</th>
+          <th>What they check</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ferricdb-sql</code></td>
+          <td>17 tests: 5 lexer, 7 statement/script, 4 precedence/expr, 1 invalid corpus (total 17 <code>ms3_</code> functions)</td>
+          <td>Case-insensitive keywords, lowercased idents, <code>''</code> escapes, maximal munch, comments, exact AST shapes, type synonyms, optional <code>FROM</code>, 8-level Pratt grouping, zero panics on broken SQL.</td>
+        </tr>
+        <tr>
+          <td><code>ferricdb-catalog</code></td>
+          <td>5 tests: <code>ms3_bootstrap_create_table_roundtrip</code>, <code>ms3_duplicate_create_table_errors</code>, <code>ms3_drop_table_removes</code>, <code>ms3_catalog_persists_across_reopen</code>, <code>ms3_schema_fidelity_survives_reopen</code></td>
+          <td>Fresh empty <code>tables()</code>, unique OIDs, duplicate/missing errors, name reuse after drop, exact OID/<code>first_page</code>/schema/order/nullability round-trip after full close and reopen.</td>
+        </tr>
+        <tr>
+          <td><code>ferricdb-exec</code></td>
+          <td><code>ms3_binder_resolves_and_rejects</code></td>
+          <td>Valid <code>SELECT id, name AS who FROM users WHERE score &gt; 10</code> (implicit <code>Int → Float</code> widening!) plus <code>Err(Error::Bind)</code> for unknown table, unknown column, non-boolean <code>WHERE</code>, bad arithmetic, and <code>INSERT</code> arity mismatch.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>You will also see tests tagged <code>#[ignore = "milestone 5"]</code>,
+  <code>"milestone 6"</code>, <code>"milestone 7"</code>, and <code>"milestone 8"</code> at the
+  bottom of <code>parser.rs</code> and <code>catalog.rs</code> (for <code>CREATE INDEX</code>,
+  <code>JOIN</code>/<code>GROUP BY</code>, <code>ANALYZE</code>/<code>EXPLAIN</code>, and
+  <code>VACUUM</code>). Leave those ignored for now — they are future milestones' shopping lists.</p>
 
   <h2 id="sec-pitfalls">Common pitfalls</h2>
+
   <div class="callout pitfall">
-    <span class="callout-title">Precedence-table typos</span>
-    <p><em>Symptom:</em> <code>a OR b AND c</code> groups the wrong way, or comparisons swallow
-    arithmetic (<code>a + 1 &gt; b</code> parsing as <code>a + (1 &gt; b)</code>). One wrong
-    integer in the table produces trees that look plausible in <code>.ast</code> and fail
-    quietly at execution time in Milestone 4. Trust the precedence tests — they exist because
-    everyone makes exactly this mistake once.</p>
+    <span class="callout-title">Pitfall — precedence bugs around <code>NOT</code> and <code>IS NULL</code></span>
+    <p><em>Symptom:</em> <code>NOT a AND b</code> parses as <code>NOT (a AND b)</code>, or
+    <code>a + 1 &gt; b AND c</code> groups incorrectly, or <code>x IS NOT NULL</code> fails to
+    parse after a comparison. <em>Cause:</em> shifting a number in the 8-level table or forgetting
+    to check postfix <code>IS [NOT] NULL</code> inside the Pratt <code>led</code> loop.
+    <em>Fix:</em> copy the 8-level table verbatim (<code>OR=1, AND=2, NOT=3, IS NULL=4, cmp=5, +/-=6, */%=7, neg=8</code>)
+    and verify every boundary with <code>Parser::parse_expr</code>.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Consuming tokens on the error path</span>
-    <p><em>Symptom:</em> error messages that point one token too far, or cascading bogus errors
-    after the first. <em>Cause:</em> a helper called <code>next()</code> to inspect and then
-    errored without backing up. Decide with <code>peek()</code>, consume with
-    <code>expect()</code> — if every consumption is one of those two, this bug cannot exist.</p>
+    <span class="callout-title">Pitfall — returning <code>__tables</code> / <code>__columns</code> from <code>Catalog::tables()</code></span>
+    <p><em>Symptom:</em> <code>ms3_bootstrap_create_table_roundtrip</code> fails on its very first
+    assertion (<code>assert!(catalog.tables().unwrap().is_empty())</code>), or <code>.tables</code>
+    prints internal tables on a blank database. <em>Cause:</em> inserting rows describing
+    <code>__tables</code> and <code>__columns</code> into <code>__tables</code> without filtering
+    them out, or storing them in <code>CatalogCache::tables</code>. <em>Fix:</em> Page&nbsp;0 points
+    directly to pages 1 and 2; keep only <em>user</em> tables inside <code>__tables</code> and
+    <code>CatalogCache::tables</code>.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Bootstrap reads the catalog to learn the catalog's schema</span>
-    <p><em>Symptom:</em> <code>bootstrap</code> works on a fresh database and panics on reopen
-    (or vice versa). <em>Cause:</em> using catalog lookups for <code>__tables</code>/<code>__columns</code>
-    themselves. Their schemas and page ids are compile-time constants; only <em>user</em> tables
-    are discovered by scanning. Write the reopen test first if you are unsure — it is the one
-    that catches this.</p>
+    <span class="callout-title">Pitfall — forgetting to persist <code>next_oid</code> across reopen</span>
+    <p><em>Symptom:</em> <code>ms3_catalog_persists_across_reopen</code> passes, then creating a
+    new table after reopening collides with OID&nbsp;1 and mixes two tables' columns together in
+    <code>__columns</code>! <em>Cause:</em> initializing <code>next_oid = 1</code> on reopen
+    instead of reading it from Page&nbsp;0 (or taking <code>max_seen_oid + 1</code>).
+    <em>Fix:</em> write <code>next_oid</code> into Page&nbsp;0 on every allocation and verify on
+    reopen that <code>next_oid</code> exceeds every loaded OID.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Forgetting that catalog writes must persist</span>
-    <p><em>Symptom:</em> <code>.tables</code> shows your table until the process restarts.
-    <em>Cause:</em> catalog rows inserted through the buffer pool but never flushed —
-    <code>flush_all</code> on clean shutdown (and after DDL, until the WAL exists) is part of
-    this milestone's REPL wiring.</p>
+    <span class="callout-title">Pitfall — returning <code>Error::Catalog</code> instead of <code>Error::Bind</code> from the binder</span>
+    <p><em>Symptom:</em> <code>ms3_binder_resolves_and_rejects</code> fails on
+    <code>SELECT id FROM ghost</code> with <code>Err(Error::Catalog(...))</code> when the test
+    asserts <code>Err(Error::Bind(_))</code>. <em>Cause:</em> using <code>?</code> directly on
+    <code>self.catalog.table(&amp;name)?</code>, propagating <code>Error::Catalog</code> out of
+    <code>Binder::bind</code>. <em>Fix:</em> map missing-table catalog errors to
+    <code>Error::Bind(format!("unknown table `{name}`"))</code> inside the binder.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — forgetting to flush the buffer pool after DDL in the REPL</span>
+    <p><em>Symptom:</em> <code>.tables</code> shows your newly created table during the session,
+    then vanishes the moment you restart <code>ferricdb --db test.db</code>. <em>Cause:</em>
+    catalog pages modified in your write-back buffer pool were never flushed to disk.
+    <em>Fix:</em> call <code>store.flush_all()?</code> after DDL statements and on clean REPL exit
+    (until Milestone&nbsp;9's WAL provides crash durability).</p>
   </div>
 
   <h2 id="sec-done">Definition of done</h2>
   <ul>
-    <li><code>ms3_</code> groups pass in both crates; <code>ms1_</code>/<code>ms2_</code> still
-      pass.</li>
-    <li>In the REPL: <code>.ast SELECT 1 + 2 * 3;</code> shows multiplication nested under
-      addition; <code>CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);</code>
-      succeeds; <code>.tables</code> lists it; <code>.schema users</code> shows both columns
-      with types; all of it survives restart.</li>
-    <li>Binding <code>SELECT ghost FROM users</code> and <code>SELECT name FROM nowhere</code>
-      both fail with errors that name the missing thing.</li>
-    <li>Invalid SQL never panics the REPL.</li>
+    <li>All <code>ms3_</code> tests pass across all three crates: <code>ferricdb-sql</code> (17),
+      <code>ferricdb-catalog</code> (5), and <code>ferricdb-exec</code>
+      (<code>ms3_binder_resolves_and_rejects</code>).</li>
+    <li><code>ms1_</code> and <code>ms2_</code> regression suites stay green.</li>
+    <li>In the REPL (<code>cargo run -p ferricdb -- --db /tmp/ms3.db</code>):
+      <code>.ast SELECT 1 + 2 * 3;</code> prints multiplication nested under addition;
+      <code>CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);</code>
+      succeeds; <code>.tables</code> lists <code>users</code>; <code>.schema users</code> prints all
+      three columns with types and nullability; quitting and reopening <code>/tmp/ms3.db</code>
+      retains the table verbatim.</li>
+    <li>Malformed SQL and invalid column/table references produce readable error messages and never
+      panic the REPL.</li>
   </ul>
 
   <h2 id="sec-quiz">Check your understanding</h2>
-  <fieldset class="quiz" data-explain="The parser owns grammar only — Postgres's parser likewise never consults the catalog; semantic checks live in the analyzer. Keeping the parser schema-free means it is testable with no database and its behavior never changes when tables are created or dropped.">
-    <legend class="quiz-q">Where is SELECT ghost FROM nowhere rejected?</legend>
-    <label><input type="radio" name="q1"> In the lexer — unknown identifiers</label>
-    <label><input type="radio" name="q1"> In the parser — the table doesn't exist</label>
-    <label><input type="radio" name="q1" data-correct> In the binder — it parses fine, then name resolution fails against the catalog</label>
+
+  <fieldset class="quiz" data-explain="The parser checks grammar only and stays completely independent of the catalog — just like PostgreSQL's parser/analyzer split. SELECT ghost FROM nowhere is grammatically valid SQL, so Lexer::tokenize and Parser::parse both succeed; Binder::bind then consults Catalog::table(&quot;nowhere&quot;) and returns Err(Error::Bind) naming the unknown table.">
+    <legend class="quiz-q">Which stage rejects <code>SELECT ghost FROM nowhere</code>?</legend>
+    <label><input type="radio" name="ms3-q1"> The lexer — <code>ghost</code> and <code>nowhere</code> are unknown tokens.</label>
+    <label><input type="radio" name="ms3-q1"> The parser — it looks up <code>nowhere</code> while parsing the <code>FROM</code> clause.</label>
+    <label><input type="radio" name="ms3-q1" data-correct> The binder — it parses cleanly to an AST, then fails name resolution against the catalog with <code>Error::Bind</code>.</label>
+    <label><input type="radio" name="ms3-q1"> The buffer pool — page lookup fails for table <code>nowhere</code>.</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
-  <fieldset class="quiz" data-explain="The catalog tables describe themselves, so their schemas cannot be discovered — they must be known before any lookup is possible. Compile-time constants (with fixed page ids) break the circularity; Postgres ships compiled-in bootstrap schemas the same way.">
-    <legend class="quiz-q">Why are the __tables/__columns schemas Rust constants instead of catalog lookups?</legend>
-    <label><input type="radio" name="q2"> Performance — constants avoid page reads</label>
-    <label><input type="radio" name="q2" data-correct> Circularity — you cannot read a table's schema out of a table whose schema you don't know yet</label>
-    <label><input type="radio" name="q2"> Safety — user statements could otherwise modify them</label>
+
+  <fieldset class="quiz" data-explain="You cannot discover the schema of __tables by querying __tables before you know how to deserialize its rows! Fixing Page 0 as a catalog header and hard-coding the schemas of __tables (Page 1) and __columns (Page 2) as Rust constants breaks the circularity — the exact bootstrap strategy PostgreSQL uses for pg_class and pg_attribute.">
+    <legend class="quiz-q">Why are the schemas and page ids of <code>__tables</code> and
+    <code>__columns</code> fixed compile-time constants rather than looked up dynamically?</legend>
+    <label><input type="radio" name="ms3-q2"> To avoid acquiring buffer-pool pins during startup.</label>
+    <label><input type="radio" name="ms3-q2" data-correct> To break bootstrap circularity — you cannot deserialize a system table's rows without already knowing its schema and location.</label>
+    <label><input type="radio" name="ms3-q2"> Because <code>HeapFile</code> only supports compile-time schemas.</label>
+    <label><input type="radio" name="ms3-q2"> So <code>Catalog::tables()</code> will list them first.</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="In FerricDB's 8-level Pratt table: AND has bp 2, prefix NOT has bp 3, postfix IS NULL has bp 4, and &gt; has bp 5. Because IS NULL (4) binds tighter than NOT (3), NOT active IS NULL groups as NOT (active IS NULL). Because both NOT (3) and &gt; (5) bind tighter than AND (2), the full expression parses as (NOT (active IS NULL)) AND (x &gt; 0).">
+    <legend class="quiz-q">Under FerricDB's 8-level Pratt binding-power table
+    (<code>OR=1, AND=2, NOT=3, IS NULL=4, cmp=5</code>), how does
+    <code>NOT active IS NULL AND x &gt; 0</code> parse?</legend>
+    <label><input type="radio" name="ms3-q3"> <code>NOT ((active IS NULL) AND (x &gt; 0))</code></label>
+    <label><input type="radio" name="ms3-q3"> <code>((NOT active) IS NULL) AND (x &gt; 0)</code></label>
+    <label><input type="radio" name="ms3-q3" data-correct> <code>(NOT (active IS NULL)) AND (x &gt; 0)</code></label>
+    <label><input type="radio" name="ms3-q3"> Parse error — <code>IS NULL</code> requires parentheses after <code>NOT</code>.</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
@@ -281,36 +935,37 @@ cargo test -p ferricdb-buffer  -- --include-ignored ms2_</code></pre>
     <h2 id="sec-sources">Primary sources</h2>
     <div class="refs">
       <ol>
-        <li id="ref-1">apache/datafusion-sqlparser-rs, README — Pratt/TDOP expression parsing
-          inside hand-written recursive descent; the design this milestone follows.
+        <li id="ref-1"><code>apache/datafusion-sqlparser-rs</code> — Pratt/TDOP expression parsing
+          inside hand-written recursive descent; the parser architecture this milestone mirrors.
           <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">https://github.com/apache/datafusion-sqlparser-rs</a></li>
-        <li id="ref-2">Hironobu Suzuki, The Internals of PostgreSQL, §3.1 — parser vs analyzer
-          responsibilities; the catalog-backed semantic analysis this milestone's binder
-          mirrors.
+        <li id="ref-2">Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, §3.1 — parser vs.
+          analyzer responsibilities; the catalog-backed semantic analysis this milestone's binder
+          reproduces.
           <a href="https://www.interdb.jp/pg/pgsql03/01.html" rel="external">https://www.interdb.jp/pg/pgsql03/01.html</a></li>
-        <li id="ref-3">SQLite, "Architecture of SQLite" — the alternative front-end design
-          (generated parser, bytecode target) contrasted throughout Module 5.
+        <li id="ref-3">SQLite, “Architecture of SQLite” — the contrasting front-end architecture
+          (Lemon-generated LALR parser compiling SQL to bytecode).
           <a href="https://sqlite.org/arch.html" rel="external">https://sqlite.org/arch.html</a></li>
-        <li id="ref-4">cstack, "Let's Build a Simple Database", Part 2 — the minimal front-end
-          and engine split.
+        <li id="ref-4">cstack, “Let's Build a Simple Database”, Part 2 — the minimal metacommand
+          vs. SQL statement preparation boundary used in our REPL wiring.
           <a href="https://cstack.github.io/db_tutorial/parts/part2.html" rel="external">https://cstack.github.io/db_tutorial/parts/part2.html</a></li>
+        <li id="ref-5">PostgreSQL Documentation, “System Catalogs” — <code>pg_class</code>,
+          <code>pg_attribute</code>, and self-hosted catalog metadata.
+          <a href="https://www.postgresql.org/docs/current/catalogs.html" rel="external">https://www.postgresql.org/docs/current/catalogs.html</a></li>
       </ol>
     </div>
 
     <h2 id="sec-deeper">Go deeper</h2>
     <ul>
-      <li>PostgreSQL docs, "System Catalogs" — pg_class and pg_attribute, the production versions
-        of your __tables and __columns.
-        <a href="https://www.postgresql.org/docs/current/catalogs.html" rel="external">postgresql.org/docs/current/catalogs.html</a></li>
-      <li>sqlparser-rs source — compare your Pratt loop with theirs after you finish; the
-        similarity is the point.
+      <li>SQLite, “CREATE TABLE” — how a real SQL dialect extends column constraints beyond
+        <code>NOT NULL</code> and <code>PRIMARY KEY</code>.
+        <a href="https://sqlite.org/lang_createtable.html" rel="external">sqlite.org/lang_createtable.html</a></li>
+      <li>PostgreSQL Documentation, “Constraints” — primary keys, nullability rules, and why
+        <code>PRIMARY KEY</code> implies <code>NOT NULL</code> in standard SQL.
+        <a href="https://www.postgresql.org/docs/current/ddl-constraints.html" rel="external">postgresql.org/docs/current/ddl-constraints.html</a></li>
+      <li><code>sqlparser-rs</code> source — once your tests are green, read its
+        <code>parse_subexpr</code> loop and compare it line-by-line with your Pratt parser.
         <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">github.com/apache/datafusion-sqlparser-rs</a></li>
     </ul>
-
-    <h2 id="sec-milestone">Milestone link</h2>
-    <p>Next on the path: <a href="../../modules/m06-query-execution/index.html">M06 · Query
-    Execution</a>, then <a href="../milestone-04/index.html">Milestone 4</a> — where the
-    statements you can now parse finally run.</p>
 
     <nav class="prevnext">
       <a href="../../modules/m05-sql-parsing/index.html"><span class="dir">← Previous</span> M05 · SQL Front-End</a>
@@ -322,6 +977,7 @@ cargo test -p ferricdb-buffer  -- --include-ignored ms2_</code></pre>
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     done: ["heap", "disk", "buffer"],
     current: ["frontend", "catalog"],

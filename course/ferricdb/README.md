@@ -25,8 +25,8 @@ wins.
 | `crates/storage` | `ferricdb-storage` | Slotted heap pages, tuple (de)serialization, disk manager, heap files | 1 | m02-storage |
 | `crates/buffer` | `ferricdb-buffer` | Buffer pool manager, clock replacer (LRU-K as stretch), RAII pin guards | 2 | m03-buffer-pool |
 | `crates/sql` | `ferricdb-sql` | Lexer, AST, recursive-descent statement parser + Pratt expression parser | 3 | m05-sql-parsing |
-| `crates/catalog` | `ferricdb-catalog` | Self-hosted system catalog (stored in its own heap pages); table stats | 3, 7 | m05, m08 |
-| `crates/exec` | `ferricdb-exec` | Binder (3), planner + Volcano executors (4), joins/aggregation/external sort (6), cost-based optimizer (7) | 3, 4, 6, 7 | m06, m07, m08 |
+| `crates/catalog` | `ferricdb-catalog` | Self-hosted system catalog (stored in its own heap pages); index & table stats | 3, 5, 7 | m05, m04, m08 |
+| `crates/exec` | `ferricdb-exec` | Binder (3), planner + Volcano executors (4), index scan (5), joins/aggregation/external sort (6), cost-based optimizer (7), MVCC/VACUUM (8) | 3–8 | m06, m07, m08, m09 |
 | `crates/index` | `ferricdb-index` | Disk-resident B+Tree index with range scans | 5 | m04-data-structures-indexes |
 | `crates/txn` | `ferricdb-txn` | MVCC snapshots, visibility rules, transaction manager, first-committer-wins | 8 | m09-transactions-mvcc |
 | `crates/wal` | `ferricdb-wal` | Write-ahead log and ARIES-style recovery (analysis / redo / undo) | 9 | m10-logging-recovery |
@@ -69,7 +69,9 @@ $ cargo test --workspace -- --include-ignored msN_
 $ cargo test -p ferricdb-storage -- --include-ignored ms1_
 $ cargo test -p ferricdb-buffer  -- --include-ignored ms2_
 
-# sqllogictest files run through the harness test from milestone 4 on:
+# sqllogictest files run through the harness per milestone:
+$ cargo test -p ferricdb -- --include-ignored ms4_slt_crud
+$ cargo test -p ferricdb -- --include-ignored ms6_slt_joins_agg_sort
 $ cargo test -p ferricdb -- --include-ignored slt_all
 ```
 
@@ -81,11 +83,12 @@ classmates who are not there yet.
 
 Core algorithms are implemented **by hand** — that is the whole point. The
 only external crates allowed are the ones already declared in the workspace
-`Cargo.toml`: `thiserror`, `bytes`, `rustyline` (REPL), `tokio` (server crate
-only), and as dev-dependencies `tempfile`, `rand` (fixed-seed property tests),
-`sqllogictest` (harness), `criterion` (benches). `sqlparser` is permitted
-solely as the documented Milestone 3 escape hatch and is not a default
-dependency. Do not add anything else.
+`Cargo.toml`: `thiserror`, `bytes`, `rustyline` (REPL), `tempfile` (`ferricdb`
+binary temp DBs + tests), `tokio` (`server` crate and `ferricdb` `--serve`),
+and as dev-dependencies `rand` (fixed-seed property tests), `sqllogictest`
+(harness), `criterion` (benches). `sqlparser` is permitted solely as the
+documented Milestone 3 escape hatch and is not a default dependency. Do not
+add anything else.
 
 ### Attribution
 

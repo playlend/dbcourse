@@ -1,11 +1,6 @@
-//! Provided Milestone 8 test suite.
+//! Provided Milestone 8 test suite (plus MS9 `restore` hook test).
 //!
 //! Run with `cargo test -p ferricdb-txn -- --include-ignored ms8_`.
-//!
-//! Course convention (documented on `Snapshot::is_visible`): the snapshot's
-//! owner is the transaction with id `xmax - 1`, assigned atomically with
-//! the snapshot capture. The visibility table below builds snapshots by
-//! hand around that convention.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -15,13 +10,14 @@ use ferricdb_common::{Error, RecordId, TupleMeta, TxnId};
 use ferricdb_txn::{Snapshot, Transaction, TransactionManager};
 
 /// The M09 module's scenario: we are transaction 100.
-/// Snapshot 98:101:{98,100} — T98 in flight, T99 aborted, T95/T96 settled
-/// long ago, T100 is us. (xmax = 101 ⇒ owner = 100.)
+/// Snapshot owner=100, xmin=98, xmax=101, active={98} — T98 in flight,
+/// T99 aborted, T95/T96 settled long ago, T100 is us.
 fn snapshot_100() -> Snapshot {
     Snapshot {
+        owner: 100,
         xmin: 98,
         xmax: 101,
-        active: BTreeSet::from([98, 100]),
+        active: BTreeSet::from([98]),
     }
 }
 
@@ -70,6 +66,19 @@ fn ms8_visibility_rules_table() {
     }
 }
 
+/// Frozen / bootstrap tuples (`xmin == 0`) behave as committed in the distant
+/// past: visible unless deleted by a visible `xmax`.
+#[test]
+#[ignore = "milestone 8"]
+fn ms8_frozen_tuple_xmin_zero_is_visible() {
+    let snap = snapshot_100();
+    assert!(snap.is_visible(&TupleMeta { xmin: 0, xmax: 0 }, &oracle));
+    assert!(snap.is_visible(&TupleMeta { xmin: 0, xmax: 98 }, &oracle));
+    assert!(snap.is_visible(&TupleMeta { xmin: 0, xmax: 99 }, &oracle));
+    assert!(!snap.is_visible(&TupleMeta { xmin: 0, xmax: 96 }, &oracle));
+    assert!(!snap.is_visible(&TupleMeta { xmin: 0, xmax: 100 }, &oracle));
+}
+
 /// Rules 5 and 9 need a creator/deleter that committed AFTER the snapshot:
 /// T98 commits, but it stays in our active set until we retake.
 #[test]
@@ -100,12 +109,24 @@ fn ms8_begin_assigns_increasing_ids_and_snapshots() {
     let mgr = TransactionManager::new();
     let t1 = mgr.begin();
     let t2 = mgr.begin();
+    assert!(t1.id() >= 1, "0 is reserved for frozen/none");
     assert!(t2.id() > t1.id(), "ids increase");
+    assert_eq!(t2.snapshot().owner, t2.id());
+    assert!(
+        !t2.snapshot().active.contains(&t2.id()),
+        "active holds OTHER in-flight txns, not owner"
+    );
     assert!(
         t2.snapshot().active.contains(&t1.id()),
         "a later snapshot sees an earlier active txn as active"
     );
+    assert!(mgr.is_active(t1.id()), "in-flight txn is active");
     mgr.commit(&t1).unwrap();
+    assert!(!mgr.is_active(t1.id()), "committed txn is no longer active");
+    assert!(
+        mgr.is_committed(t1.id()),
+        "committed txn is marked committed"
+    );
     let t3 = mgr.begin();
     assert!(
         !t3.snapshot().active.contains(&t1.id()),
@@ -132,6 +153,14 @@ fn ms8_first_committer_wins() {
         Err(Error::Serialization(_)) => {}
         other => panic!("second committer must get a serialization error, got {other:?}"),
     }
+    assert!(
+        !mgr.is_committed(t2.id()),
+        "conflicting second committer must be aborted"
+    );
+    assert!(
+        mgr.oldest_visible_xid() > t2.id(),
+        "aborted second committer leaves the active set so the horizon advances"
+    );
 }
 
 #[test]
@@ -145,7 +174,13 @@ fn ms8_no_conflict_when_not_concurrent() {
 
     let t1 = mgr.begin();
     mgr.record_write(&t1, rid);
+    assert!(mgr.is_active(t1.id()), "in-flight txn is active");
     mgr.commit(&t1).unwrap();
+    assert!(!mgr.is_active(t1.id()), "committed txn is no longer active");
+    assert!(
+        mgr.is_committed(t1.id()),
+        "committed txn is marked committed"
+    );
 
     // t2 starts AFTER t1 committed: same rid, no conflict.
     let t2 = mgr.begin();
@@ -179,11 +214,15 @@ fn ms8_abort_frees_conflicts() {
 #[ignore = "milestone 8"]
 fn ms8_fuzzy_read_prevented() {
     let mgr = TransactionManager::new();
+    // Seed a real committed row before reader & writer begin.
+    let setup = mgr.begin();
+    mgr.commit(&setup).unwrap();
+
     let reader = mgr.begin();
     let writer = mgr.begin();
 
     let row_v1 = TupleMeta {
-        xmin: 1,
+        xmin: setup.id(),
         xmax: writer.id(),
     }; // writer deletes v1
     let row_v2 = TupleMeta {
@@ -191,7 +230,7 @@ fn ms8_fuzzy_read_prevented() {
         xmax: 0,
     }; // and writes v2
     let snap = reader.snapshot().clone();
-    let o = |xid: TxnId| xid == 1 || mgr.is_committed(xid);
+    let o = |xid: TxnId| mgr.is_committed(xid);
 
     // before the writer commits
     assert!(snap.is_visible(&row_v1, &o));
@@ -266,9 +305,9 @@ fn ms8_concurrent_begins_are_atomic() {
             let mut ids = Vec::new();
             for _ in 0..100 {
                 let t: Arc<Transaction> = mgr.begin();
-                // a txn is never "active in its own snapshot" per the
-                // owner-is-xmax-minus-one convention
+                assert_eq!(t.snapshot().owner, t.id());
                 assert!(t.id() < t.snapshot().xmax);
+                assert!(!t.snapshot().active.contains(&t.id()));
                 ids.push(t.id());
                 mgr.commit(&t).unwrap();
             }
@@ -287,4 +326,24 @@ fn ms8_concurrent_begins_are_atomic() {
         n,
         "txn ids are globally unique under concurrency"
     );
+}
+
+#[test]
+#[ignore = "milestone 9"]
+fn ms9_restore_committed_txns_after_restart() {
+    let mgr = TransactionManager::new();
+    mgr.restore(15, [3, 7, 12]);
+    assert!(mgr.is_committed(3));
+    assert!(mgr.is_committed(7));
+    assert!(mgr.is_committed(12));
+    assert!(!mgr.is_committed(8));
+
+    let fresh = mgr.begin();
+    assert!(
+        fresh.id() > 15,
+        "new transactions after recovery must not reuse pre-crash ids"
+    );
+    let snap = fresh.snapshot();
+    assert!(snap.is_visible(&TupleMeta { xmin: 7, xmax: 0 }, &|x| mgr.is_committed(x)));
+    assert!(!snap.is_visible(&TupleMeta { xmin: 8, xmax: 0 }, &|x| mgr.is_committed(x)));
 }

@@ -25,8 +25,9 @@
 
 <main>
   <h1>Milestone 4 · Planner and Volcano Executor</h1>
-  <p class="subtitle">The milestone where FerricDB becomes a database: bound statements become
-  plans, plans become iterator trees, and real SQL runs end to end in your REPL.</p>
+  <p class="subtitle">The milestone where FerricDB becomes a working database: bound statements
+  become logical plans, plans become Volcano iterator trees, and full SQL CRUD runs end to end in
+  your REPL and through sqllogictest.</p>
 
   <noscript><p class="noscript-warn">The architecture diagram and quizzes need JavaScript;
   all specification content is readable without it.</p></noscript>
@@ -38,6 +39,8 @@
       <li><a href="#sec-reading">Required reading</a></li>
       <li><a href="#sec-arch">Where this fits</a></li>
       <li><a href="#sec-spec">Specification</a></li>
+      <li><a href="#sec-plumbing">Statement dispatch, RecordId flow, and the Halloween guard</a></li>
+      <li><a href="#sec-eval">Expression evaluation, three-valued logic, and NULL ordering</a></li>
       <li><a href="#sec-guidance">Step-by-step guidance</a></li>
       <li><a href="#sec-tests">Test plan</a></li>
       <li><a href="#sec-pitfalls">Common pitfalls</a></li>
@@ -48,218 +51,875 @@
     </ol>
   </div>
 
-  <p>Every piece you have built so far was in service of this moment. Storage holds tuples, the
-  buffer pool serves pages, the front-end produces checked statements — and today you write the
-  machine that connects them: a planner that turns <code>BoundStatement</code>s into operator
-  trees and an executor that pulls tuples through those trees one <code>next()</code> at a
-  time. When the last test goes green, type <code>INSERT</code> and <code>SELECT</code> into
-  your REPL and take the moment. You wrote a database.</p>
+  <p>Storage holds tuples (MS1), the buffer pool caches pages (MS2), and the front-end produces
+  catalog-checked statements (MS3). Today you build the execution engine in
+  <code>course/ferricdb/crates/exec</code>: a planner mapping <code>BoundStatement</code>s to
+  <code>LogicalPlan</code> trees, a Volcano executor pulling <code>ExecRow</code>s one
+  <code>next()</code> at a time, a three-valued expression evaluator, and the top-level
+  <code>execute()</code> driver powering your REPL, tests, and future wire server. When
+  <code>ms4_slt_crud</code> turns green, run <code>INSERT</code>, <code>SELECT</code>,
+  <code>UPDATE</code>, and <code>DELETE</code> in your REPL and restart the binary to see your rows
+  persist. You built a database.</p>
 
   <h2 id="sec-objectives">Learning objectives</h2>
   <ul>
-    <li><strong>Implement</strong> the Volcano iterator contract — <code>open</code>/<code>next</code>/<code>close</code>
-      — and explain why pull-based composition makes operators independent.<sup class="cite"><a href="#ref-1">1</a></sup></li>
-    <li><strong>Implement</strong> the nine core operators: SeqScan, Filter, Projection, Values,
-      Limit, in-memory Sort, Insert, Update, Delete.<sup class="cite"><a href="#ref-2">2</a></sup></li>
-    <li><strong>Implement</strong> an expression evaluator with SQL three-valued logic.</li>
-    <li><strong>Build</strong> the planner that maps bound statements to logical plans and
-      logical plans to executor trees.</li>
-    <li><strong>Recognize</strong> blocking vs streaming operators and the Halloween problem —
-      and defuse the latter.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Implement</strong> the Volcano iterator contract — <code>open</code> /
+      <code>next</code> / <code>close</code> yielding <code>Option&lt;ExecRow&gt;</code> — and
+      compose operators via <code>Box&lt;dyn Executor&gt;</code>.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Implement</strong> all nine Milestone&nbsp;4 physical operators:
+      <code>SeqScan</code>, <code>Filter</code>, <code>Projection</code>, <code>Values</code>,
+      <code>Limit</code>, blocking in-memory <code>Sort</code>, <code>Insert</code>,
+      <code>Update</code>, and <code>Delete</code>.<sup class="cite"><a href="#ref-2">2</a></sup><sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong>Implement</strong> SQL expression evaluation with three-valued logic,
+      <code>Value::sql_cmp</code>, implicit <code>Integer → Float</code> widening,
+      <code>CAST</code> conversions, and safe division-by-zero handling.<sup class="cite"><a href="#ref-5">5</a></sup></li>
+    <li><strong>Build</strong> <code>Planner::plan</code>, identity <code>Planner::optimize</code>,
+      <code>Planner::create_executor</code>, and <code>execute()</code> with direct DDL dispatch
+      and PostgreSQL <code>CommandComplete</code> tags.<sup class="cite"><a href="#ref-4">4</a></sup><sup class="cite"><a href="#ref-7">7</a></sup></li>
+    <li><strong>Propagate</strong> physical <code>RecordId</code>s via <code>ExecRow</code> and
+      defuse the <strong>Halloween problem</strong> on out-of-place <code>HeapFile</code> updates.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li><strong>Upgrade</strong> the REPL to <code>ferricdb_exec::execute</code> with aligned ASCII
+      tables and verify end-to-end SQL with <code>sqllogictest</code>.<sup class="cite"><a href="#ref-3">3</a></sup></li>
   </ul>
 
   <h2 id="sec-reading">Required reading</h2>
   <ul>
-    <li><a href="../../modules/m06-query-execution/index.html">M06 · Query Execution</a> — the
-      concept module: the iterator model, plan trees, operator semantics. Its plan-tree stepper
-      is a visual trace of the code you are about to write.</li>
+    <li><a href="../../modules/m06-query-execution/index.html">M06 · Query Execution</a> — logical
+      vs. physical plans, the Volcano iterator model, blocking vs. streaming operators, and the
+      pull-pipeline stepper.</li>
     <li><a href="../../modules/m01-relational-model-sql/index.html">M01 · The Relational Model</a>
-      — revisit it: your operators implement exactly that algebra.</li>
-    <li>toyDB's architecture guide — a clean Rust iterator engine; read how its executors
-      compose before designing yours.
-      <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">github.com/erikgrinaker/toydb/docs/architecture</a></li>
-    <li>CMU 15-445 Project #3 — operator semantics at BusTub scale (their executor set is a
-      superset of this milestone's).
-      <a href="https://15445.courses.cs.cmu.edu/fall2025/project3/" rel="external">15445.courses.cs.cmu.edu/fall2025/project3/</a></li>
+      — revisit three-valued logic and relational algebra; your operators execute that exact model.</li>
+    <li>Hellerstein, Stonebraker, and Hamilton, “Architecture of a Database System”, Chapter&nbsp;4
+      — dataflow plans and iterator execution.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li>CMU 15-445 Project&nbsp;#3 (Fall 2025) — BusTub's <code>(Tuple, RID)</code> iterator
+      output, operator contracts, and update-path hazards.<sup class="cite"><a href="#ref-2">2</a></sup></li>
+    <li>E.&nbsp;Grinaker, toyDB Architecture Guide — a single-tree Rust iterator engine.<sup class="cite"><a href="#ref-4">4</a></sup></li>
   </ul>
 
   <h2 id="sec-arch">Where this fits</h2>
   <figure>
     <div id="arch-diagram"></div>
-    <figcaption>Figure 1 — planner and executor light up. With this milestone the entire query
-    path from SQL text to heap pages is yours, end to end.</figcaption>
+    <figcaption>Figure 1 — FerricDB architecture. Planner and executor come online, completing the
+    full single-table query path from SQL text down to heap pages on disk.</figcaption>
   </figure>
+  <p>Two seams on <code>ExecContext</code> remain dormant until later milestones:
+  <code>txn_manager</code> / <code>current_txn</code> / <code>failed_txn</code> (Milestone&nbsp;8
+  MVCC) and <code>wal</code> (Milestone&nbsp;9 write-ahead logging). In Milestone&nbsp;4, every
+  inserted tuple writes <code>TupleMeta::default()</code> (<code>xmin = 0, xmax = 0</code>: frozen
+  and live) and <code>wal</code> stays <code>None</code>. Keeping these fields in place lets
+  Milestones&nbsp;5–10 slot in without breaking <code>ferricdb-exec</code>'s public signatures.</p>
 
   <h2 id="sec-spec">Specification</h2>
-  <p>You implement the heart of <code>crates/exec</code>:</p>
+  <p>You implement Milestone&nbsp;4 inside <code>course/ferricdb/crates/exec</code> (package
+  <code>ferricdb-exec</code>). All public signatures below are quoted verbatim from
+  <code>course/ferricdb/docs/api-spec.md</code> and <code>crates/exec/src/{lib,plan}.rs</code> — do
+  not alter them.</p>
 
-  <pre><code>pub mod plan {
-    pub enum LogicalPlan {
-        SeqScan { table: TableInfo, filter: Option&lt;BoundExpr&gt; },
-        Filter { input: Box&lt;LogicalPlan&gt;, predicate: BoundExpr },
-        Projection { input: Box&lt;LogicalPlan&gt;, exprs: Vec&lt;BoundExpr&gt; },
-        Sort { input: Box&lt;LogicalPlan&gt;, keys: Vec&lt;(BoundExpr, bool)&gt; },
-        Limit { input: Box&lt;LogicalPlan&gt;, limit: u64 },
-        Insert { table: TableInfo, input: Box&lt;LogicalPlan&gt; },
-        Update { table: TableInfo, set: Vec&lt;(usize, BoundExpr)&gt;, input: Box&lt;LogicalPlan&gt; },
-        Delete { table: TableInfo, input: Box&lt;LogicalPlan&gt; },
-        Values { rows: Vec&lt;Vec&lt;BoundExpr&gt;&gt;, schema: Schema },
-        // IndexScan, joins, aggregates: Milestones 5–6
-    }
+  <h3>1. Row container, Volcano trait, and execution context</h3>
+  <pre><code>// crates/exec/src/lib.rs — verbatim public API from api-spec.md
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecRow { pub values: Vec&lt;Value&gt;, pub rid: Option&lt;RecordId&gt; }
+impl ExecRow {
+    pub fn new(values: Vec&lt;Value&gt;) -&gt; Self;
+    pub fn with_rid(values: Vec&lt;Value&gt;, rid: RecordId) -&gt; Self;
 }
 
 /// Volcano iterator contract. next() returns Ok(None) at end of stream.
 pub trait Executor {
     fn schema(&amp;self) -&gt; &amp;Schema;
     fn open(&amp;mut self) -&gt; Result&lt;()&gt;;
-    fn next(&amp;mut self) -&gt; Result&lt;Option&lt;Vec&lt;Value&gt;&gt;&gt;;
+    fn next(&amp;mut self) -&gt; Result&lt;Option&lt;ExecRow&gt;&gt;;
     fn close(&amp;mut self) -&gt; Result&lt;()&gt;;
 }
 
+pub const DEFAULT_MEMORY_PAGES: usize = 64;
+pub struct ExecContext {
+    pub catalog: Arc&lt;Catalog&gt;,
+    pub store: Arc&lt;dyn PageStore&gt;,
+    pub txn_manager: Arc&lt;TransactionManager&gt;,
+    pub current_txn: Mutex&lt;Option&lt;Arc&lt;Transaction&gt;&gt;&gt;,
+    pub failed_txn: Mutex&lt;bool&gt;,
+    pub wal: Option&lt;Arc&lt;dyn WalHook&gt;&gt;,
+    pub memory_pages: usize,
+}
+impl ExecContext {
+    pub fn new(catalog: Arc&lt;Catalog&gt;, store: Arc&lt;dyn PageStore&gt;,
+               txn_manager: Arc&lt;TransactionManager&gt;) -&gt; Self;
+    pub fn new_session(&amp;self) -&gt; Self; // isolated per-connection session for Server
+}</code></pre>
+
+  <h3>2. Logical plan tree</h3>
+  <pre><code>// crates/exec/src/plan.rs — verbatim public API from api-spec.md
+
+pub mod plan {
+    #[derive(Clone, Debug)]
+    pub enum LogicalPlan {
+        SeqScan { table_idx: usize, table: TableInfo, filter: Option&lt;BoundExpr&gt; },
+        IndexScan { table_idx: usize, table: TableInfo, index: IndexInfo,
+                    lower: Bound&lt;Value&gt;, upper: Bound&lt;Value&gt; },             // MS5
+        Filter { input: Box&lt;LogicalPlan&gt;, predicate: BoundExpr },
+        Projection { input: Box&lt;LogicalPlan&gt;, exprs: Vec&lt;BoundExpr&gt;, schema: Schema },
+        NestedLoopJoin { left: Box&lt;LogicalPlan&gt;, right: Box&lt;LogicalPlan&gt;,
+                         on: Option&lt;BoundExpr&gt; },                            // MS6
+        HashJoin { left: Box&lt;LogicalPlan&gt;, right: Box&lt;LogicalPlan&gt;,
+                   left_keys: Vec&lt;BoundExpr&gt;, right_keys: Vec&lt;BoundExpr&gt; },  // MS6
+        Aggregate { input: Box&lt;LogicalPlan&gt;, group_by: Vec&lt;BoundExpr&gt;,
+                    aggregates: Vec&lt;AggExpr&gt; },                              // MS6
+        Sort { input: Box&lt;LogicalPlan&gt;, keys: Vec&lt;(BoundExpr, bool)&gt; },      // NULLs LAST in ASC &amp; DESC
+        Limit { input: Box&lt;LogicalPlan&gt;, limit: u64 },
+        Insert { table: TableInfo, input: Box&lt;LogicalPlan&gt; },
+        Update { table: TableInfo, set: Vec&lt;(usize, BoundExpr)&gt;, input: Box&lt;LogicalPlan&gt; },
+        Delete { table: TableInfo, input: Box&lt;LogicalPlan&gt; },
+        Values { rows: Vec&lt;Vec&lt;BoundExpr&gt;&gt;, schema: Schema },
+    }
+}</code></pre>
+  <p>Milestone&nbsp;4 builds and executes nine variants: <code>SeqScan</code>, <code>Filter</code>,
+  <code>Projection</code>, <code>Sort</code>, <code>Limit</code>, <code>Insert</code>,
+  <code>Update</code>, <code>Delete</code>, and <code>Values</code>. <code>IndexScan</code>
+  arrives in Milestone&nbsp;5; joins and <code>Aggregate</code> arrive in Milestone&nbsp;6 — return
+  <code>Err(Error::Execution(...))</code> if <code>create_executor</code> encounters them today.</p>
+
+  <h3>3. Planner, QueryResult, and <code>execute()</code></h3>
+  <pre><code>// crates/exec/src/lib.rs — verbatim public API from api-spec.md
+
 pub struct Planner&lt;'a&gt; { /* &amp;'a ExecContext */ }
 impl&lt;'a&gt; Planner&lt;'a&gt; {
+    pub fn new(ctx: &amp;'a ExecContext) -&gt; Self;
     pub fn plan(&amp;self, stmt: binder::BoundStatement) -&gt; Result&lt;plan::LogicalPlan&gt;;
+    /// MS4: identity (return Ok(plan)); MS7: rewrite rules + cost-based optimizer.
+    pub fn optimize(&amp;self, plan: plan::LogicalPlan) -&gt; Result&lt;plan::LogicalPlan&gt;;
     pub fn create_executor(&amp;self, plan: &amp;plan::LogicalPlan) -&gt; Result&lt;Box&lt;dyn Executor&gt;&gt;;
 }
 
-pub struct QueryResult { pub schema: Schema, pub rows: Vec&lt;Vec&lt;Value&gt;&gt;,
-                         pub affected: u64, pub explain: Option&lt;String&gt; }
+#[derive(Clone, Debug, Default)]
+pub struct QueryResult {
+    pub schema: Schema,
+    pub rows: Vec&lt;Vec&lt;Value&gt;&gt;,
+    pub affected: u64,
+    pub tag: String,
+    pub explain: Option&lt;String&gt;,
+}
 /// One-stop entry used by REPL, tests, and server.
 pub fn execute(sql: &amp;str, ctx: &amp;ExecContext) -&gt; Result&lt;Vec&lt;QueryResult&gt;&gt;;</code></pre>
+  <p>The starter file already implements <code>ExecRow::new</code> / <code>with_rid</code>,
+  <code>ExecContext::new</code> / <code>new_session</code>, and <code>Planner::new</code>. Keep
+  those intact and replace the four <code>todo!("Milestone 4")</code> stubs:
+  <code>Planner::plan</code>, <code>Planner::optimize</code> (implemented as the identity function
+  <code>Ok(plan)</code> in Milestone&nbsp;4!), <code>Planner::create_executor</code>, and
+  <code>execute</code>.</p>
 
-  <p>Operator semantics you must honor (each is checked by a test):</p>
+  <h3>Operator contract summary</h3>
   <ul>
-    <li><strong>SeqScan</strong> wraps <code>HeapFile::scan</code>, deserializes tuples, and
-      (optionally) applies an inlined filter. Skips tombstones.</li>
-    <li><strong>Filter</strong> passes a row iff its predicate evaluates to <em>true</em> —
-      NULL is not true, so a NULL predicate drops the row. Three-valued logic is not optional;
-      it is the tests' favorite subject.</li>
-    <li><strong>Projection</strong> evaluates its expressions per row and emits the new shape;
-      its <code>schema()</code> reports the projected columns and types.</li>
-    <li><strong>Sort</strong> is <em>blocking</em>: <code>open()</code> drains its child,
-      sorts in memory with <code>Value::sql_cmp</code> (NULLs order last in this course —
-      document any choice you make), and <code>next()</code> replays. External sort arrives in
-      Milestone 6.</li>
-    <li><strong>Limit</strong> is <em>streaming</em>: stop calling the child after N rows —
-      the M06 stepper's short-circuit, now in code.</li>
-    <li><strong>Insert / Update / Delete</strong> consume their input, write through
-      <code>HeapFile</code>, and report <code>affected</code> counts (rows produced: none).
-      Update and Delete take their victims from a child SeqScan.</li>
-    <li><strong>Values</strong> emits its literal rows; it is INSERT's usual child.</li>
+    <li><strong><code>SeqScan</code> (streaming):</strong> opens <code>HeapFile::scan()</code>,
+      deserializes live tuples, applies any fused <code>filter</code>, and emits
+      <code>ExecRow::with_rid(values, rid)</code>.</li>
+    <li><strong><code>Filter</code> (streaming):</strong> pulls child rows and forwards the
+      original <code>ExecRow</code> (preserving <code>row.rid</code>) iff its predicate evaluates to
+      <code>Value::Boolean(true)</code>.</li>
+    <li><strong><code>Projection</code> (streaming):</strong> evaluates <code>exprs</code> per row,
+      emits <code>ExecRow::new(vals)</code> (<code>rid: None</code>), and reports
+      <code>plan.schema</code> from <code>schema()</code>.</li>
+    <li><strong><code>Values</code> (streaming):</strong> evaluates literal row expressions against
+      <code>&amp;[]</code> and emits <code>ExecRow::new(vals)</code>.</li>
+    <li><strong><code>Sort</code> (blocking):</strong> drains its child in <code>open()</code>,
+      sorts in memory with <strong>NULLs LAST in both ASC and DESC</strong>, then replays on
+      <code>next()</code>.</li>
+    <li><strong><code>Limit</code> (streaming):</strong> stops pulling from its child after
+      <code>limit</code> rows (<code>LIMIT 0</code> pulls zero rows).</li>
+    <li><strong><code>Insert</code> / <code>Update</code> / <code>Delete</code> (DML):</strong>
+      perform their <code>HeapFile</code> writes (with a materialization guard for
+      <code>Update</code> and <code>Delete</code>) and emit one 1-column row
+      <code>[Value::Integer(affected)]</code>, then <code>Ok(None)</code>.</li>
   </ul>
 
+  <h3><code>QueryResult</code> shapes &amp; PostgreSQL <code>CommandComplete</code> tags</h3>
+  <p>Two consumers rely on exact <code>QueryResult</code> fields: <code>slt_harness.rs</code> checks
+  <code>result.schema.columns.is_empty()</code> to distinguish <code>statement ok</code> from
+  <code>query</code> results,<sup class="cite"><a href="#ref-3">3</a></sup> and Milestone&nbsp;10's
+  PostgreSQL wire server forwards <code>QueryResult::tag</code> verbatim in its
+  <code>CommandComplete</code> (<code>'C'</code>) message.<sup class="cite"><a href="#ref-7">7</a></sup>
+  Populate every statement according to this table:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Statement</th>
+          <th><code>schema</code></th>
+          <th><code>rows</code></th>
+          <th><code>affected</code></th>
+          <th><code>tag</code> (PostgreSQL format)<sup class="cite"><a href="#ref-7">7</a></sup></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>SELECT …</code></td>
+          <td><code>exec.schema().clone()</code></td>
+          <td>Collected <code>row.values</code></td>
+          <td><code>0</code></td>
+          <td><code>format!("SELECT {}", rows.len())</code> (e.g. <code>"SELECT 3"</code>)</td>
+        </tr>
+        <tr>
+          <td><code>INSERT …</code></td>
+          <td>Empty</td>
+          <td><code>vec![]</code></td>
+          <td><code>n</code></td>
+          <td><code>format!("INSERT 0 {n}")</code> (<code>0</code> = legacy OID slot)</td>
+        </tr>
+        <tr>
+          <td><code>UPDATE …</code></td>
+          <td>Empty</td>
+          <td><code>vec![]</code></td>
+          <td><code>n</code></td>
+          <td><code>format!("UPDATE {n}")</code> (e.g. <code>"UPDATE 1"</code>)</td>
+        </tr>
+        <tr>
+          <td><code>DELETE …</code></td>
+          <td>Empty</td>
+          <td><code>vec![]</code></td>
+          <td><code>n</code></td>
+          <td><code>format!("DELETE {n}")</code> (e.g. <code>"DELETE 2"</code>)</td>
+        </tr>
+        <tr>
+          <td><code>CREATE TABLE</code></td>
+          <td>Empty</td>
+          <td><code>vec![]</code></td>
+          <td><code>0</code></td>
+          <td><code>"CREATE TABLE"</code></td>
+        </tr>
+        <tr>
+          <td><code>DROP TABLE</code></td>
+          <td>Empty</td>
+          <td><code>vec![]</code></td>
+          <td><code>0</code></td>
+          <td><code>"DROP TABLE"</code></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="sec-plumbing">Statement dispatch, RecordId flow, and the Halloween guard</h2>
+  <p>Four structural invariants tie <code>execute()</code>, <code>Planner</code>, and
+  <code>HeapFile</code> together cleanly.</p>
+
+  <h3>1. Direct DDL / TCL dispatch in <code>execute()</code></h3>
+  <p><code>LogicalPlan</code> has <strong>no</strong> <code>CreateTable</code> or
+  <code>DropTable</code> variant. Following PostgreSQL's split between utility commands and
+  plannable queries (and toyDB's dispatcher),<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-4">4</a></sup>
+  <code>execute(sql, ctx)</code> intercepts DDL directly against <code>ctx.catalog</code> before
+  <code>Planner::plan</code>, while plannable statements flow through the full Volcano pipeline:</p>
+  <pre><code>execute(sql, ctx):
+    for stmt in Parser::parse(sql)?:               // empty / ";" → Ok(vec![])
+        bound ← Binder::new(&amp;ctx.catalog).bind(stmt)?
+        match bound:
+            CreateTable { name, schema, .. } →
+                ctx.catalog.create_table(&amp;name, schema)?
+                push QueryResult { tag: "CREATE TABLE", ..default }
+            DropTable { name } →
+                ctx.catalog.drop_table(&amp;name)?
+                push QueryResult { tag: "DROP TABLE", ..default }
+            Select | Insert | Update | Delete →
+                plan ← planner.optimize(planner.plan(bound)?)?   // identity in MS4
+                exec ← planner.create_executor(&amp;plan)?
+                push drive_executor(exec, stmt_kind)?            // open → next* → close
+            CreateIndex | Analyze | Explain | Begin | Commit | Rollback | Vacuum →
+                return Err(Error::Execution("not implemented until a later milestone"))</code></pre>
+  <p>Inside <code>drive_executor</code>, always run <code>open()</code>, drain <code>next()</code>
+  to <code>None</code>, and call <code>close()</code>.<sup class="cite"><a href="#ref-1">1</a></sup>
+  For <code>SELECT</code>, collect <code>row.values</code> with <code>exec.schema().clone()</code>.
+  For DML (<code>Insert</code>, <code>Update</code>, <code>Delete</code>), extract the single
+  <code>[Value::Integer(n)]</code> row emitted by the operator into
+  <code>QueryResult::affected</code> and return an empty <code>schema</code> and empty
+  <code>rows</code>.</p>
+
+  <h3>2. Why <code>Projection</code> sits above <code>Sort</code> and <code>Limit</code></h3>
+  <p>Look at <code>SELECT id FROM users ORDER BY age DESC</code> in the provided suite:
+  <code>age</code> is <strong>not</strong> in the projection list, yet <code>ORDER BY</code> sorts
+  on <code>BoundExpr::Column { table: 0, column: 2 }</code>. If <code>Projection</code> ran below
+  <code>Sort</code>, each row would shrink to <code>[id]</code> and <code>Sort</code> would panic
+  indexing column&nbsp;2. Build every <code>SELECT</code> bottom-up in the order documented in
+  <code>crates/exec/src/lib.rs</code>:
+  <code>Scan (or 1-row empty Values if FROM is empty) → Filter? → Sort? → Limit? → Projection</code>.
+  <code>Sort</code> then sees all base-table columns, and <code>Projection</code> evaluates
+  expressions only on the rows that survive <code>Limit</code>. For table-less queries like
+  <code>SELECT 1 + 2 * 3</code>, plant
+  <code>LogicalPlan::Values { rows: vec![vec![]], schema: Schema::default() }</code> under
+  <code>Projection</code> so <code>Projection</code> pulls one dummy row, evaluates its constants,
+  and stops.</p>
+
+  <figure>
+    <svg viewBox="0 0 940 520" role="img">
+      <title>Volcano pull-pipeline execution tree for SELECT name FROM users WHERE age &gt;= 30 ORDER BY age DESC LIMIT 2, showing open()/next() calls flowing downward, ExecRow { values, rid } flowing upward, blocking Sort buffering in open(), Limit stopping early, and Projection running outermost.</title>
+      <defs>
+        <marker id="ms4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <!-- Top SQL Banner -->
+      <rect x="20" y="12" width="900" height="38" rx="6" class="d-box"/>
+      <text x="470" y="35" text-anchor="middle" class="d-mono" font-weight="600">SELECT name FROM users WHERE age &gt;= 30 ORDER BY age DESC LIMIT 2</text>
+
+      <!-- Operator stack (x=140..410, center=275) -->
+      <rect x="140" y="62" width="270" height="34" rx="6" class="d-box"/>
+      <text x="275" y="83" text-anchor="middle" class="d-mono" font-weight="600">execute() / REPL</text>
+
+      <path d="M 215 96 V 126" class="d-line-hl" marker-end="url(#ms4-arr)"/>
+      <text x="207" y="115" text-anchor="end" class="d-mono-sm">open() / next()</text>
+      <path d="M 335 128 V 98" class="d-line" marker-end="url(#ms4-arr)"/>
+      <text x="343" y="115" text-anchor="start" class="d-mono-sm">["dan"], ["ada"] (rid: None)</text>
+
+      <rect x="140" y="128" width="270" height="48" rx="6" class="d-box-hl"/>
+      <text x="275" y="147" text-anchor="middle" class="d-mono" font-weight="600">Projection  (streaming)</text>
+      <text x="275" y="165" text-anchor="middle" class="d-mono-sm">exprs: [Col(0,1) → name] · rid: None</text>
+
+      <path d="M 215 176 V 206" class="d-line-hl" marker-end="url(#ms4-arr)"/>
+      <text x="207" y="195" text-anchor="end" class="d-mono-sm">next() × 3</text>
+      <path d="M 335 208 V 178" class="d-line" marker-end="url(#ms4-arr)"/>
+      <text x="343" y="195" text-anchor="start" class="d-mono-sm">2 rows, then None</text>
+
+      <rect x="140" y="208" width="270" height="48" rx="6" class="d-box-good"/>
+      <text x="275" y="227" text-anchor="middle" class="d-mono" font-weight="600">Limit (limit = 2)  (streaming)</text>
+      <text x="275" y="245" text-anchor="middle" class="d-text-sm">stops pulling after 2 rows (skips fay)</text>
+
+      <path d="M 215 256 V 286" class="d-line-hl" marker-end="url(#ms4-arr)"/>
+      <text x="207" y="275" text-anchor="end" class="d-mono-sm">next() × 2</text>
+      <path d="M 335 288 V 258" class="d-line" marker-end="url(#ms4-arr)"/>
+      <text x="343" y="275" text-anchor="start" class="d-mono-sm">(4,'dan',41), (1,'ada',36)</text>
+
+      <rect x="140" y="288" width="270" height="56" rx="6" class="d-box-warn"/>
+      <text x="275" y="306" text-anchor="middle" class="d-mono" font-weight="600">Sort (age DESC)  (BLOCKING)</text>
+      <text x="275" y="322" text-anchor="middle" class="d-text-sm">open(): drains ALL child rows &amp; sorts</text>
+      <text x="275" y="336" text-anchor="middle" class="d-mono-sm">NULLs LAST · buf: [41, 36, 33]</text>
+
+      <path d="M 215 344 V 374" class="d-line-hl" marker-end="url(#ms4-arr)"/>
+      <text x="207" y="363" text-anchor="end" class="d-mono-sm">open() drains all</text>
+      <path d="M 335 376 V 346" class="d-line" marker-end="url(#ms4-arr)"/>
+      <text x="343" y="363" text-anchor="start" class="d-mono-sm">ExecRow { vals, rid: Some }</text>
+
+      <rect x="140" y="376" width="270" height="48" rx="6" class="d-box-hl"/>
+      <text x="275" y="395" text-anchor="middle" class="d-mono" font-weight="600">Filter (age &gt;= 30)  (streaming)</text>
+      <text x="275" y="413" text-anchor="middle" class="d-text-sm">passes TRUE only; forwards row.rid</text>
+
+      <path d="M 215 424 V 454" class="d-line-hl" marker-end="url(#ms4-arr)"/>
+      <text x="207" y="443" text-anchor="end" class="d-mono-sm">next() × 6</text>
+      <path d="M 335 456 V 426" class="d-line" marker-end="url(#ms4-arr)"/>
+      <text x="343" y="443" text-anchor="start" class="d-mono-sm">ExecRow::with_rid(v, rid)</text>
+
+      <rect x="140" y="456" width="270" height="50" rx="6" class="d-box"/>
+      <text x="275" y="475" text-anchor="middle" class="d-mono" font-weight="600">SeqScan (users)  (streaming)</text>
+      <text x="275" y="493" text-anchor="middle" class="d-mono-sm">HeapFile::scan() → 5 live tuples</text>
+
+      <!-- Right trace panel (x=555..920) -->
+      <rect x="555" y="62" width="365" height="444" rx="8" class="d-box"/>
+      <text x="737" y="84" text-anchor="middle" class="d-text" font-weight="650">Row Trace on Table "users"</text>
+
+      <rect x="571" y="98" width="333" height="124" rx="6" class="d-box"/>
+      <text x="583" y="115" class="d-text-sm" font-weight="600">HeapFile scan order (page 3, slots 0..4):</text>
+      <text x="583" y="134" class="d-mono-sm">s0: (1, 'ada', 36)   → age&gt;=30 TRUE   ✓</text>
+      <text x="583" y="152" class="d-mono-sm">s1: (2, 'bob', 29)   → age&gt;=30 FALSE  ✗</text>
+      <text x="583" y="170" class="d-mono-sm">s2: (3, 'eve', NULL) → age&gt;=30 NULL   ✗</text>
+      <text x="583" y="188" class="d-mono-sm">s3: (4, 'dan', 41)   → age&gt;=30 TRUE   ✓</text>
+      <text x="583" y="206" class="d-mono-sm">s4: (5, 'fay', 33)   → age&gt;=30 TRUE   ✓</text>
+
+      <rect x="571" y="234" width="333" height="86" rx="6" class="d-box-warn"/>
+      <text x="583" y="252" class="d-text-sm" font-weight="600">Inside Sort::open() (blocking barrier):</text>
+      <text x="583" y="272" class="d-mono-sm">pulls all 5 heap rows via Filter</text>
+      <text x="583" y="290" class="d-mono-sm">buffers 3 passing rows → sorts DESC:</text>
+      <text x="583" y="308" class="d-mono-sm">[(4,'dan',41), (1,'ada',36), (5,'fay',33)]</text>
+
+      <rect x="571" y="332" width="333" height="82" rx="6" class="d-box-good"/>
+      <text x="583" y="350" class="d-text-sm" font-weight="600">Why Projection sits ABOVE Sort &amp; Limit:</text>
+      <text x="583" y="369" class="d-text-sm">ORDER BY age reads Col(0,2) before Projection</text>
+      <text x="583" y="387" class="d-text-sm">strips rows to [name]; Limit(2) skips fay(33),</text>
+      <text x="583" y="404" class="d-text-sm">so Projection evaluates only 2 output rows.</text>
+
+      <rect x="571" y="426" width="333" height="66" rx="6" class="d-box-hl"/>
+      <text x="583" y="444" class="d-text-sm" font-weight="600">QueryResult returned by execute():</text>
+      <text x="583" y="463" class="d-mono-sm">rows: [["dan"], ["ada"]]   affected: 0</text>
+      <text x="583" y="481" class="d-mono-sm">schema: [name: Text]       tag: "SELECT 2"</text>
+    </svg>
+    <figcaption>Figure 2 — Volcano pull-pipeline execution tree for
+    <code>SELECT name FROM users WHERE age &gt;= 30 ORDER BY age DESC LIMIT 2</code>. Control calls
+    flow downward on the left; <code>ExecRow { values, rid }</code> rows flow upward on the right.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-2">2</a></sup></figcaption>
+  </figure>
+
+  <h3>3. Composable <code>RecordId</code> flow &amp; the Halloween guard on <code>HeapFile</code></h3>
+  <p>Modeled on BusTub's <code>(Tuple, RID)</code> iterator output,<sup class="cite"><a href="#ref-2">2</a></sup>
+  <code>ExecRow</code> attaches <code>rid: Option&lt;RecordId&gt;</code> alongside SQL values.
+  <code>SeqScan</code> emits <code>ExecRow::with_rid(values, rid)</code>, <code>Filter</code>
+  forwards <code>row.rid</code> untouched, and <code>Update</code> / <code>Delete</code> pull
+  victims from <em>any</em> child <code>Box&lt;dyn Executor&gt;</code> (<code>SeqScan</code> or
+  <code>Filter(SeqScan)</code> today; <code>IndexScan</code> transparently in Milestone&nbsp;5)
+  without smuggling physical addresses into SQL columns.</p>
+
+  <p>That clean composition exposes a classic hazard immediately — even before B+Tree indexes exist.
+  Because <code>HeapFile</code> has no in-place update (variable-length <code>TEXT</code> can grow,
+  and Milestone&nbsp;8 MVCC needs old tuple versions preserved), <code>Update</code> executes
+  <strong>out of place</strong>: <code>heap.delete(old_rid)</code> followed by
+  <code>heap.insert(TupleMeta::default(), &amp;new_bytes)</code>. Because <code>insert</code>
+  appends into a higher slot (or new tail page) <em>ahead</em> of a live <code>HeapScan</code>
+  cursor, a streaming <code>Update</code> re-encounters its own writes — the <strong>Halloween
+  problem</strong>.<sup class="cite"><a href="#ref-2">2</a></sup> On
+  <code>UPDATE n SET x = x + 1 WHERE x &lt; 100</code> over <code>95..105</code>
+  (<code>ms4_halloween_guard</code>), streaming bumps <code>95</code> five times up to
+  <code>100</code> (15 total updates instead of 5). The fix: inside <code>Update::open()</code>
+  (and <code>Delete::open()</code>), drain all matching <code>(RecordId, new_values)</code> victims
+  from the child first, call <code>child.close()?</code>, and only then mutate
+  <code>HeapFile</code>.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+
+  <figure>
+    <svg viewBox="0 0 940 436" role="img">
+      <title>Comparison of naive streaming UPDATE versus a Halloween-guarded UPDATE on HeapFile for UPDATE n SET x = x + 1 WHERE x &lt; 100: naive streaming appends updated tuples ahead of the scan cursor (affected=15), whereas materializing all (RecordId, new_values) victims in open() before mutating updates each qualifying row once (affected=5).</title>
+      <defs>
+        <marker id="ms4-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <rect x="20" y="12" width="900" height="36" rx="6" class="d-box"/>
+      <text x="470" y="34" text-anchor="middle" class="d-mono" font-weight="600">UPDATE n SET x = x + 1 WHERE x &lt; 100   (initial rows: x = 95, 96, 97, 98, 99, 100..104)</text>
+
+      <!-- LEFT PANEL: Naive Streaming UPDATE (BAD) -->
+      <rect x="20" y="62" width="440" height="360" rx="8" class="d-box"/>
+      <rect x="34" y="74" width="412" height="30" rx="5" class="d-box-bad"/>
+      <text x="240" y="94" text-anchor="middle" class="d-text" font-weight="650">Naive Streaming UPDATE (Halloween Bug)</text>
+
+      <text x="38" y="124" class="d-text-sm" font-weight="600">1. Cursor reads s0 (x = 95 &lt; 100), deletes s0, appends 96:</text>
+
+      <rect x="38" y="134" width="64" height="38" rx="4" class="d-box-bad"/>
+      <text x="70" y="150" text-anchor="middle" class="d-mono-sm" font-weight="600">s0: †</text>
+      <text x="70" y="165" text-anchor="middle" class="d-mono-sm">del 95</text>
+
+      <rect x="106" y="134" width="64" height="38" rx="4" class="d-box"/>
+      <text x="138" y="150" text-anchor="middle" class="d-mono-sm" font-weight="600">s1: 96</text>
+      <text x="138" y="165" text-anchor="middle" class="d-text-sm">next</text>
+
+      <rect x="174" y="134" width="64" height="38" rx="4" class="d-box"/>
+      <text x="206" y="150" text-anchor="middle" class="d-mono-sm" font-weight="600">s2: 97</text>
+      <text x="206" y="165" text-anchor="middle" class="d-text-sm">live</text>
+
+      <rect x="242" y="134" width="64" height="38" rx="4" class="d-box"/>
+      <text x="274" y="150" text-anchor="middle" class="d-mono-sm" font-weight="600">s3: 98</text>
+      <text x="274" y="165" text-anchor="middle" class="d-text-sm">live</text>
+
+      <rect x="310" y="134" width="64" height="38" rx="4" class="d-box"/>
+      <text x="342" y="150" text-anchor="middle" class="d-mono-sm" font-weight="600">s4..s9</text>
+      <text x="342" y="165" text-anchor="middle" class="d-mono-sm">99..104</text>
+
+      <rect x="378" y="134" width="64" height="38" rx="4" class="d-box-warn"/>
+      <text x="410" y="150" text-anchor="middle" class="d-mono-sm" font-weight="600">s10: 96</text>
+      <text x="410" y="165" text-anchor="middle" class="d-text-sm">NEW!</text>
+
+      <path d="M 70 172 V 192 H 410 V 174" class="d-line-hl" marker-end="url(#ms4-arr2)"/>
+      <text x="240" y="207" text-anchor="middle" class="d-text-sm">delete(s0) + insert(96) lands AHEAD of scan cursor</text>
+
+      <text x="38" y="232" class="d-text-sm" font-weight="600">2. Scan cursor reaches s10 (96 &lt; 100) and updates it AGAIN:</text>
+
+      <rect x="38" y="242" width="64" height="38" rx="4" class="d-box-bad"/>
+      <text x="70" y="258" text-anchor="middle" class="d-mono-sm" font-weight="600">s0..s4</text>
+      <text x="70" y="273" text-anchor="middle" class="d-mono-sm">5 dead</text>
+
+      <rect x="106" y="242" width="64" height="38" rx="4" class="d-box"/>
+      <text x="138" y="258" text-anchor="middle" class="d-mono-sm" font-weight="600">s5..s9</text>
+      <text x="138" y="273" text-anchor="middle" class="d-mono-sm">100..104</text>
+
+      <rect x="174" y="242" width="64" height="38" rx="4" class="d-box-bad"/>
+      <text x="206" y="258" text-anchor="middle" class="d-mono-sm" font-weight="600">s10: †</text>
+      <text x="206" y="273" text-anchor="middle" class="d-mono-sm">was 96!</text>
+
+      <rect x="242" y="242" width="64" height="38" rx="4" class="d-box-warn"/>
+      <text x="274" y="258" text-anchor="middle" class="d-mono-sm" font-weight="600">s11: 97</text>
+      <text x="274" y="273" text-anchor="middle" class="d-text-sm">re-read!</text>
+
+      <rect x="310" y="242" width="64" height="38" rx="4" class="d-box-warn"/>
+      <text x="342" y="258" text-anchor="middle" class="d-mono-sm" font-weight="600">s12..</text>
+      <text x="342" y="273" text-anchor="middle" class="d-mono-sm">→ 98,99</text>
+
+      <rect x="378" y="242" width="64" height="38" rx="4" class="d-box-bad"/>
+      <text x="410" y="258" text-anchor="middle" class="d-mono-sm" font-weight="600">loop!</text>
+      <text x="410" y="273" text-anchor="middle" class="d-mono-sm">hits 100</text>
+
+      <text x="240" y="298" text-anchor="middle" class="d-mono-sm">▲ cursor walks right into newly inserted slots s10, s11…</text>
+
+      <rect x="34" y="316" width="412" height="92" rx="6" class="d-box-bad"/>
+      <text x="46" y="336" class="d-text" font-weight="650">Corrupted outcome (rows bumped 1..5×):</text>
+      <text x="46" y="357" class="d-mono-sm">95→96→97→98→99→100  (5 updates instead of 1!)</text>
+      <text x="46" y="375" class="d-mono-sm">affected = 15   (expected 5)</text>
+      <text x="46" y="393" class="d-mono-sm">rows: [100,100,100,100,100,100,101..104]</text>
+
+      <!-- RIGHT PANEL: Materialized Victim List in open() (GOOD) -->
+      <rect x="480" y="62" width="440" height="360" rx="8" class="d-box"/>
+      <rect x="494" y="74" width="412" height="30" rx="5" class="d-box-good"/>
+      <text x="700" y="94" text-anchor="middle" class="d-text" font-weight="650">Halloween Guard: Materialize in open()</text>
+
+      <rect x="494" y="114" width="412" height="80" rx="6" class="d-box-hl"/>
+      <text x="506" y="132" class="d-text-sm" font-weight="650">Phase 1 — Drain child read-only, then close():</text>
+      <text x="506" y="150" class="d-mono-sm">victims: Vec&lt;(RecordId, Vec&lt;Value&gt;)&gt; = [</text>
+      <text x="506" y="167" class="d-mono-sm">  (s0,[96]), (s1,[97]), (s2,[98]), (s3,[99]), (s4,[100])</text>
+      <text x="506" y="184" class="d-mono-sm">];  child.close()?;   // heap scan is finished</text>
+
+      <path d="M 700 194 V 214" class="d-line-hl" marker-end="url(#ms4-arr2)"/>
+      <text x="710" y="208" class="d-text-sm">zero writes during scan</text>
+
+      <rect x="494" y="216" width="412" height="78" rx="6" class="d-box-good"/>
+      <text x="506" y="234" class="d-text-sm" font-weight="650">Phase 2 — Apply buffered writes to HeapFile:</text>
+      <text x="506" y="253" class="d-mono-sm">for (old_rid, new_vals) in victims:</text>
+      <text x="506" y="270" class="d-mono-sm">  heap.delete(old_rid)?;  heap.insert(meta, bytes)?;</text>
+      <text x="506" y="286" class="d-mono-sm">// newly inserted slots s10..s14 are never scanned</text>
+
+      <path d="M 700 294 V 314" class="d-line-hl" marker-end="url(#ms4-arr2)"/>
+      <text x="710" y="308" class="d-text-sm">next() yields [Integer(5)] once</text>
+
+      <rect x="494" y="316" width="412" height="92" rx="6" class="d-box-good"/>
+      <text x="506" y="336" class="d-text" font-weight="650">Exact outcome (ms4_halloween_guard passes):</text>
+      <text x="506" y="357" class="d-mono-sm">Each qualifying row processed once (s0..s4)</text>
+      <text x="506" y="375" class="d-mono-sm">affected = 5   tag = "UPDATE 5"</text>
+      <text x="506" y="393" class="d-mono-sm">rows: [96, 97, 98, 99, 100, 100, 101..104]</text>
+    </svg>
+    <figcaption>Figure 3 — The Halloween problem on <code>HeapFile</code>. Streaming out-of-place
+    updates append ahead of the live scan cursor (left); buffering <code>(RecordId, new_values)</code>
+    victims in <code>open()</code> and closing the scan before writing defuses the hazard for both
+    heap and Milestone&nbsp;5 index scans (right).<sup class="cite"><a href="#ref-2">2</a></sup></figcaption>
+  </figure>
+
+  <h2 id="sec-eval">Expression evaluation, three-valued logic, and NULL ordering</h2>
+  <p>Your evaluator — <code>eval_expr(expr: &amp;BoundExpr, row: &amp;[Value]) -&gt; Result&lt;Value&gt;</code>
+  — resolves <code>BoundExpr::Column { table, column, .. }</code> (in single-table MS4,
+  <code>table == 0</code> and <code>row[column]</code> is direct; resolving via a small
+  <code>table_idx → offset</code> helper in <code>create_executor</code> pays off in MS6 joins) and
+  <code>BoundExpr::InputRef { index, .. }</code> (<code>row[index]</code>).</p>
+
+  <h3>1. Three-Valued Logic (3VL) truth table</h3>
+  <p>In SQL, <code>NULL</code> means “unknown”, not <code>false</code>.<sup class="cite"><a href="#ref-5">5</a></sup>
+  Keep <code>Value::Null</code> intact through every expression and convert to pass/drop
+  <strong>only inside <code>Filter</code></strong> (<code>matches!(val, Value::Boolean(true))</code>):</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th><code>A</code></th><th><code>B</code></th><th><code>A AND B</code></th>
+          <th><code>A OR B</code></th><th><code>NOT A</code></th>
+          <th><code>A IS NULL</code></th><th><code>A IS NOT NULL</code></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>TRUE</code></td><td><code>TRUE</code></td><td><code>TRUE</code></td><td><code>TRUE</code></td><td><code>FALSE</code></td><td><code>FALSE</code></td><td><code>TRUE</code></td></tr>
+        <tr><td><code>TRUE</code></td><td><code>FALSE</code></td><td><code>FALSE</code></td><td><code>TRUE</code></td><td><code>FALSE</code></td><td><code>FALSE</code></td><td><code>TRUE</code></td></tr>
+        <tr><td><code>TRUE</code></td><td><code>NULL</code></td><td><code>NULL</code></td><td><strong><code>TRUE</code></strong></td><td><code>FALSE</code></td><td><code>FALSE</code></td><td><code>TRUE</code></td></tr>
+        <tr><td><code>FALSE</code></td><td><code>TRUE</code></td><td><code>FALSE</code></td><td><code>TRUE</code></td><td><code>TRUE</code></td><td><code>FALSE</code></td><td><code>TRUE</code></td></tr>
+        <tr><td><code>FALSE</code></td><td><code>FALSE</code></td><td><code>FALSE</code></td><td><code>FALSE</code></td><td><code>TRUE</code></td><td><code>FALSE</code></td><td><code>TRUE</code></td></tr>
+        <tr><td><code>FALSE</code></td><td><code>NULL</code></td><td><strong><code>FALSE</code></strong></td><td><code>NULL</code></td><td><code>TRUE</code></td><td><code>FALSE</code></td><td><code>TRUE</code></td></tr>
+        <tr><td><code>NULL</code></td><td><code>TRUE</code></td><td><code>NULL</code></td><td><strong><code>TRUE</code></strong></td><td><strong><code>NULL</code></strong></td><td><code>TRUE</code></td><td><code>FALSE</code></td></tr>
+        <tr><td><code>NULL</code></td><td><code>FALSE</code></td><td><strong><code>FALSE</code></strong></td><td><code>NULL</code></td><td><strong><code>NULL</code></strong></td><td><code>TRUE</code></td><td><code>FALSE</code></td></tr>
+        <tr><td><code>NULL</code></td><td><code>NULL</code></td><td><code>NULL</code></td><td><code>NULL</code></td><td><strong><code>NULL</code></strong></td><td><code>TRUE</code></td><td><code>FALSE</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p>Notice the decisive short-circuit rows: <code>FALSE AND NULL = FALSE</code>,
+  <code>TRUE OR NULL = TRUE</code>, and <code>NOT NULL = NULL</code>.<sup class="cite"><a href="#ref-5">5</a></sup>
+  Only <code>IS [NOT] NULL</code> returns a definite boolean on a <code>NULL</code> operand.</p>
+
+  <h3>2. Comparisons, arithmetic, widening, and <code>CAST</code></h3>
+  <ul>
+    <li><strong>Comparisons:</strong> always use <code>lhs.sql_cmp(&amp;rhs)</code> from
+      <code>ferricdb-common</code> — never Rust's derived <code>==</code> (where
+      <code>Value::Null == Value::Null</code> is <code>true</code>!). Map <code>None</code> to
+      <code>Value::Null</code> and <code>Some(ord)</code> to <code>Value::Boolean</code>.</li>
+    <li><strong>Arithmetic &amp; division by zero:</strong> any <code>Value::Null</code> operand
+      yields <code>Value::Null</code> (including <code>1 / NULL</code>). Dividing or taking
+      remainder by zero (<code>0</code> or <code>0.0</code>) — or overflowing
+      <code>i64::MIN / -1</code> — returns <code>Err(Error::Execution(...))</code>, never a panic.</li>
+    <li><strong>Implicit <code>Integer → Float</code> widening:</strong> widen mixed
+      <code>(Integer, Float)</code> arithmetic operands to <code>f64</code>, and in
+      <code>Insert</code> / <code>Update</code> coerce <code>Value::Integer(i)</code> to
+      <code>Value::Float(i as f64)</code> whenever the target column's type is
+      <code>DataType::Float</code>.</li>
+    <li><strong><code>CAST(expr AS type)</code> rules:</strong>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Input</th><th>Target</th><th>Result</th></tr>
+          </thead>
+          <tbody>
+            <tr><td><code>Null</code></td><td>Any</td><td><code>Value::Null</code></td></tr>
+            <tr><td>Matching scalar</td><td>Same type</td><td>Unchanged</td></tr>
+            <tr><td><code>Integer(i)</code></td><td><code>Float</code></td><td><code>Value::Float(i as f64)</code></td></tr>
+            <tr><td><code>Float(f)</code></td><td><code>Integer</code></td><td><code>Value::Integer(f as i64)</code> (error on NaN/Inf)</td></tr>
+            <tr><td><code>Int / Float / Bool</code></td><td><code>Text</code></td><td><code>Value::Text(v.to_string())</code></td></tr>
+            <tr><td><code>Text(s)</code></td><td><code>Int / Float</code></td><td><code>s.trim().parse()</code> or <code>Err(Error::Execution)</code></td></tr>
+            <tr><td><code>Text(s)</code></td><td><code>Boolean</code></td><td><code>"true"/"t"/"1"</code>, <code>"false"/"f"/"0"</code> (case-insensitive), else <code>Err(Error::Execution)</code></td></tr>
+            <tr><td>Unsupported pair</td><td>—</td><td><code>Err(Error::Execution(...))</code></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </li>
+  </ul>
+
+  <h3>3. <code>ORDER BY</code> and <code>NULL</code> ordering</h3>
+  <p>Whereas PostgreSQL defaults to <code>NULLS LAST</code> for <code>ASC</code> and
+  <code>NULLS FIRST</code> for <code>DESC</code>,<sup class="cite"><a href="#ref-6">6</a></sup>
+  <strong>FerricDB orders <code>NULL</code>s LAST in both <code>ASC</code> and
+  <code>DESC</code></strong> (matching <code>ms4_order_by_limit_and_null_ordering</code>,
+  <code>ms4_crud.slt</code>, and Milestone&nbsp;6's <code>ExternalSorter</code>). Handle
+  <code>NULL</code> <em>before</em> reversing for <code>desc</code>:</p>
+  <pre><code>cmp_sort_key(a, b, desc):
+    match (a, b):
+        (Null, Null) → Equal
+        (Null, _)    → Greater      // NULL always sorts LAST, even under DESC
+        (_, Null)    → Less
+        (x, y)       →
+            ord ← x.sql_cmp(y).unwrap_or(Equal)
+            if desc { ord.reverse() } else { ord }</code></pre>
+  <p>For multi-key <code>ORDER BY</code>, walk keys in order and return the first
+  non-<code>Equal</code> comparison. Pre-evaluate sort keys once per row inside
+  <code>Sort::open()</code> so expression errors propagate cleanly before sorting.</p>
+
   <h2 id="sec-guidance">Step-by-step guidance</h2>
+  <p>Build in layers and run <code>cargo test -p ferricdb-exec -- --include-ignored ms4_</code>
+  after each step to watch tests turn green one by one.</p>
+
   <ol>
-    <li><strong>Expression evaluator first.</strong>
-      <code>eval(expr: &amp;BoundExpr, row: &amp;[Value]) -&gt; Result&lt;Value&gt;</code> — a match over
-      the expression tree. The delicate part is NULL: any arithmetic or comparison with a NULL
-      operand yields NULL; <code>AND</code>/<code>OR</code> follow the three-valued truth tables
-      from M01 (<code>false AND NULL = false</code>, <code>true OR NULL = true</code> — the
-      short-circuit rows matter); <code>IS NULL</code> is the one expression that looks at NULL
-      and returns a real boolean. <code>common::Value::sql_cmp</code> already encodes comparison
-      semantics — use it, don't re-derive it.</li>
-    <li><strong>Values + Projection next.</strong> With those two and the evaluator,
-      <code>SELECT 1 + 2 * 3;</code> runs end to end through <code>execute()</code>. Get that
-      green before touching storage.</li>
-    <li><strong>SeqScan, then Filter, then Insert.</strong> Scan is a thin adapter over
-      <code>HeapFile::scan</code>; Insert is Values feeding serialized tuples into
-      <code>HeapFile::insert</code>. At this point the first sqllogictest statements pass.</li>
-    <li><strong>Update/Delete: materialize victims first.</strong> Collect the target
-      <code>RecordId</code>s from the child scan <em>completely</em>, close the scan, then
-      mutate. Interleaving scan and mutation is the <strong>Halloween problem</strong>: an
-      update that moves a tuple forward can meet its own output and update it again. The
-      provided test constructs exactly that trap (an UPDATE bumping values into the scan's
-      path); materialization defuses it.<sup class="cite"><a href="#ref-2">2</a></sup></li>
-    <li><strong>Sort and Limit.</strong> Sort teaches the blocking pattern (all work in
-      <code>open</code>); Limit teaches early termination. Together they finish the SELECT
-      clause set.</li>
-    <li><strong>Planner: two honest functions.</strong> <code>plan()</code> is a structural
-      mapping — SELECT becomes Scan→Filter→Sort→Limit→Projection (build the tree bottom-up;
-      Projection outermost so ORDER BY can reference unprojected columns for now).
-      <code>create_executor()</code> recursively converts nodes to boxed executors. Resist
-      cleverness here — optimization is Milestone 7's whole job.</li>
-    <li><strong>The result table.</strong> Wire <code>execute()</code> into the REPL's
-      <code>print_result</code>: column headers from <code>QueryResult::schema</code>,
-      width-aligned rows, <code>N rows</code> / <code>N affected</code> trailers. This is the
-      REPL payoff moment from Milestone 0.</li>
-    <li><strong>Run the sqllogictest suite last.</strong> The harness (provided in
-      <code>crates/ferricdb/tests/slt_harness.rs</code>) drives <code>execute()</code> with
-      <code>tests/slt/ms4_crud.slt</code> — CREATE/INSERT/SELECT/UPDATE/DELETE with WHERE,
-      ORDER BY, LIMIT, and NULL cases, in the standard sqllogictest format.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>Expression evaluator first (private <code>eval.rs</code>).</strong>
+      Implement <code>eval_expr</code> covering all <code>BoundExpr</code> variants, the 3VL truth
+      table, <code>Value::sql_cmp</code>, widening arithmetic with division-by-zero checks,
+      <code>IS [NOT] NULL</code>, and <code>CAST</code>.</li>
+
+    <li><strong><code>Values</code>, <code>Projection</code>, and <code>execute()</code> DDL
+      dispatch.</strong>
+      Wire <code>parse → bind → DDL/plan → optimize (Ok(plan)) → create_executor → open/next/close</code>.
+      For empty <code>FROM</code>, plant a 1-row empty <code>Values</code> under
+      <code>Projection</code>. <code>ms4_values_projection_expression_eval</code> passes immediately.</li>
+
+    <li><strong><code>SeqScan</code>, <code>Filter</code>, and <code>Insert</code>.</strong>
+      <code>SeqScan</code> attaches <code>ExecRow::with_rid(values, rid)</code> from
+      <code>HeapFile::scan()</code>; <code>Filter</code> keeps <code>row.rid</code> intact;
+      <code>Insert</code> widens <code>Integer → Float</code> where needed, serializes with
+      <code>tuple::serialize</code> (enforcing <code>NOT NULL</code>), writes with
+      <code>TupleMeta::default()</code>, and emits <code>[Value::Integer(affected)]</code> once.
+      <code>ms4_three_valued_logic_in_where</code> and <code>ms4_errors_are_errors</code> go green.</li>
+
+    <li><strong><code>Update</code> and <code>Delete</code> with the Halloween guard.</strong>
+      Lower both to <code>SeqScan → Filter? → Update/Delete</code>. Inside <code>open()</code>,
+      materialize all victims and close the child before writing:<sup class="cite"><a href="#ref-2">2</a></sup>
+      <pre><code>Update::open():
+    child.open()?
+    victims ← []
+    while let Some(row) = child.next()?:
+        rid ← row.rid.ok_or(Execution("missing RecordId"))?
+        new_vals ← row.values.clone()
+        for (col_idx, expr) in self.set:
+            val ← eval_expr(expr, &amp;row.values)?     // evaluate against ORIGINAL row
+            new_vals[col_idx] ← coerce_if_float(val, table.schema.column(col_idx))
+        victims.push((rid, new_vals))
+    child.close()?                                  // scan closed BEFORE any write
+
+    heap ← HeapFile::open(store, table.first_page)
+    for (rid, new_vals) in victims:
+        bytes ← tuple::serialize(&amp;table.schema, &amp;new_vals)?
+        heap.delete(rid)?
+        heap.insert(TupleMeta::default(), &amp;bytes)?
+    self.affected ← victims.len() as i64;  self.emitted ← false</code></pre>
+      Evaluate every <code>SET</code> expression against the original <code>&amp;row.values</code>
+      (not mutated <code>new_vals</code>). Mirror the same materialize-then-delete barrier in
+      <code>Delete::open()</code>. Both <code>ms4_crud_roundtrip_with_counts</code> and
+      <code>ms4_halloween_guard</code> now pass.</li>
+
+    <li><strong>Blocking <code>Sort</code> and streaming <code>Limit</code>.</strong>
+      Drain and sort in <code>Sort::open()</code> using <code>cmp_sort_key</code> (NULLs LAST in
+      both directions); short-circuit <code>Limit::next()</code> once
+      <code>emitted == limit</code>. Now <code>ms4_order_by_limit_and_null_ordering</code> passes —
+      all six <code>ferricdb-exec</code> tests are green.</li>
+
+    <li><strong>REPL transition (Milestone&nbsp;3 → Milestone&nbsp;4) in
+      <code>course/ferricdb/crates/ferricdb/src/repl.rs</code>.</strong>
+      Store an <code>ExecContext</code> on <code>Repl</code> (rebuilt on <code>.open &lt;path&gt;</code>
+      after calling <code>self.ctx.store.flush_all()?</code>). <strong>Replace</strong>
+      Milestone&nbsp;3's direct-<code>Catalog</code> DDL branch and placeholder SQL echo with a
+      single call to <code>ferricdb_exec::execute(&amp;sql, &amp;self.ctx)</code>. Print each
+      <code>QueryResult</code>: if <code>!res.schema.columns.is_empty()</code>, render an aligned
+      ASCII table (column widths from headers and cells, <code>Value::Null</code> printed as
+      <code>NULL</code>, dashed header rule, and <code>(N rows)</code> trailer); otherwise print
+      <code>res.tag</code> (<code>CREATE TABLE</code>, <code>INSERT 0 4</code>, <code>UPDATE 1</code>,
+      <code>DELETE 2</code>). Call <code>self.ctx.store.flush_all()?</code> after writes and on
+      exit so data persists across restarts, and keep all six meta-commands (<code>.help</code>,
+      <code>.exit</code>, <code>.tables</code>, <code>.schema</code>, <code>.ast</code>,
+      <code>.open</code>) intact for <code>tests/smoke.rs</code>.</li>
+
+    <li><strong>Run <code>ms4_slt_crud</code> end to end.</strong>
+      <code>crates/ferricdb/tests/slt_harness.rs</code> replays
+      <code>tests/slt/ms4_crud.slt</code> through <code>execute()</code> and prints exact diffs on
+      any mismatch.<sup class="cite"><a href="#ref-3">3</a></sup></li>
   </ol>
 
   <h2 id="sec-tests">Test plan</h2>
-  <pre><code>cargo test -p ferricdb-exec -- --include-ignored ms4_
+  <p>Keep the <code>#[ignore = "milestone 4"]</code> attributes intact and invoke tests with
+  <code>--include-ignored</code>:</p>
+  <pre><code># 1. Core Milestone 4 suite (all 6 ms4_ tests in ferricdb-exec)
+cargo test -p ferricdb-exec -- --include-ignored ms4_
 
-# end-to-end: the sqllogictest suite
-cargo test -p ferricdb -- --include-ignored slt_all
+# 2. End-to-end Milestone 4 sqllogictest suite (ms4_crud.slt)
+cargo test -p ferricdb -- --include-ignored ms4_slt_crud
 
-# regressions
-cargo test -p ferricdb-sql -p ferricdb-catalog -- --include-ignored ms3_</code></pre>
-  <p>The <code>ms4_</code> group builds a fresh <code>ExecContext</code> over a tempfile-backed
-  store and drives everything through <code>execute()</code>: CRUD round-trips, three-valued
-  WHERE semantics, ORDER BY + LIMIT interplay, affected counts, expression evaluation (including
-  CAST and IS NULL), and the Halloween guard. <code>slt_all</code> then replays
-  <code>ms4_crud.slt</code>; when a case fails, the harness prints the statement and both result
-  sets — read them, they are precise.</p>
+# 3. Smoke test + Milestone 1–3 regressions
+cargo test -p ferricdb --test smoke
+cargo test -p ferricdb-storage -- --include-ignored ms1_
+cargo test -p ferricdb-buffer  -- --include-ignored ms2_
+cargo test -p ferricdb-sql -p ferricdb-catalog -- --include-ignored ms3_
+cargo test -p ferricdb-exec -- --include-ignored ms3_</code></pre>
+
+  <div class="callout note">
+    <span class="callout-title">Run <code>ms4_slt_crud</code> — not <code>slt_all</code> — in Milestone 4</span>
+    <p><code>crates/ferricdb/tests/slt_harness.rs</code> defines <code>ms4_slt_crud</code>
+    (Milestone&nbsp;4), <code>ms6_slt_joins_agg_sort</code> (Milestone&nbsp;6), and
+    <code>slt_all</code> (Milestone&nbsp;6). Because <code>slt_all</code> replays every
+    <code>.slt</code> file in <code>tests/slt/</code> — including <code>ms6_joins_agg_sort.slt</code>
+    — it turns green in Milestone&nbsp;6, not Milestone&nbsp;4.</p>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Test name</th><th>Crate</th><th>What it verifies</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>ms4_values_projection_expression_eval</code></td>
+          <td><code>ferricdb-exec</code></td>
+          <td>Table-less <code>SELECT 1 + 2 * 3</code> and <code>SELECT CAST(1 AS FLOAT), 'a', true, NULL IS NULL, 7 % 3</code>.</td>
+        </tr>
+        <tr>
+          <td><code>ms4_crud_roundtrip_with_counts</code></td>
+          <td><code>ferricdb-exec</code></td>
+          <td><code>CREATE TABLE</code>, multi-row <code>INSERT</code>, <code>SELECT</code>, <code>UPDATE</code> (<code>affected == 1</code>), <code>DELETE</code> (<code>affected == 2</code>), surviving rows.</td>
+        </tr>
+        <tr>
+          <td><code>ms4_three_valued_logic_in_where</code></td>
+          <td><code>ferricdb-exec</code></td>
+          <td><code>age &gt; 30</code>, <code>NOT (age &gt; 30)</code>, <code>age IS NULL</code>, <code>age = NULL</code>, <code>false AND age = NULL</code>, <code>true OR age &gt; 999</code>.</td>
+        </tr>
+        <tr>
+          <td><code>ms4_order_by_limit_and_null_ordering</code></td>
+          <td><code>ferricdb-exec</code></td>
+          <td><code>SELECT id FROM users ORDER BY age DESC</code> (<code>[4,1,2,3]</code>), <code>ORDER BY age</code> (<code>[2,1,4,3]</code>), <code>ORDER BY id LIMIT 2</code> (<code>[1,2]</code>).</td>
+        </tr>
+        <tr>
+          <td><code>ms4_halloween_guard</code></td>
+          <td><code>ferricdb-exec</code></td>
+          <td><code>UPDATE n SET x = x + 1 WHERE x &lt; 100</code> on <code>95..105</code>: <code>affected == 5</code> and sorted result <code>[96,97,98,99,100,100,101..104]</code>.</td>
+        </tr>
+        <tr>
+          <td><code>ms4_errors_are_errors</code></td>
+          <td><code>ferricdb-exec</code></td>
+          <td>Unknown column, unknown table, <code>INSERT</code> arity mismatch, and type error (<code>name + 1</code>) return <code>Err(_)</code> cleanly.</td>
+        </tr>
+        <tr>
+          <td><code>ms4_slt_crud</code></td>
+          <td><code>ferricdb</code></td>
+          <td>Full replay of <code>tests/slt/ms4_crud.slt</code>: CRUD, <code>rowsort</code>, bare boolean <code>WHERE active ORDER BY id</code>, NULLs-last <code>DESC</code>, self-referential <code>UPDATE</code>, <code>= NULL</code>, <code>OR</code>, and binder errors.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
 
   <h2 id="sec-pitfalls">Common pitfalls</h2>
+
   <div class="callout pitfall">
-    <span class="callout-title">Treating NULL as false everywhere</span>
-    <p><em>Symptom:</em> <code>SELECT * FROM t WHERE NOT (x &gt; 5)</code> returns rows where
-    <code>x</code> is NULL. <em>Cause:</em> collapsing NULL to false <em>before</em> NOT instead
-    of after: <code>NOT NULL</code> is NULL, which the filter then drops. Keep NULL a first-class
-    value through the whole expression tree and convert to "row passes?" only at the filter
-    boundary.</p>
+    <span class="callout-title">Pitfall — collapsing <code>NULL</code> to <code>false</code> early (or using Rust <code>==</code>)</span>
+    <p><em>Symptom:</em> <code>WHERE NOT (age &gt; 30)</code> returns rows with <code>NULL</code>
+    age, or <code>WHERE age = NULL</code> matches them. <em>Fix:</em> use <code>Value::sql_cmp</code>
+    for every comparison, preserve <code>Value::Null</code> through the 3VL truth table, and coerce
+    to <code>bool</code> only at <code>Filter</code>.<sup class="cite"><a href="#ref-5">5</a></sup></p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">The Halloween problem</span>
-    <p><em>Symptom:</em> <code>UPDATE t SET x = x + 10 WHERE x &lt; 100</code> bumps some rows
-    twice (or loops). <em>Cause:</em> the update's writes land ahead of the scan cursor and are
-    re-visited. Named for the day IBM's System R team discovered it; the fix is the one in the
-    guidance — fully materialize the victim list before writing.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+    <span class="callout-title">Pitfall — putting <code>Projection</code> below <code>Sort</code></span>
+    <p><em>Symptom:</em> <code>SELECT id FROM users ORDER BY age DESC</code> panics with index out
+    of bounds. <em>Fix:</em> build <code>SELECT</code> bottom-up as
+    <code>Scan → Filter? → Sort? → Limit? → Projection</code> so <code>Sort</code> still sees
+    unprojected base-table columns.</p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Sort as a streaming operator</span>
-    <p><em>Symptom:</em> ORDER BY output is correct for one-page tables and interleaved for
-    larger ones. <em>Cause:</em> sorting each <code>next()</code> batch instead of draining the
-    child in <code>open()</code>. A sort cannot emit its first row before seeing its last input
-    row — blocking is the definition, not an implementation detail.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+    <span class="callout-title">Pitfall — streaming <code>Update</code> on <code>HeapFile</code> (Halloween bug)</span>
+    <p><em>Symptom:</em> <code>ms4_halloween_guard</code> reports <code>affected == 15</code> and
+    bumps <code>95..99</code> all the way to <code>100</code>. <em>Fix:</em> materialize all
+    <code>(RecordId, new_values)</code> victims in <code>Update::open()</code> and call
+    <code>child.close()?</code> before any <code>HeapFile</code> write.<sup class="cite"><a href="#ref-2">2</a></sup></p>
   </div>
+
   <div class="callout pitfall">
-    <span class="callout-title">Schema lies</span>
-    <p><em>Symptom:</em> downstream operators panic on column indexes. <em>Cause:</em> an
-    operator whose <code>schema()</code> doesn't match what <code>next()</code> actually emits
-    (classically: Projection reporting its input schema). Every test failure of the form
-    "index out of bounds" starts here.</p>
+    <span class="callout-title">Pitfall — non-empty <code>QueryResult::schema</code> on DML</span>
+    <p><em>Symptom:</em> <code>ms4_slt_crud</code> fails on <code>INSERT</code> / <code>UPDATE</code>
+    expecting <code>statement ok</code>. <em>Fix:</em> unpack the DML executor's single
+    <code>[Value::Integer(n)]</code> row into <code>QueryResult::affected</code> and return empty
+    <code>Schema::default()</code> and empty <code>rows</code>.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — reversing <code>NULL</code> ordering under <code>DESC</code></span>
+    <p><em>Symptom:</em> <code>ORDER BY age DESC</code> puts <code>NULL</code> first
+    (<code>[3,4,1,2]</code>). <em>Fix:</em> return <code>Greater</code> / <code>Less</code> for
+    <code>NULL</code> <em>before</em> applying <code>if desc { ord.reverse() }</code>.</p>
+  </div>
+
+  <div class="callout pitfall">
+    <span class="callout-title">Pitfall — schema lies, streaming sorts, or divide-by-zero panics</span>
+    <p><em>Symptom:</em> downstream index panics, interleaved multi-page <code>ORDER BY</code>
+    output, or a panic on <code>SELECT 1 / 0</code>. <em>Fix:</em> return <code>plan.schema</code>
+    from <code>Projection::schema()</code>, drain the entire child in <code>Sort::open()</code>,<sup class="cite"><a href="#ref-1">1</a></sup>
+    and return <code>Err(Error::Execution)</code> on zero divisors.</p>
   </div>
 
   <h2 id="sec-done">Definition of done</h2>
   <ul>
-    <li><code>ms4_</code> and <code>slt_all</code> pass; <code>ms1_</code>–<code>ms3_</code>
-      still pass.</li>
-    <li>A full REPL session works: create a table, insert three rows (one with NULLs), select
-      with WHERE/ORDER BY/LIMIT, update, delete, select again — with aligned result tables and
-      correct counts.</li>
-    <li>The Halloween UPDATE from the pitfall bumps every row exactly once.</li>
-    <li>You can explain why Limit over Sort still reads the whole table, but Limit over SeqScan
-      does not.</li>
+    <li>All six <code>ms4_</code> tests pass via
+      <code>cargo test -p ferricdb-exec -- --include-ignored ms4_</code>.</li>
+    <li><code>cargo test -p ferricdb -- --include-ignored ms4_slt_crud</code> passes cleanly.</li>
+    <li><code>smoke</code> and all <code>ms1_</code>–<code>ms3_</code> regression suites stay green.</li>
+    <li><code>Planner::optimize</code> returns <code>Ok(plan)</code>, and <code>execute()</code>
+      populates exact PostgreSQL <code>CommandComplete</code> tags in <code>QueryResult::tag</code>.</li>
+    <li>Your REPL runs <code>CREATE TABLE</code>, <code>INSERT</code> (with <code>NULL</code>s),
+      <code>SELECT</code> (<code>WHERE</code> / <code>ORDER BY</code> / <code>LIMIT</code>),
+      self-referential <code>UPDATE</code>, and <code>DELETE</code> with aligned ASCII tables,
+      accurate tags, and persistence across restart.</li>
   </ul>
 
   <h2 id="sec-quiz">Check your understanding</h2>
-  <fieldset class="quiz" data-explain="Sort must see every input row before it can emit the smallest — it is blocking by definition. Limit is streaming: it just stops pulling. Stacked as Limit(Sort(...)), the sort still consumes everything; the limit only trims the replay. That asymmetry is why 'top-N' gets its own specialized operator in real systems.">
-    <legend class="quiz-q">SELECT … ORDER BY x LIMIT 5 on a million-row table: how many rows does Sort consume?</legend>
-    <label><input type="radio" name="q1"> Five — Limit stops the pipeline early</label>
-    <label><input type="radio" name="q1" data-correct> All million — Sort is blocking; Limit only trims what Sort replays</label>
-    <label><input type="radio" name="q1"> One page worth — the buffer pool bounds it</label>
+
+  <fieldset class="quiz" data-explain="Sort is blocking: it cannot emit even the largest value until it has inspected every input row inside open(). Limit is streaming and only stops pulling from Sort after two rows — it cannot keep Sort from draining SeqScan. That is why real systems add a Top-N heap operator or use an ordered B+Tree scan (Milestone 5).">
+    <legend class="quiz-q">You run <code>SELECT name FROM users ORDER BY age DESC LIMIT 2</code>
+    on a 1,000,000-row table via <code>Projection ← Limit(2) ← Sort(age DESC) ← SeqScan</code>. How
+    many rows does <code>Sort</code> consume from <code>SeqScan</code>?</legend>
+    <label><input type="radio" name="ms4-q1"> 2 — <code>Limit(2)</code> stops the pipeline after two rows.</label>
+    <label><input type="radio" name="ms4-q1" data-correct> All 1,000,000 — <code>Sort</code> drains its child completely in <code>open()</code> before <code>Limit</code> pulls its first row.</label>
+    <label><input type="radio" name="ms4-q1"> 64 pages worth — <code>DEFAULT_MEMORY_PAGES</code> caps <code>SeqScan</code>.</label>
+    <label><input type="radio" name="ms4-q1"> 3 — two for the limit plus one to check for ties.</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
-  <fieldset class="quiz" data-explain="false AND NULL is false (the false side decides regardless of the unknown), while true AND NULL is NULL (the unknown side could still flip it). Getting these two rows of the truth table right is most of what the ms4_ NULL tests check.">
-    <legend class="quiz-q">What does false AND NULL evaluate to?</legend>
-    <label><input type="radio" name="q2" data-correct> false — the known false operand decides</label>
-    <label><input type="radio" name="q2"> NULL — any operation with NULL is NULL</label>
-    <label><input type="radio" name="q2"> An error — booleans cannot mix with NULL</label>
+
+  <fieldset class="quiz" data-explain="Under SQL three-valued logic: age &gt; 30 is NULL and NOT NULL stays NULL (dropped by Filter); age = NULL is NULL (dropped); FALSE AND NULL is FALSE (dropped); TRUE OR NULL short-circuits to TRUE because the known true decides the disjunction, so eve passes.">
+    <legend class="quiz-q">Row <code>eve</code> has <code>age = NULL</code>. Which
+    <code>WHERE</code> predicate lets <code>eve</code> pass through <code>Filter</code>?</legend>
+    <label><input type="radio" name="ms4-q2"> <code>WHERE NOT (age &gt; 30)</code></label>
+    <label><input type="radio" name="ms4-q2"> <code>WHERE age = NULL</code></label>
+    <label><input type="radio" name="ms4-q2"> <code>WHERE false AND (age = NULL)</code></label>
+    <label><input type="radio" name="ms4-q2" data-correct> <code>WHERE true OR (age &gt; 999)</code></label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="HeapFile updates tuples out of place (delete old RecordId, then insert new bytes). Because insert appends into a higher slot or tail page ahead of the open HeapScan cursor, streaming Update re-visits its own newly written rows (the Halloween problem). Materializing all (RecordId, new_values) victims in open() and closing the child scan before mutating prevents re-processing newly inserted tuples over both SeqScan and Milestone 5 IndexScan.">
+    <legend class="quiz-q">Why must <code>Update</code> materialize all matching
+    <code>(RecordId, new_values)</code> rows in <code>open()</code> and call
+    <code>child.close()</code> before mutating <code>HeapFile</code>?</legend>
+    <label><input type="radio" name="ms4-q3"> Rust's borrow checker forbids calling <code>HeapFile::insert</code> while a <code>HeapScan</code> exists.</label>
+    <label><input type="radio" name="ms4-q3" data-correct> Out-of-place <code>delete</code> + <code>insert</code> appends updated tuples ahead of the open scan cursor, causing the Halloween problem if reads and writes interleave.</label>
+    <label><input type="radio" name="ms4-q3"> <code>BufferPoolManager</code> cannot pin two heap pages simultaneously.</label>
+    <label><input type="radio" name="ms4-q3"> Only so <code>Update</code> can sort victims by <code>RecordId</code> before returning.</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
@@ -268,34 +928,45 @@ cargo test -p ferricdb-sql -p ferricdb-catalog -- --include-ignored ms3_</code><
     <h2 id="sec-sources">Primary sources</h2>
     <div class="refs">
       <ol>
-        <li id="ref-1">Hellerstein, Stonebraker, Hamilton, "Architecture of a Database System" —
-          the query processor chapter: the iterator model and operator composition.
+        <li id="ref-1">J.&nbsp;M.&nbsp;Hellerstein, M.&nbsp;Stonebraker, and J.&nbsp;Hamilton,
+          “Architecture of a Database System”, <em>Foundations and Trends in Databases</em> 1(2),
+          Chapter&nbsp;4 — Volcano iterators, operator composition, and blocking vs. streaming.
           <a href="https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf" rel="external">https://dsf.berkeley.edu/papers/fntdb07-architecture.pdf</a></li>
-        <li id="ref-2">CMU 15-445/645 (Fall 2025), Project #3: Query Execution — operator
-          semantics, blocking vs streaming, and update-path hazards.
+        <li id="ref-2">CMU 15-445/645 (Fall 2025), Project&nbsp;#3: Query Execution —
+          <code>(Tuple, RID)</code> iterator outputs, DML counts, and update-path hazards.
           <a href="https://15445.courses.cs.cmu.edu/fall2025/project3/" rel="external">https://15445.courses.cs.cmu.edu/fall2025/project3/</a></li>
-        <li id="ref-3">risinglightdb/sqllogictest-rs — the harness format and runner used by the
-          end-to-end suite.
+        <li id="ref-3"><code>risinglightdb/sqllogictest-rs</code> — the <code>.slt</code> format
+          and runner driving <code>ms4_slt_crud</code>.
           <a href="https://github.com/risinglightdb/sqllogictest-rs" rel="external">https://github.com/risinglightdb/sqllogictest-rs</a></li>
-        <li id="ref-4">erikgrinaker/toydb, architecture guide — a Rust iterator engine to
-          compare designs with.
+        <li id="ref-4">E.&nbsp;Grinaker, “toyDB Architecture Guide” — a Rust Volcano iterator
+          engine using a single plan-node tree.
           <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md</a></li>
+        <li id="ref-5">PostgreSQL Documentation, “Logical Operators” — SQL three-valued logic truth
+          tables for <code>AND</code>, <code>OR</code>, and <code>NOT</code>.
+          <a href="https://www.postgresql.org/docs/current/functions-logical.html" rel="external">https://www.postgresql.org/docs/current/functions-logical.html</a></li>
+        <li id="ref-6">PostgreSQL Documentation, “Sorting Rows” — <code>ORDER BY</code>
+          <code>NULLS FIRST</code> / <code>NULLS LAST</code> defaults contrasted with FerricDB.
+          <a href="https://www.postgresql.org/docs/current/queries-order.html" rel="external">https://www.postgresql.org/docs/current/queries-order.html</a></li>
+        <li id="ref-7">PostgreSQL Documentation, “Message Formats” — <code>CommandComplete</code>
+          tag formats (<code>SELECT N</code>, <code>INSERT 0 N</code>, <code>UPDATE N</code>,
+          <code>DELETE N</code>, <code>CREATE TABLE</code>, <code>DROP TABLE</code>).
+          <a href="https://www.postgresql.org/docs/current/protocol-message-formats.html" rel="external">https://www.postgresql.org/docs/current/protocol-message-formats.html</a></li>
       </ol>
     </div>
 
     <h2 id="sec-deeper">Go deeper</h2>
     <ul>
-      <li>The Internals of PostgreSQL, §3.4 — how Postgres's executor walks its plan trees; map
-        each of its node types onto yours.
+      <li>Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, Chapter&nbsp;3 (§3.4 Executor) —
+        how PostgreSQL walks plan trees over its buffer manager.
         <a href="https://www.interdb.jp/pg/pgsql03.html" rel="external">interdb.jp/pg/pgsql03.html</a></li>
-      <li>toyDB's SQL docs — which parts of SQL a comparable one-person engine chose to support,
-        and why. <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/sql.md" rel="external">github.com/erikgrinaker/toydb/docs/sql.md</a></li>
+      <li>E.&nbsp;Grinaker, toyDB “SQL Execution” — compare a single-author Rust Volcano engine.
+        <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/sql-execution.md" rel="external">github.com/erikgrinaker/toydb/docs/architecture/sql-execution.md</a></li>
+      <li>E.&nbsp;Grinaker, toyDB “SQL Reference” — types, casts, and expression semantics.
+        <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/sql.md" rel="external">github.com/erikgrinaker/toydb/docs/sql.md</a></li>
+      <li>SQLite Documentation, “NULL Handling in SQLite” — three-valued logic edge cases across
+        SQL engines.
+        <a href="https://sqlite.org/nulls.html" rel="external">sqlite.org/nulls.html</a></li>
     </ul>
-
-    <h2 id="sec-milestone">Milestone link</h2>
-    <p>Next on the path: <a href="../../modules/m04-data-structures-indexes/index.html">M04 ·
-    B+Trees (and Friends)</a>, then <a href="../milestone-05/index.html">Milestone 5</a> — your
-    scans learn to skip.</p>
 
     <nav class="prevnext">
       <a href="../../modules/m06-query-execution/index.html"><span class="dir">← Previous</span> M06 · Query Execution</a>
@@ -307,6 +978,7 @@ cargo test -p ferricdb-sql -p ferricdb-catalog -- --include-ignored ms3_</code><
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   Course.renderArchitecture(document.getElementById("arch-diagram"), {
     done: ["heap", "disk", "buffer", "frontend", "catalog"],
     current: ["planner", "executor"],

@@ -16,11 +16,16 @@
 //! ```text
 //! SQL text ── Parser ──▶ ast::Statement
 //!          ── Binder ──▶ binder::BoundStatement      (names → (table_idx, col_idx))
-//!          ── Planner::plan ──▶ plan::LogicalPlan
+//!          ── Planner::plan ──▶ plan::LogicalPlan    (SELECT/INSERT/UPDATE/DELETE)
 //!          ── Planner::optimize ──▶ plan::LogicalPlan (rewritten, costed — MS7)
 //!          ── Planner::create_executor ──▶ Box<dyn Executor>  (Volcano iterators)
 //!          ── open()/next()/close() loop ──▶ QueryResult
 //! ```
+//!
+//! DDL, TCL, and utility statements (`CREATE TABLE`, `DROP TABLE`,
+//! `CREATE INDEX`, `BEGIN`, `COMMIT`, `ROLLBACK`, `ANALYZE`, `EXPLAIN`,
+//! `VACUUM`) are dispatched directly by [`execute`] without going through
+//! [`Planner::plan`].
 //!
 //! [`execute`] is the one-stop entry point used by the REPL, the provided
 //! tests, and the server crate.
@@ -36,9 +41,36 @@ pub mod sort;
 use std::sync::{Arc, Mutex};
 
 use ferricdb_catalog::Catalog;
-use ferricdb_common::{Lsn, RecordId, Result, Schema, TupleMeta, TxnId, Value};
+use ferricdb_common::{Lsn, PageId, RecordId, Result, Schema, TupleMeta, TxnId, Value};
 use ferricdb_storage::PageStore;
 use ferricdb_txn::{Transaction, TransactionManager};
+
+/// One row flowing between Volcano operators (modeled on BusTub's
+/// `(Tuple, RID)` iterator output).
+///
+/// Base scans (`SeqScan`, `IndexScan`) attach `rid: Some(rid)`, and `Filter`
+/// forwards it unchanged so `Update` and `Delete` can compose over any
+/// child `Box<dyn Executor>` without smuggling `RecordId`s inside `Value`s.
+/// Operators that synthesize rows (`Projection`, `Join`, `Aggregate`,
+/// `Values`) set `rid: None`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExecRow {
+    pub values: Vec<Value>,
+    pub rid: Option<RecordId>,
+}
+
+impl ExecRow {
+    pub fn new(values: Vec<Value>) -> Self {
+        ExecRow { values, rid: None }
+    }
+
+    pub fn with_rid(values: Vec<Value>, rid: RecordId) -> Self {
+        ExecRow {
+            values,
+            rid: Some(rid),
+        }
+    }
+}
 
 /// Volcano (iterator-model) executor contract. Every physical operator —
 /// scan, filter, projection, join, aggregate, sort, limit, and the DML
@@ -50,7 +82,10 @@ use ferricdb_txn::{Transaction, TransactionManager};
 ///    it acquires resources and opens the children.
 /// 2. [`Executor::next`] returns `Ok(Some(row))` for each output row and
 ///    `Ok(None)` at end of stream. After `Ok(None)` it keeps returning
-///    `Ok(None)`.
+///    `Ok(None)`. DML operators (`Insert`, `Update`, `Delete`) perform their
+///    writes and emit a single one-column row `[Value::Integer(affected)]`
+///    (then `Ok(None)`), which [`execute`] extracts into
+///    [`QueryResult::affected`].
 /// 3. [`Executor::close`] releases resources (also closes the children).
 ///
 /// Implemented in Milestone 4 (basic operators), extended in Milestones
@@ -65,8 +100,9 @@ pub trait Executor {
     /// sorted runs, ...).
     fn open(&mut self) -> Result<()>;
 
-    /// Produce the next output row, or `Ok(None)` at end of stream.
-    fn next(&mut self) -> Result<Option<Vec<Value>>>;
+    /// Produce the next output row (plus optional `RecordId`), or `Ok(None)`
+    /// at end of stream.
+    fn next(&mut self) -> Result<Option<ExecRow>>;
 
     /// Release everything acquired in `open`.
     fn close(&mut self) -> Result<()>;
@@ -84,13 +120,22 @@ pub trait Executor {
 /// Until Milestone 9, [`ExecContext::wal`] is `None` and executors skip
 /// logging entirely.
 pub trait WalHook: Send + Sync {
+    /// Log formatting a newly allocated heap page so crash recovery can
+    /// re-initialize it before replaying tuple inserts.
+    fn log_page_init(&self, page_id: PageId) -> Result<Lsn>;
     /// Log the start of transaction `txn`. Returns the record's LSN.
     fn log_begin(&self, txn: TxnId) -> Result<Lsn>;
     /// Log the commit of `txn`. The caller must `flush_until` the returned
     /// LSN before reporting success to the client (the durability point).
     fn log_commit(&self, txn: TxnId) -> Result<Lsn>;
-    /// Log the abort of `txn`.
+    /// Log the abort of `txn` (transaction-end marker written once rollback finishes).
     fn log_abort(&self, txn: TxnId) -> Result<Lsn>;
+    /// Roll back `txn` by walking its `prev_lsn` chain backward, applying
+    /// inverse page mutations (`HeapPage::delete` / `HeapPage::put_at`) via
+    /// `store`, appending a `Clr` per undone mutation (stamping `pageLSN`),
+    /// and finishing with `LogRecord::Abort`. Reuses ARIES Pass 3 undo for
+    /// live `ROLLBACK`.
+    fn rollback(&self, txn: TxnId, store: &dyn PageStore) -> Result<()>;
     /// Log a tuple insertion (after-image only).
     fn log_insert(&self, txn: TxnId, rid: RecordId, meta: TupleMeta, tuple: &[u8]) -> Result<Lsn>;
     /// Log a tuple update (before- and after-image, so it can be both
@@ -121,7 +166,10 @@ pub const DEFAULT_MEMORY_PAGES: usize = 64;
 /// server each build one of these and pass it to [`execute`].
 ///
 /// Fields are public so the binary crate and tests can wire one up
-/// directly; [`ExecContext::new`] fills in the common defaults.
+/// directly; [`ExecContext::new`] fills in defaults, and
+/// [`ExecContext::new_session`] creates an isolated per-connection session
+/// for `ferricdb-server` (sharing the database `Arc`s with a fresh
+/// `current_txn` and `failed_txn`).
 pub struct ExecContext {
     /// The system catalog: table/index definitions and (from Milestone 7)
     /// per-table statistics.
@@ -138,6 +186,10 @@ pub struct ExecContext {
     /// an explicit transaction run in their own single-statement
     /// (autocommit) transaction. Before Milestone 8 this stays `None`.
     pub current_txn: Mutex<Option<Arc<Transaction>>>,
+    /// Set to `true` when a statement fails inside an explicit transaction
+    /// (PostgreSQL `ReadyForQuery('E')` semantics: further commands are
+    /// rejected until `ROLLBACK` clears both `current_txn` and `failed_txn`).
+    pub failed_txn: Mutex<bool>,
     /// Write-ahead-log hook (Milestone 9). `None` until the binary wires
     /// in the WAL; executors must skip logging when absent.
     pub wal: Option<Arc<dyn WalHook>>,
@@ -162,8 +214,25 @@ impl ExecContext {
             store,
             txn_manager,
             current_txn: Mutex::new(None),
+            failed_txn: Mutex::new(false),
             wal: None,
             memory_pages: DEFAULT_MEMORY_PAGES,
+        }
+    }
+
+    /// Create an independent per-connection session sharing this context's
+    /// database services (`catalog`, `store`, `txn_manager`, `wal`,
+    /// `memory_pages`) with its own clean `current_txn` and `failed_txn`
+    /// slots. Call this once per accepted TCP connection in Milestone 10.
+    pub fn new_session(&self) -> Self {
+        ExecContext {
+            catalog: Arc::clone(&self.catalog),
+            store: Arc::clone(&self.store),
+            txn_manager: Arc::clone(&self.txn_manager),
+            current_txn: Mutex::new(None),
+            failed_txn: Mutex::new(false),
+            wal: self.wal.as_ref().map(Arc::clone),
+            memory_pages: self.memory_pages,
         }
     }
 }
@@ -183,21 +252,27 @@ impl<'a> Planner<'a> {
         Planner { ctx }
     }
 
-    /// Translate a bound statement into a [`plan::LogicalPlan`] tree
-    /// (Milestone 4; joins and aggregates extend it in Milestone 6).
+    /// Translate a plannable bound statement (`Select`, `Insert`, `Update`,
+    /// `Delete`) into a [`plan::LogicalPlan`] tree (Milestone 4; joins and
+    /// aggregates extend it in Milestone 6).
+    ///
+    /// DDL, TCL, and utility statements (`CreateTable`, `DropTable`,
+    /// `CreateIndex`, `Begin`, `Commit`, `Rollback`, `Analyze`, `Explain`,
+    /// `Vacuum`) are dispatched directly by [`execute`] before calling
+    /// `plan()`.
     ///
     /// Typical shapes: `SELECT` becomes
-    /// `Projection(Limit?(Sort?(Filter?(scan/join ...))))` — built
-    /// inside-out; `INSERT` becomes `Insert { input: Values }`; `UPDATE`
-    /// and `DELETE` wrap a filtered scan of the target table.
+    /// `Projection(Limit?(Sort?(Aggregate?(Filter?(scan/join ...)))))` —
+    /// built inside-out; `INSERT` becomes `Insert { input: Values }`;
+    /// `UPDATE` and `DELETE` wrap a filtered scan of the target table.
     pub fn plan(&self, stmt: binder::BoundStatement) -> Result<plan::LogicalPlan> {
         todo!("Milestone 4")
     }
 
     /// Improve a plan. In Milestone 4, implement this as the identity
     /// function (return the plan unchanged). Milestone 7 turns it into a
-    /// real optimizer: rewrite rules first (predicate pushdown, projection
-    /// pruning, constant folding), then cost-based decisions using
+    /// real optimizer: rewrite rules first (constant folding, predicate
+    /// pushdown, redundant-projection cleanup), then cost-based decisions using
     /// [`cost::CostModel`] — access path (SeqScan vs IndexScan) and join
     /// strategy/order.
     ///
@@ -235,6 +310,11 @@ pub struct QueryResult {
     pub rows: Vec<Vec<Value>>,
     /// Rows inserted/updated/deleted, for DML statements; 0 otherwise.
     pub affected: u64,
+    /// PostgreSQL `CommandComplete` tag (e.g. `"SELECT 3"`, `"INSERT 0 2"`,
+    /// `"UPDATE 1"`, `"DELETE 2"`, `"CREATE TABLE"`, `"BEGIN"`, `"COMMIT"`,
+    /// `"ROLLBACK"`, `"ANALYZE"`, `"VACUUM"`). Used directly by
+    /// `ferricdb-server` in Milestone 10.
+    pub tag: String,
     /// Rendered plan for `EXPLAIN` (and `EXPLAIN ANALYZE`) statements,
     /// `None` otherwise. Format contract the provided tests grep for:
     /// one plan node per line, indented by depth, each line starting
@@ -253,9 +333,9 @@ pub struct QueryResult {
 ///   autocommit transaction (before Milestone 8 there is effectively a
 ///   single implicit transaction and `TupleMeta` stays zeroed).
 /// - `BEGIN` stores a new transaction in [`ExecContext::current_txn`];
-///   `COMMIT`/`ROLLBACK` end it via the
-///   [`TransactionManager`]. A serialization
-///   failure surfaces as `Err(Error::Serialization)` (Milestone 8).
+///   `COMMIT`/`ROLLBACK` end it via the [`TransactionManager`]. A
+///   serialization failure surfaces as `Err(Error::Serialization)`
+///   (Milestone 8).
 /// - `EXPLAIN <stmt>` does not run `<stmt>`; it returns the rendered plan
 ///   in [`QueryResult::explain`]. `EXPLAIN ANALYZE` runs it and may
 ///   append runtime counters (Milestone 7).

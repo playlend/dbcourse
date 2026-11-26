@@ -93,11 +93,19 @@
       more — and implement it for the existing heap first (a pure refactor; every test stays
       green).</li>
     <li><strong>Key design.</strong> An LSM table is a sorted map, so it needs a key: use the
-      primary key (encode with an order-preserving format) rather than RecordId. Tuples become
-      (encoded PK → serialized row + TupleMeta).</li>
+      primary key (encoded in an order-preserving format) rather than <code>RecordId</code>. To
+      preserve Milestone&nbsp;8 MVCC snapshot isolation across concurrent <code>UPDATE</code>s,
+      do not overwrite old versions under the bare primary key — encode
+      <code>(encoded PK, xmin)</code> as the LSM key (or keep a version chain in the value) so
+      every committed version stays readable to older snapshots until <code>VACUUM</code>.</li>
     <li><strong>Implement <code>LsmTable: TableStorage</code></strong> over your Mini-LSM
-      engine: insert/update = put, delete = tombstone put, scan = range iterator, MVCC metas
-      travel inside the value bytes.</li>
+      engine: <code>insert</code> / <code>update</code> = put a new version under
+      <code>(encoded PK, xmin)</code> (and stamp <code>xmax</code> on the prior version),
+      <code>delete</code> = stamp <code>TupleMeta.xmax</code> on the live version (never emit a
+      raw LSM tombstone on <code>DELETE</code> — let <code>VACUUM</code> emit real tombstones once
+      the deleter is below <code>oldest_visible_xid()</code>; see the pitfall below),
+      <code>scan</code> = range iterator filtering each version through
+      <code>Snapshot::is_visible</code>.</li>
     <li><strong>Catalog + DDL.</strong> A storage flag on <code>TableInfo</code>, parsed from
       the WITH clause; the planner picks the scan implementation by table storage.</li>
     <li><strong>Reuse the behavioral suites.</strong> Run the ms1_ heap-semantics tests (where
@@ -108,9 +116,12 @@
   <h2 id="sec-pitfalls">Pitfalls</h2>
   <div class="callout pitfall">
     <span class="callout-title">RecordId stability</span>
-    <p>Compaction moves data; there is no stable (page, slot) address. Secondary indexes over
-    LSM tables must store <em>keys</em>, not RecordIds — a real design fork from your B+Tree,
-    worth a paragraph in your notes even if you skip secondary indexes here.</p>
+    <p>Compaction moves data; there is no stable (page, slot) address. Both secondary indexes
+    <em>and</em> Milestone 8's <code>TransactionManager::record_write(txn, rid)</code> assume
+    stable tuple addresses: for LSM-backed tables, generalize write-set keys to an enum
+    (<code>RowKey::Heap(RecordId) | RowKey::Lsm(Oid, Vec&lt;u8&gt;)</code>) and store primary keys
+    instead of <code>RecordId</code>s in secondary indexes — a real design fork from your heap +
+    B+Tree stack, worth a paragraph in your notes even if you skip secondary indexes here.</p>
   </div>
   <div class="callout pitfall">
     <span class="callout-title">Two WALs, one truth</span>
@@ -157,6 +168,16 @@
           (starter code and tests: <a href="https://github.com/skyzh/mini-lsm" rel="external">github.com/skyzh/mini-lsm</a>)</li>
       </ol>
     </div>
+
+    <h2 id="sec-deeper">Go deeper</h2>
+    <ul>
+      <li>Mini-LSM Book &amp; Starter Repository — full three-week Rust curriculum covering
+        memtables, SST encoding, bloom filters, leveled/tiered compaction, and MVCC on LSMs.
+        <a href="https://skyzh.github.io/mini-lsm/" rel="external">skyzh.github.io/mini-lsm</a></li>
+      <li>Stonebraker &amp; Pavlo, "What Goes Around Comes Around... And Around..." (SIGMOD Record
+        2024) — historical perspective on why log-structured engines dominate write-heavy workloads.
+        <a href="https://db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf" rel="external">db.cs.cmu.edu/papers/2024/whatgoesaround-sigmodrec2024.pdf</a></li>
+    </ul>
 
     <nav class="prevnext">
       <a href="../stretch-s2/index.html"><span class="dir">← Previous</span> Stretch S2 · Serializable Isolation (SSI)</a>

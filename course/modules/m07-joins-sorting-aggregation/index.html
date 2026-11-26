@@ -125,35 +125,49 @@
   href="#ref-2">2</a></sup></p>
 
   <figure>
-    <svg viewBox="0 0 760 250" role="img">
+    <svg viewBox="0 0 760 258" role="img">
       <title>Block nested loop join buffer layout: B minus 2 pages hold a chunk of the outer relation, one page streams the inner relation, one page buffers output.</title>
-      <rect x="16" y="34" width="120" height="56" rx="8" class="d-box"/>
-      <text x="76" y="58" text-anchor="middle" class="d-text">R on disk</text>
-      <text x="76" y="76" text-anchor="middle" class="d-mono-sm">[R] pages</text>
-      <rect x="16" y="152" width="120" height="56" rx="8" class="d-box"/>
-      <text x="76" y="176" text-anchor="middle" class="d-text">S on disk</text>
-      <text x="76" y="194" text-anchor="middle" class="d-mono-sm">[S] pages</text>
+      <defs>
+        <marker id="m07-f1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+        <marker id="m07-f1-arr-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
+      <rect x="10" y="46" width="112" height="56" rx="8" class="d-box"/>
+      <text x="66" y="70" text-anchor="middle" class="d-text">R on disk</text>
+      <text x="66" y="88" text-anchor="middle" class="d-mono-sm">[R] pages</text>
+      <rect x="10" y="156" width="112" height="56" rx="8" class="d-box"/>
+      <text x="66" y="180" text-anchor="middle" class="d-text">S on disk</text>
+      <text x="66" y="198" text-anchor="middle" class="d-mono-sm">[S] pages</text>
 
-      <rect x="212" y="16" width="382" height="216" rx="10" class="d-box"/>
-      <text x="403" y="38" text-anchor="middle" class="d-text">buffer pool: B pages granted to the join</text>
+      <rect x="244" y="16" width="376" height="224" rx="10" class="d-box"/>
+      <text x="432" y="38" text-anchor="middle" class="d-text">buffer pool: B pages granted to the join</text>
 
-      <rect x="232" y="56" width="52" height="40" rx="5" class="d-box-hl"/>
-      <rect x="292" y="56" width="52" height="40" rx="5" class="d-box-hl"/>
-      <rect x="352" y="56" width="52" height="40" rx="5" class="d-box-hl"/>
-      <text x="428" y="82" text-anchor="middle" class="d-text">…</text>
-      <text x="342" y="120" text-anchor="middle" class="d-text-sm">chunk of R: B − 2 pages</text>
+      <rect x="264" y="54" width="52" height="40" rx="5" class="d-box-hl"/>
+      <rect x="324" y="54" width="52" height="40" rx="5" class="d-box-hl"/>
+      <rect x="384" y="54" width="52" height="40" rx="5" class="d-box-hl"/>
+      <text x="460" y="79" text-anchor="middle" class="d-text">…</text>
+      <text x="374" y="116" text-anchor="middle" class="d-text-sm">chunk of R: B − 2 pages</text>
 
-      <rect x="480" y="56" width="94" height="40" rx="5" class="d-box-warn"/>
-      <text x="527" y="81" text-anchor="middle" class="d-mono-sm">S input (1)</text>
-      <rect x="480" y="152" width="94" height="40" rx="5" class="d-box-good"/>
-      <text x="527" y="177" text-anchor="middle" class="d-mono-sm">output (1)</text>
+      <rect x="264" y="164" width="104" height="40" rx="5" class="d-box-warn"/>
+      <text x="316" y="189" text-anchor="middle" class="d-mono-sm">S input (1)</text>
+      <rect x="496" y="164" width="104" height="40" rx="5" class="d-box-good"/>
+      <text x="548" y="189" text-anchor="middle" class="d-mono-sm">output (1)</text>
 
-      <line x1="136" y1="62" x2="232" y2="72" class="d-line"/>
-      <text x="182" y="52" text-anchor="middle" class="d-text-sm">read once</text>
-      <line x1="136" y1="180" x2="480" y2="82" class="d-line-hl"/>
-      <text x="300" y="166" text-anchor="middle" class="d-text-sm">rescanned ⌈[R]/(B−2)⌉ times</text>
-      <line x1="574" y1="172" x2="700" y2="172" class="d-line"/>
-      <text x="660" y="162" text-anchor="middle" class="d-text-sm">to parent</text>
+      <line x1="122" y1="74" x2="264" y2="74" class="d-line" marker-end="url(#m07-f1-arr)"/>
+      <text x="183" y="64" text-anchor="middle" class="d-text-sm">read once</text>
+      <line x1="122" y1="184" x2="264" y2="184" class="d-line-hl" marker-end="url(#m07-f1-arr-hl)"/>
+      <text x="183" y="172" text-anchor="middle" class="d-text-sm">rescanned</text>
+      <text x="183" y="204" text-anchor="middle" class="d-text-sm">⌈[R]/(B−2)⌉ times</text>
+
+      <line x1="368" y1="184" x2="496" y2="184" class="d-line" marker-end="url(#m07-f1-arr)"/>
+      <line x1="432" y1="126" x2="432" y2="162" class="d-line" stroke-dasharray="4 3"/>
+      <text x="432" y="176" text-anchor="middle" class="d-text-sm">join pairs</text>
+
+      <line x1="600" y1="184" x2="740" y2="184" class="d-line" marker-end="url(#m07-f1-arr)"/>
+      <text x="682" y="174" text-anchor="middle" class="d-text-sm">to parent</text>
     </svg>
     <figcaption>Figure 1 — Block nested loop join: the outer relation is consumed in chunks of
     B−2 pages; each chunk triggers exactly one full scan of the inner relation.</figcaption>
@@ -184,9 +198,10 @@
   <code>work_mem</code> and overflows to a temporary file if the tuples outgrow it; every subsequent
   rescan then reads this compact store instead of the base table, which the cost model treats as much
   cheaper.<sup class="cite"><a href="#ref-3">3</a></sup> In FerricDB, Milestone&nbsp;6's
-  <code>NestedLoopJoin</code> executor takes the block-based approach within its
-  <code>memory_pages</code> budget — a course choice modeled directly on the CS186 formulation.<sup
-  class="cite"><a href="#ref-2">2</a></sup></p>
+  <code>NestedLoopJoin</code> executor follows that materialized pattern — buffering the inner child
+  once in memory during <code>open()</code> and scanning it for each outer row — while the block
+  nested loop join above gives you the general disk-oriented algorithm and cost model when neither
+  side fits.<sup class="cite"><a href="#ref-2">2</a>,<a href="#ref-3">3</a></sup></p>
 
   <div class="callout pitfall">
     <span class="callout-title">Pitfall: rescanning an iterator</span>
@@ -240,8 +255,8 @@
       <rect x="460" y="188" width="90" height="34" rx="5" class="d-box"/>
       <text x="505" y="210" text-anchor="middle" class="d-mono">k = 5</text>
 
-      <text x="620" y="122" class="d-text-sm">◀ mark: start of</text>
-      <text x="620" y="138" class="d-text-sm">the k=2 run in S</text>
+      <text x="562" y="122" class="d-text-sm">◀ mark: start of</text>
+      <text x="562" y="138" class="d-text-sm">the k=2 run in S</text>
 
       <line x1="210" y1="112" x2="460" y2="112" class="d-line-hl"/>
       <line x1="210" y1="118" x2="460" y2="158" class="d-line-hl"/>
@@ -298,11 +313,22 @@
   batch; probe then compares each outer tuple against the bucket its hash selects.<sup
   class="cite"><a href="#ref-5">5</a></sup> Note the bucket comparison in the probe phase still checks
   the real key: different keys can share a bucket, so hashing narrows the candidates but equality
-  decides.<sup class="cite"><a href="#ref-5">5</a></sup></p>
+  decides.<sup class="cite"><a href="#ref-5">5</a></sup> In FerricDB,
+  <code>LogicalPlan::HashJoin</code> follows the opposite side convention: it builds the hash table
+  on its <strong>left</strong> input and probes with its <strong>right</strong> input (a course
+  choice; Milestone&nbsp;7's optimizer places the smaller relation on the left).</p>
 
   <figure>
     <svg viewBox="0 0 760 330" role="img">
       <title>Hash join phases: build inserts inner tuples into an in-memory hash table; probe streams outer tuples through the hash function into buckets and emits matches.</title>
+      <defs>
+        <marker id="m07-f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+        <marker id="m07-f3-arr-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
       <text x="90" y="30" text-anchor="middle" class="d-text">① build: inner S, once</text>
       <rect x="40" y="44" width="100" height="28" rx="5" class="d-box"/>
       <text x="90" y="63" text-anchor="middle" class="d-mono-sm">S: k=1</text>
@@ -315,8 +341,8 @@
 
       <rect x="210" y="80" width="80" height="56" rx="10" class="d-box-warn"/>
       <text x="250" y="113" text-anchor="middle" class="d-mono">h(k)</text>
-      <line x1="140" y1="108" x2="210" y2="108" class="d-line"/>
-      <line x1="290" y1="108" x2="360" y2="108" class="d-line"/>
+      <line x1="140" y1="108" x2="210" y2="108" class="d-line" marker-end="url(#m07-f3-arr)"/>
+      <line x1="290" y1="108" x2="360" y2="108" class="d-line" marker-end="url(#m07-f3-arr)"/>
 
       <rect x="360" y="36" width="210" height="200" rx="10" class="d-box"/>
       <text x="465" y="58" text-anchor="middle" class="d-text-sm">hash table in memory (≤ B−2)</text>
@@ -330,10 +356,10 @@
       <text x="90" y="238" text-anchor="middle" class="d-text">② probe: outer R, streamed</text>
       <rect x="40" y="252" width="100" height="28" rx="5" class="d-box-hl"/>
       <text x="90" y="271" text-anchor="middle" class="d-mono-sm">R: k=2</text>
-      <path d="M 140 266 C 250 266 310 240 376 200" class="d-line-hl"/>
+      <path d="M 140 266 C 250 266 310 240 376 200" class="d-line-hl" marker-end="url(#m07-f3-arr-hl)"/>
       <text x="262" y="292" text-anchor="middle" class="d-text-sm">hash key → bucket 2, compare keys</text>
 
-      <line x1="570" y1="196" x2="676" y2="196" class="d-line-hl"/>
+      <line x1="570" y1="196" x2="676" y2="196" class="d-line-hl" marker-end="url(#m07-f3-arr-hl)"/>
       <text x="668" y="184" text-anchor="middle" class="d-text-sm">emit matches</text>
       <text x="656" y="214" class="d-mono-sm">(k=2 rows join;</text>
       <text x="656" y="228" class="d-mono-sm">k=5 fails the</text>
@@ -368,6 +394,14 @@
   <figure>
     <svg viewBox="0 0 760 300" role="img">
       <title>Grace hash join: both relations are hashed into matching partitions on disk, then each partition pair is joined in memory.</title>
+      <defs>
+        <marker id="m07-f4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+        <marker id="m07-f4-arr-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
       <rect x="20" y="60" width="90" height="44" rx="6" class="d-box"/>
       <text x="65" y="87" text-anchor="middle" class="d-mono-sm">R (big)</text>
       <rect x="20" y="180" width="90" height="44" rx="6" class="d-box"/>
@@ -375,12 +409,12 @@
 
       <rect x="160" y="118" width="70" height="50" rx="10" class="d-box-warn"/>
       <text x="195" y="148" text-anchor="middle" class="d-mono">h₁(k)</text>
-      <line x1="110" y1="82" x2="160" y2="132" class="d-line"/>
-      <line x1="110" y1="202" x2="160" y2="154" class="d-line"/>
+      <line x1="110" y1="82" x2="160" y2="132" class="d-line" marker-end="url(#m07-f4-arr)"/>
+      <line x1="110" y1="202" x2="160" y2="154" class="d-line" marker-end="url(#m07-f4-arr)"/>
 
-      <line x1="230" y1="132" x2="300" y2="70" class="d-line"/>
-      <line x1="230" y1="143" x2="300" y2="143" class="d-line"/>
-      <line x1="230" y1="154" x2="300" y2="216" class="d-line"/>
+      <line x1="230" y1="132" x2="300" y2="70" class="d-line" marker-end="url(#m07-f4-arr)"/>
+      <line x1="230" y1="143" x2="300" y2="143" class="d-line" marker-end="url(#m07-f4-arr)"/>
+      <line x1="230" y1="154" x2="300" y2="216" class="d-line" marker-end="url(#m07-f4-arr)"/>
 
       <rect x="300" y="48" width="74" height="40" rx="5" class="d-box-hl"/>
       <text x="337" y="73" text-anchor="middle" class="d-mono-sm">R₀ | S₀</text>
@@ -391,12 +425,13 @@
       <text x="337" y="262" text-anchor="middle" class="d-text-sm">B−1 partition pairs on disk</text>
       <text x="337" y="278" text-anchor="middle" class="d-text-sm">(matching keys share a pair)</text>
 
-      <line x1="374" y1="143" x2="450" y2="143" class="d-line-hl"/>
-      <rect x="450" y="106" width="180" height="74" rx="10" class="d-box-good"/>
-      <text x="540" y="136" text-anchor="middle" class="d-text-sm">per pair: build h₂ table on the</text>
-      <text x="540" y="152" text-anchor="middle" class="d-text-sm">smaller half, probe with the other</text>
-      <line x1="630" y1="143" x2="716" y2="143" class="d-line"/>
-      <text x="700" y="132" text-anchor="middle" class="d-text-sm">output</text>
+      <line x1="374" y1="143" x2="436" y2="143" class="d-line-hl" marker-end="url(#m07-f4-arr-hl)"/>
+      <rect x="436" y="103" width="210" height="80" rx="10" class="d-box-good"/>
+      <text x="541" y="128" text-anchor="middle" class="d-text-sm">per pair: build h₂ table</text>
+      <text x="541" y="146" text-anchor="middle" class="d-text-sm">on the smaller half,</text>
+      <text x="541" y="164" text-anchor="middle" class="d-text-sm">probe with the other</text>
+      <line x1="646" y1="143" x2="736" y2="143" class="d-line" marker-end="url(#m07-f4-arr)"/>
+      <text x="692" y="132" text-anchor="middle" class="d-text-sm">output</text>
     </svg>
     <figcaption>Figure 4 — Grace (partitioned) hash join. Partitioning is a full read+write of both
     inputs; the build-and-probe phase then handles one memory-sized piece at a time.</figcaption>
@@ -498,16 +533,17 @@ I/O    = 2·N · passes</code></pre>
   with B = 52 yields ⌈1000/52⌉ = 20 runs, one 51-way merge pass finishes the job, so 2 passes ×
   2,000 = 4,000 I/Os.<sup class="cite"><a href="#ref-6">6</a></sup></p>
 
-  <p>The widget below runs the exact configuration you will unit-test in Milestone 6:
-  <strong>N = 8 pages, B = 3 buffers</strong>. Pass 0 makes ⌈8/3⌉ = 3 runs; the 2-way merges then need
-  ⌈log₂ 3⌉ = 2 more passes; 3 passes × 2×8 = 48 I/Os. Watch the I/O counter agree with the formula.</p>
+  <p>The widget below traces the classic textbook configuration — <strong>N = 8 pages, B = 3
+  buffers</strong> — where Pass 0 makes ⌈8/3⌉ = 3 runs and the 2-way merges need ⌈log₂ 3⌉ = 2 more
+  passes (3 passes × 2×8 = 48 I/Os). Watch the I/O counter agree with the formula.</p>
 
   <div class="widget" id="widget-extsort">
     <p class="widget-title">External merge sort: 8 pages, 3 buffers</p>
     <p class="widget-sub">Step through run generation and both merge passes; every box is a disk page
     (two keys per page). The I/O counter counts each page read and each page write. (Without
-    JavaScript: the run contents for each pass are listed in the prose above and the formula predicts
-    3 passes, 48 I/Os.)</p>
+    JavaScript: Pass 0 reads 3+3+2 pages to write 3 sorted runs of 3, 3, and 2 pages [16 I/Os];
+    Pass 1 merges the first two runs into a 6-page run and carries the 2-page run [32 I/Os]; Pass 2
+    merges those two runs into the final 8-page sorted output — 3 passes, 48 I/Os total.)</p>
     <div class="stat-row">
       <span class="stat">I/O so far: <b id="es-io">0</b> / 48</span>
       <span class="stat">passes done: <b id="es-pass">0</b> / 3</span>
@@ -521,11 +557,16 @@ I/O    = 2·N · passes</code></pre>
     <span class="callout-title">Course choice: the sort budget is explicit</span>
     <p>FerricDB's <code>sort::ExternalSorter</code> (crate <code>course/ferricdb/crates/exec</code>)
     takes a <code>memory_pages</code> parameter and must never hold more than that many pages of
-    tuples in memory — spilling runs to temp pages and k-way merging exactly as above. The tests pin
-    small budgets like B = 3 on purpose: correctness bugs in run boundaries and merge cursors only
-    show up when spilling actually happens. The budget-then-spill discipline mirrors PostgreSQL, whose
-    sorts run in memory when they fit and otherwise fall back to temporary files on disk.<sup
-    class="cite"><a href="#ref-4">4</a></sup></p>
+    tuples in memory — spilling sorted runs to temp pages and running a <code>k</code>-way merge
+    (<code>k = max(2, memory_pages − 1)</code>), ordering <code>NULL</code> values last under both
+    <code>ASC</code> and <code>DESC</code> (course convention). The Milestone&nbsp;6 tests in
+    <code>crates/exec/tests/exec.rs</code> pin <code>memory_pages = 4</code> (a textbook 3-way
+    merge) on purpose — both directly in <code>ms6_external_sorter_spills_runs</code> (checking
+    <code>spilled_runs() &gt; 0</code> and <code>NULLS LAST</code>) and end-to-end in
+    <code>ms6_external_sort_under_tiny_budget</code> over 2,000 rows — because correctness bugs in
+    run boundaries and merge cursors only show up when spilling actually happens. The
+    budget-then-spill discipline mirrors PostgreSQL, whose sorts run in memory when they fit and
+    otherwise fall back to temporary files on disk.<sup class="cite"><a href="#ref-4">4</a></sup></p>
   </div>
 
   <h2 id="sec-agg">Aggregation: sort it or hash it</h2>
@@ -558,37 +599,42 @@ I/O    = 2·N · passes</code></pre>
   <figure>
     <svg viewBox="0 0 880 240" role="img">
       <title>Two GROUP BY pipelines: sort-based aggregation sorts input so groups are adjacent and streams accumulators; hash-based aggregation keeps one hash table entry of running state per group.</title>
+      <defs>
+        <marker id="m07-f5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+      </defs>
       <text x="20" y="34" class="d-text">sort-based</text>
       <rect x="20" y="48" width="120" height="44" rx="6" class="d-box"/>
       <text x="80" y="75" text-anchor="middle" class="d-mono-sm">B A C A B A</text>
-      <line x1="140" y1="70" x2="196" y2="70" class="d-line"/>
+      <line x1="140" y1="70" x2="196" y2="70" class="d-line" marker-end="url(#m07-f5-arr)"/>
       <rect x="196" y="48" width="130" height="44" rx="6" class="d-box-warn"/>
       <text x="261" y="75" text-anchor="middle" class="d-text-sm">external sort</text>
-      <line x1="326" y1="70" x2="382" y2="70" class="d-line"/>
+      <line x1="326" y1="70" x2="382" y2="70" class="d-line" marker-end="url(#m07-f5-arr)"/>
       <rect x="382" y="48" width="120" height="44" rx="6" class="d-box"/>
       <text x="442" y="75" text-anchor="middle" class="d-mono-sm">A A A B B C</text>
-      <line x1="502" y1="70" x2="558" y2="70" class="d-line"/>
+      <line x1="502" y1="70" x2="558" y2="70" class="d-line" marker-end="url(#m07-f5-arr)"/>
       <rect x="558" y="48" width="170" height="44" rx="6" class="d-box-good"/>
       <text x="643" y="68" text-anchor="middle" class="d-text-sm">stream: emit on</text>
       <text x="643" y="84" text-anchor="middle" class="d-text-sm">key change (1 group live)</text>
-      <line x1="728" y1="70" x2="768" y2="70" class="d-line"/>
-      <text x="806" y="66" text-anchor="middle" class="d-text-sm">sorted</text>
-      <text x="806" y="82" text-anchor="middle" class="d-text-sm">groups</text>
+      <line x1="728" y1="70" x2="768" y2="70" class="d-line" marker-end="url(#m07-f5-arr)"/>
+      <text x="780" y="66" class="d-text-sm">sorted</text>
+      <text x="780" y="82" class="d-text-sm">groups</text>
 
       <text x="20" y="152" class="d-text">hash-based</text>
       <rect x="20" y="166" width="120" height="44" rx="6" class="d-box"/>
       <text x="80" y="193" text-anchor="middle" class="d-mono-sm">B A C A B A</text>
-      <line x1="140" y1="188" x2="196" y2="188" class="d-line"/>
+      <line x1="140" y1="188" x2="196" y2="188" class="d-line" marker-end="url(#m07-f5-arr)"/>
       <rect x="196" y="166" width="130" height="44" rx="6" class="d-box-warn"/>
       <text x="261" y="193" text-anchor="middle" class="d-mono-sm">h(key)</text>
-      <line x1="326" y1="188" x2="382" y2="188" class="d-line"/>
+      <line x1="326" y1="188" x2="382" y2="188" class="d-line" marker-end="url(#m07-f5-arr)"/>
       <rect x="382" y="152" width="220" height="76" rx="6" class="d-box-hl"/>
       <text x="492" y="174" text-anchor="middle" class="d-text-sm">hash table of running state</text>
       <text x="492" y="194" text-anchor="middle" class="d-mono-sm">A: n=3 · B: n=2 · C: n=1</text>
       <text x="492" y="212" text-anchor="middle" class="d-text-sm">one entry per group, no sort</text>
-      <line x1="602" y1="188" x2="658" y2="188" class="d-line"/>
-      <text x="726" y="184" text-anchor="middle" class="d-text-sm">groups, arbitrary order</text>
-      <text x="726" y="202" text-anchor="middle" class="d-text-sm">(spill: partition like Grace)</text>
+      <line x1="602" y1="188" x2="658" y2="188" class="d-line" marker-end="url(#m07-f5-arr)"/>
+      <text x="670" y="184" class="d-text-sm">groups, arbitrary order</text>
+      <text x="670" y="202" class="d-text-sm">(spill: partition like Grace)</text>
     </svg>
     <figcaption>Figure 5 — The two GROUP BY strategies. Sorting buys adjacency (and ordered output);
     hashing buys directness (one pass when the groups fit in memory).</figcaption>
@@ -713,7 +759,7 @@ I/O    = 2·N · passes</code></pre>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="Merge join and hash join both rely on equality: merge join is restricted to natural/equi-joins, and hashing only co-locates identical keys — an inequality gives the hash function nothing to work with. Nested loop simply evaluates the predicate on every pair, so it accepts any condition. (Real planners may still find rewrites, but among these three algorithms only nested loop applies directly.)">
+  <fieldset class="quiz" data-explain="Merge join and hash join both rely on equality: merge join is restricted to natural/equi-joins, and hashing only co-locates identical keys — an inequality gives the hash function nothing to work with. Nested loop evaluates the predicate directly on every pair, so it accepts any condition. (Real planners may still find rewrites, but among these three algorithms only nested loop applies directly.)">
     <legend class="quiz-q">Which join algorithms can directly execute <code>R JOIN S ON R.a &lt; S.b</code>?</legend>
     <label><input type="radio" name="q5"> All three — the predicate is just a function of the pair</label>
     <label><input type="radio" name="q5"> Merge join and nested loop, since sorted order makes &lt; easy</label>
@@ -806,7 +852,7 @@ document.addEventListener("DOMContentLoaded", function () {
           cmp++;
           var m = R[i].k === S[j].k;
           if (m) outs = outs.concat([emitStr(R[i], S[j])]);
-          nljSteps.push({ r: i, s: j, mark: null, cmp: cmp, outs: outs.slice(), emitNew: m,
+          nljSteps.push({ r: i, s: j, mark: null, cmp: cmp, outs: outs.slice(), emitCount: m ? 1 : 0,
             note: "compare " + R[i].id + "(k=" + R[i].k + ") × " + S[j].id + "(k=" + S[j].k + ")" +
                   (m ? " → match, emit" : " → no match") });
         }
@@ -819,13 +865,13 @@ document.addEventListener("DOMContentLoaded", function () {
     var mergeSteps = [];
     (function () {
       var outs = [], cmp = 0;
-      mergeSteps.push({ r: null, s: null, mark: null, cmp: 0, outs: [], emitNew: false,
+      mergeSteps.push({ r: null, s: null, mark: null, cmp: 0, outs: [], emitCount: 0,
         note: "sort both inputs on k (extra cost not shown in this panel's counter)" });
       function st(r, s, mark, note, rr, ss) {
         cmp++;
-        var e = false;
-        if (rr != null) { outs = outs.concat([emitStr(rr, ss)]); e = true; }
-        mergeSteps.push({ r: r, s: s, mark: mark, cmp: cmp, outs: outs.slice(), emitNew: e, note: note });
+        var ec = 0;
+        if (rr != null) { outs = outs.concat([emitStr(rr, ss)]); ec = 1; }
+        mergeSteps.push({ r: r, s: s, mark: mark, cmp: cmp, outs: outs.slice(), emitCount: ec, note: note });
       }
       st(0, 0, 0,    "1 = 1 → emit, set mark, advance S", mR[0], mS[0]);
       st(0, 1, 0,    "1 < 2 → R's key done: advance R, rewind S to mark", null, null);
@@ -850,7 +896,7 @@ document.addEventListener("DOMContentLoaded", function () {
         var hb = S[j].k % NBUCKETS;
         buckets[hb].push(j);
         hashSteps.push({ r: null, s: j, mark: null, bucketHl: hb, buckets: snapBuckets(buckets),
-          cmp: cmp, outs: outs.slice(), emitNew: false,
+          cmp: cmp, outs: outs.slice(), emitCount: 0,
           note: "build: hash " + S[j].id + " (k=" + S[j].k + ") into bucket " + hb });
       }
       for (var i = 0; i < R.length; i++) {
@@ -862,78 +908,78 @@ document.addEventListener("DOMContentLoaded", function () {
           if (S[sj].k === R[i].k) { outs = outs.concat([emitStr(R[i], S[sj])]); hits++; }
         }
         hashSteps.push({ r: i, s: null, mark: null, bucketHl: pb, buckets: snapBuckets(buckets),
-          cmp: cmp, outs: outs.slice(), emitNew: hits > 0,
+          cmp: cmp, outs: outs.slice(), emitCount: hits,
           note: "probe: " + R[i].id + " (k=" + R[i].k + ") → bucket " + pb + ": " +
                 buckets[pb].length + " entr" + (buckets[pb].length === 1 ? "y" : "ies") +
                 " checked, " + hits + " match" + (hits === 1 ? "" : "es") });
       }
     })();
 
-    var INIT = { r: null, s: null, mark: null, cmp: 0, outs: [], emitNew: false,
+    var INIT = { r: null, s: null, mark: null, cmp: 0, outs: [], emitCount: 0,
                  buckets: EMPTY_BUCKETS, note: "ready" };
 
-    function drawCol(svg, x, title, rows, hl, mark) {
-      svg.appendChild(C.svgEl("text", { x: x + 46, y: 14, "text-anchor": "middle", "class": "d-text-sm" }, title));
+    function drawCol(layer, x, title, rows, hl, mark) {
+      layer.appendChild(C.svgEl("text", { x: x + 46, y: 14, "text-anchor": "middle", "class": "d-text-sm" }, title));
       for (var i = 0; i < rows.length; i++) {
         var y = 22 + i * 30;
-        svg.appendChild(C.svgEl("rect", { x: x, y: y, width: 92, height: 26, rx: 4,
+        layer.appendChild(C.svgEl("rect", { x: x, y: y, width: 92, height: 26, rx: 4,
           "class": (hl === i ? "d-box-hl" : "d-box") }));
-        svg.appendChild(C.svgEl("text", { x: x + 46, y: y + 17, "text-anchor": "middle", "class": "d-mono-sm" },
+        layer.appendChild(C.svgEl("text", { x: x + 46, y: y + 17, "text-anchor": "middle", "class": "d-mono-sm" },
           rows[i].id + " k=" + rows[i].k + " " + rows[i].v));
         if (mark === i) {
-          svg.appendChild(C.svgEl("text", { x: x - 4, y: y + 17, "text-anchor": "end", "class": "d-text-sm" }, "mark ▸"));
+          layer.appendChild(C.svgEl("text", { x: x - 4, y: y + 17, "text-anchor": "end", "class": "d-text-sm" }, "mark ▸"));
         }
       }
     }
 
     function drawPanel(cfg, t) {
-      var svg = cfg.svg;
-      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      var layer = cfg.layer;
+      while (layer.firstChild) layer.removeChild(layer.firstChild);
       var len = cfg.steps.length;
       var state = (t === 0) ? INIT : cfg.steps[Math.min(t, len) - 1];
       var done = t >= len;
 
-      drawCol(svg, 8, cfg.leftTitle, cfg.leftRows, state.r, null);
-      drawCol(svg, 204, cfg.rightTitle, cfg.rightRows, state.s, state.mark);
+      drawCol(layer, 8, cfg.leftTitle, cfg.leftRows, state.r, null);
+      drawCol(layer, 204, cfg.rightTitle, cfg.rightRows, state.s, state.mark);
 
       if (cfg.kind === "hash") {
-        svg.appendChild(C.svgEl("text", { x: 152, y: 14, "text-anchor": "middle", "class": "d-text-sm" }, "buckets"));
+        layer.appendChild(C.svgEl("text", { x: 152, y: 14, "text-anchor": "middle", "class": "d-text-sm" }, "buckets"));
         var bks = state.buckets || EMPTY_BUCKETS;
         for (var b = 0; b < NBUCKETS; b++) {
           var by = 22 + b * 40;
-          svg.appendChild(C.svgEl("rect", { x: 108, y: by, width: 88, height: 34, rx: 4,
+          layer.appendChild(C.svgEl("rect", { x: 108, y: by, width: 88, height: 34, rx: 4,
             "class": (state.bucketHl === b ? "d-box-hl" : "d-box") }));
-          svg.appendChild(C.svgEl("text", { x: 152, y: by + 14, "text-anchor": "middle", "class": "d-mono-sm" }, "b" + b));
+          layer.appendChild(C.svgEl("text", { x: 152, y: by + 14, "text-anchor": "middle", "class": "d-mono-sm" }, "b" + b));
           var keys = bks[b].map(function (sj) { return S[sj].k; }).join(" ");
-          svg.appendChild(C.svgEl("text", { x: 152, y: by + 28, "text-anchor": "middle", "class": "d-mono-sm" },
+          layer.appendChild(C.svgEl("text", { x: 152, y: by + 28, "text-anchor": "middle", "class": "d-mono-sm" },
             keys === "" ? "—" : keys));
         }
       } else {
-        svg.appendChild(C.svgEl("text", { x: 152, y: 80, "text-anchor": "middle", "class": "d-text" }, "⋈"));
+        layer.appendChild(C.svgEl("text", { x: 152, y: 80, "text-anchor": "middle", "class": "d-text" }, "⋈"));
         if (cfg.kind === "nlj" && state.r !== null) {
-          svg.appendChild(C.svgEl("text", { x: 152, y: 102, "text-anchor": "middle", "class": "d-text-sm" },
+          layer.appendChild(C.svgEl("text", { x: 152, y: 102, "text-anchor": "middle", "class": "d-text-sm" },
             "S scan " + (state.r + 1) + "/4"));
         }
       }
 
-      svg.appendChild(C.svgEl("text", { x: 8, y: 162, "class": "d-text-sm" }, "output (k: r⋈s):"));
-      for (var o = 0; o < state.outs.length; o++) {
-        var last = o === state.outs.length - 1;
-        svg.appendChild(C.svgEl("text", { x: 14, y: 177 + o * 13,
-          "class": (last && state.emitNew && !done ? "d-mono" : "d-mono-sm") }, state.outs[o]));
-      }
-      svg.appendChild(C.svgEl("text", { x: 8, y: 248, "class": "d-text-sm" },
-        "comparisons: " + state.cmp + " · rows out: " + state.outs.length));
-
+      layer.appendChild(C.svgEl("text", { x: 8, y: 162, "class": "d-text-sm" }, "output (k: r⋈s):"));
       if (done) {
-        svg.appendChild(C.svgEl("rect", { x: 156, y: 232, width: 138, height: 20, rx: 10, "class": "d-box-good" }));
-        svg.appendChild(C.svgEl("text", { x: 225, y: 246, "text-anchor": "middle", "class": "d-text-sm" },
+        layer.appendChild(C.svgEl("rect", { x: 154, y: 150, width: 138, height: 20, rx: 10, "class": "d-box-good" }));
+        layer.appendChild(C.svgEl("text", { x: 223, y: 164, "text-anchor": "middle", "class": "d-text-sm" },
           "done: " + len + " work units"));
       }
+      var newStart = state.outs.length - (state.emitCount || 0);
+      for (var o = 0; o < state.outs.length; o++) {
+        var isNew = state.emitCount > 0 && o >= newStart;
+        layer.appendChild(C.svgEl("text", { x: 14, y: 177 + o * 13,
+          "class": isNew ? "d-mono" : "d-mono-sm" }, state.outs[o]));
+      }
+      layer.appendChild(C.svgEl("text", { x: 8, y: 248, "class": "d-text-sm" },
+        "comparisons: " + state.cmp + " · rows out: " + state.outs.length));
 
-      cfg.noteEl.textContent = done
-        ? "finished after " + len + " units of work"
-        : (t === 0 ? "ready — press Next" : state.note);
+      cfg.noteEl.textContent = (t === 0)
+        ? "ready — press Next"
+        : (done ? state.note + " — finished after " + len + " work units" : state.note);
     }
 
     var raceHost = document.getElementById("jr-panels");
@@ -952,10 +998,12 @@ document.addEventListener("DOMContentLoaded", function () {
         var head = C.el("p", { style: "margin:0 0 0.2rem;font-weight:650;font-size:0.92rem;" }, cfg.name);
         var svg = C.svgEl("svg", { viewBox: "0 0 300 256", width: "300", height: "256", role: "img" });
         svg.appendChild(C.svgEl("title", null, cfg.name + " step-through of R join S"));
+        var layer = C.svgEl("g");
+        svg.appendChild(layer);
         var note = C.el("div", { "class": "muted", style: "font-size:0.82rem;min-height:2.4em;" }, "");
         box.appendChild(head); box.appendChild(svg); box.appendChild(note);
         raceHost.appendChild(box);
-        cfg.svg = svg; cfg.noteEl = note;
+        cfg.svg = svg; cfg.layer = layer; cfg.noteEl = note;
       });
 
       var TOTAL = 1 + Math.max(nljSteps.length, mergeSteps.length, hashSteps.length); /* 17 */
@@ -1021,54 +1069,57 @@ document.addEventListener("DOMContentLoaded", function () {
     var esCanvas = document.getElementById("es-canvas");
     var esCtl = document.getElementById("es-ctl");
     if (esCanvas && esCtl) {
-      var esSvg = C.svgEl("svg", { viewBox: "0 0 940 330", role: "img" });
+      var esSvg = C.svgEl("svg", { viewBox: "0 0 940 392", role: "img" });
       esSvg.appendChild(C.svgEl("title", null, "External merge sort of 8 pages with 3 buffers: run generation then two merge passes"));
+      var esLayer = C.svgEl("g");
+      esSvg.appendChild(esLayer);
       esCanvas.appendChild(esSvg);
       var ioEl = document.getElementById("es-io");
       var passEl = document.getElementById("es-pass");
 
       function esRender(t) {
         var st = esSteps[t];
-        while (esSvg.firstChild) esSvg.removeChild(esSvg.firstChild);
+        while (esLayer.firstChild) esLayer.removeChild(esLayer.firstChild);
 
         /* input pages */
-        esSvg.appendChild(C.svgEl("text", { x: 10, y: 16, "class": "d-text-sm" }, "disk: input (N = 8 pages, unsorted)"));
+        esLayer.appendChild(C.svgEl("text", { x: 10, y: 16, "class": "d-text-sm" }, "disk: input (N = 8 pages, unsorted)"));
         for (var i = 0; i < esPages.length; i++) {
-          esPageBox(esSvg, 10 + i * 64, 22, esPages[i], (st.hlIn && st.hlIn.indexOf(i) >= 0) ? "d-box-hl" : "d-box");
+          esPageBox(esLayer, 10 + i * 64, 24, esPages[i], (st.hlIn && st.hlIn.indexOf(i) >= 0) ? "d-box-hl" : "d-box");
         }
 
         /* buffers */
-        esSvg.appendChild(C.svgEl("text", { x: 10, y: 84, "class": "d-text-sm" }, "memory: B = 3 buffer pages"));
+        esLayer.appendChild(C.svgEl("text", { x: 10, y: 84, "class": "d-text-sm" }, "memory: B = 3 buffer pages"));
         for (var b = 0; b < 3; b++) {
           var bx = 10 + b * 160;
-          esSvg.appendChild(C.svgEl("rect", { x: bx, y: 90, width: 150, height: 32, rx: 5,
-            "class": st.buf[b] ? "d-box-warn" : "d-box" }));
-          esSvg.appendChild(C.svgEl("text", { x: bx + 75, y: 110, "text-anchor": "middle", "class": "d-mono-sm" },
+          var activeBuf = Boolean(st.buf[b] && st.buf[b] !== "—");
+          esLayer.appendChild(C.svgEl("rect", { x: bx, y: 92, width: 150, height: 32, rx: 5,
+            "class": activeBuf ? "d-box-warn" : "d-box" }));
+          esLayer.appendChild(C.svgEl("text", { x: bx + 75, y: 112, "text-anchor": "middle", "class": "d-mono-sm" },
             st.buf[b] || "empty"));
         }
 
-        /* pass 0 runs */
+        /* pass 0 runs (18px gap from header y=154 to run label y=172) */
         function hlR(name) { return st.newRun === name || (st.hlRuns && st.hlRuns.indexOf(name) >= 0); }
         if (st.have.A || st.have.B || st.have.C) {
-          esSvg.appendChild(C.svgEl("text", { x: 10, y: 148, "class": "d-text-sm" }, "after pass 0: ⌈8/3⌉ = 3 sorted runs"));
+          esLayer.appendChild(C.svgEl("text", { x: 10, y: 154, "class": "d-text-sm" }, "after pass 0: ⌈8/3⌉ = 3 sorted runs"));
           var x0 = 10;
-          if (st.have.A) x0 = esRun(esSvg, x0, 160, "run A", runA, st.newRun === "A" ? "d-box-good" : "d-box", hlR("A") && st.newRun !== "A") + 28;
-          if (st.have.B) x0 = esRun(esSvg, x0, 160, "run B", runB, st.newRun === "B" ? "d-box-good" : "d-box", hlR("B") && st.newRun !== "B") + 28;
-          if (st.have.C) x0 = esRun(esSvg, x0, 160, "run C", runC, st.newRun === "C" ? "d-box-good" : "d-box", hlR("C") && st.newRun !== "C");
+          if (st.have.A) x0 = esRun(esLayer, x0, 178, "run A", runA, st.newRun === "A" ? "d-box-good" : "d-box", hlR("A") && st.newRun !== "A") + 28;
+          if (st.have.B) x0 = esRun(esLayer, x0, 178, "run B", runB, st.newRun === "B" ? "d-box-good" : "d-box", hlR("B") && st.newRun !== "B") + 28;
+          if (st.have.C) x0 = esRun(esLayer, x0, 178, "run C", runC, st.newRun === "C" ? "d-box-good" : "d-box", hlR("C") && st.newRun !== "C");
         }
 
-        /* pass 1 */
+        /* pass 1 (18px gap from header y=238 to run label y=256) */
         if (st.have.D || st.have.C2) {
-          esSvg.appendChild(C.svgEl("text", { x: 10, y: 216, "class": "d-text-sm" }, "after pass 1: ⌈3/2⌉ = 2 runs"));
+          esLayer.appendChild(C.svgEl("text", { x: 10, y: 238, "class": "d-text-sm" }, "after pass 1: ⌈3/2⌉ = 2 runs"));
           var x1 = 10;
-          if (st.have.D) x1 = esRun(esSvg, x1, 228, "run D = A + B", runD, st.newRun === "D" ? "d-box-good" : "d-box", hlR("D") && st.newRun !== "D") + 28;
-          if (st.have.C2) x1 = esRun(esSvg, x1, 228, "run C (carried)", runC, st.newRun === "C2" ? "d-box-good" : "d-box", hlR("C2") && st.newRun !== "C2");
+          if (st.have.D) x1 = esRun(esLayer, x1, 262, "run D = A + B", runD, st.newRun === "D" ? "d-box-good" : "d-box", hlR("D") && st.newRun !== "D") + 28;
+          if (st.have.C2) x1 = esRun(esLayer, x1, 262, "run C (carried)", runC, st.newRun === "C2" ? "d-box-good" : "d-box", hlR("C2") && st.newRun !== "C2");
         }
 
-        /* pass 2 */
+        /* pass 2 (18px gap from header y=322 to run label y=340) */
         if (st.have.F) {
-          esSvg.appendChild(C.svgEl("text", { x: 10, y: 284, "class": "d-text-sm" }, "after pass 2: 1 sorted run — done"));
-          esRun(esSvg, 10, 296, "final", runF, "d-box-good", false);
+          esLayer.appendChild(C.svgEl("text", { x: 10, y: 322, "class": "d-text-sm" }, "after pass 2: 1 sorted run — done"));
+          esRun(esLayer, 10, 346, "final", runF, "d-box-good", false);
         }
 
         if (ioEl) ioEl.textContent = String(st.io);

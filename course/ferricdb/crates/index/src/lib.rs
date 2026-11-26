@@ -1,17 +1,35 @@
 //! # ferricdb-index — disk-resident B+Tree (Milestone 5)
 //!
 //! In this crate you build FerricDB's ordered index: a **B+Tree** that maps
-//! a single-column key ([`Value`]) to a tuple address ([`RecordId`]), with
-//! every tree node stored in exactly one 8 KB page reached through the
-//! [`PageStore`] abstraction (the buffer pool in practice, Milestone 2).
+//! a single-column key ([`Value`]) to one or more tuple addresses
+//! ([`RecordId`]), with every tree node stored in exactly one 8 KB page
+//! reached through the [`PageStore`] abstraction (the buffer pool in
+//! practice, Milestone 2).
+//!
+//! # Composite `(key, rid)` entries — PostgreSQL style
+//!
+//! Real relational databases must support both non-unique secondary indexes
+//! *and* MVCC updates (Milestone 8), where two live versions of the same row
+//! temporarily share an indexed key while pointing at different `RecordId`s.
+//! Following PostgreSQL (v12+ heap-TID tie-breaking), FerricDB's B+Tree
+//! orders every entry by the **composite pair `(key, rid)`**:
+//!
+//! * Multiple distinct `RecordId`s may be stored under the same `key`.
+//! * Inserting the exact same `(key, rid)` pair twice is rejected with
+//!   [`Error::Execution`](ferricdb_common::Error::Execution).
+//! * [`BPlusTree::get`] returns all matching `RecordId`s in ascending
+//!   `RecordId` order (`Vec<RecordId>`).
+//! * [`BPlusTree::delete`] deletes a specific `(key, rid)` pair so MVCC
+//!   `VACUUM` can remove a dead tuple version without disturbing a newer
+//!   version that shares the same key.
 //!
 //! What you implement here (all of it in **Milestone 5**):
 //!
 //! - **Node layout**: leaf and internal node formats inside a
 //!   `ferricdb_storage::Page`. Remember the first 16 bytes of every page are
-//!   reserved (pageLSN + page type tag + reserved) — use the type tag to
-//!   distinguish leaf from internal nodes. The rest of the layout (header
-//!   fields, key/value packing, sibling links) is yours to design.
+//!   reserved (`pageLSN` + `page_type` + `reserved`) — use
+//!   `PAGE_TYPE_BTREE_LEAF` (2) and `PAGE_TYPE_BTREE_INTERNAL` (3) to
+//!   distinguish leaf from internal nodes.
 //! - **Point operations**: [`BPlusTree::insert`] (with node splits all the
 //!   way up to a root split), [`BPlusTree::get`], and [`BPlusTree::delete`]
 //!   (lazy deletion — removing the entry from its leaf without rebalancing —
@@ -37,20 +55,22 @@ use std::sync::Arc;
 use ferricdb_common::{DataType, PageId, RecordId, Result, Value};
 use ferricdb_storage::PageStore;
 
-/// Disk-resident B+Tree mapping a single-column key to [`RecordId`]s.
-/// One node = one page. Keys are [`Value`]s of one [`DataType`].
+/// Disk-resident B+Tree mapping a single-column key to [`RecordId`]s,
+/// ordered by composite `(key, rid)`. One node = one page.
 ///
 /// # Key contract
 ///
-/// - Keys are **unique**: FerricDB indexes are single-column unique
-///   indexes. See [`BPlusTree::insert`] for the duplicate-key behavior.
-/// - Keys are **non-NULL** values of the tree's declared key type. Callers
-///   (the Milestone 5 executor code) guarantee this; if handed
-///   [`Value::Null`] or a mismatched type, methods return
-///   [`Error::Execution`](ferricdb_common::Error::Execution) rather than
-///   panicking.
-/// - Key ordering is [`Value::sql_cmp`] restricted to one non-NULL type,
-///   which is a total order.
+/// - Entries are unique on **`(key, rid)`**, allowing duplicate `key` values
+///   with distinct `RecordId`s (required for non-unique secondary indexes
+///   and Milestone 8 MVCC out-of-place updates).
+/// - Keys must be **non-NULL**, **non-NaN** (for `DataType::Float`), and
+///   match the tree's declared [`DataType`]. If handed [`Value::Null`],
+///   `Value::Float(f)` where `f.is_nan()`, or a mismatched type, methods
+///   return [`Error::Execution`](ferricdb_common::Error::Execution) rather
+///   than panicking.
+/// - With `Null` and `NaN` rejected, [`Value::sql_cmp`] is a strict total
+///   order on keys, and `(key, rid)` is a strict total order on entries
+///   (`RecordId` implements `Ord`).
 ///
 /// # Persistence
 ///
@@ -71,7 +91,8 @@ pub struct BPlusTree {
 
 impl BPlusTree {
     /// Creates a new, empty B+Tree: allocates one page from `store`,
-    /// formats it as an empty leaf, and makes it the root.
+    /// formats it as an empty leaf (`PAGE_TYPE_BTREE_LEAF`), and makes it
+    /// the root.
     ///
     /// Implemented in Milestone 5.
     pub fn create(store: Arc<dyn PageStore>, key_type: DataType) -> Result<Self> {
@@ -81,10 +102,12 @@ impl BPlusTree {
     /// Reattaches an existing B+Tree whose root node lives at page `root`
     /// (as recorded in the catalog). Performs no I/O by itself; the root is
     /// read lazily on first use.
-    ///
-    /// Implemented in Milestone 5.
     pub fn open(store: Arc<dyn PageStore>, root: PageId, key_type: DataType) -> Self {
-        todo!("Milestone 5")
+        BPlusTree {
+            store,
+            root,
+            key_type,
+        }
     }
 
     /// Page id of the current root node.
@@ -92,61 +115,57 @@ impl BPlusTree {
     /// This is the tree's persistent identity: store it (via the catalog)
     /// and pass it back to [`BPlusTree::open`] to reattach the tree later.
     /// It changes whenever [`BPlusTree::insert`] splits the root.
-    ///
-    /// Implemented in Milestone 5.
     pub fn root_page(&self) -> PageId {
-        todo!("Milestone 5")
+        self.root
     }
 
-    /// Inserts `key → rid`, splitting leaves/internal nodes (and possibly
+    /// Inserts `(key, rid)`, splitting leaves/internal nodes (and possibly
     /// the root) as needed to make room.
     ///
-    /// # Duplicate keys
+    /// # Duplicate entries & invalid keys
     ///
-    /// FerricDB indexes are single-column **unique** indexes: inserting a
-    /// key that is already present does **not** overwrite the stored
-    /// [`RecordId`]. It returns
-    /// `Err(`[`Error::Execution`](ferricdb_common::Error::Execution)`)`
-    /// (the message should name the duplicate key) and leaves the tree
-    /// unchanged — the previously stored mapping still wins. The provided
-    /// `ms5_duplicate_key_insert_errors` test pins this contract.
+    /// - Inserting the same `key` with a **different** `rid` succeeds (both
+    ///   entries live in ascending `(key, rid)` order).
+    /// - Inserting an exact `(key, rid)` pair that is already present returns
+    ///   `Err(`[`Error::Execution`](ferricdb_common::Error::Execution)`)`
+    ///   and leaves the tree unchanged.
+    /// - Passing `Value::Null`, `Value::Float(NaN)`, or a `Value` whose
+    ///   type does not match `key_type` returns `Err(Error::Execution)`.
     ///
     /// Implemented in Milestone 5.
     pub fn insert(&mut self, key: &Value, rid: RecordId) -> Result<()> {
         todo!("Milestone 5")
     }
 
-    /// Point lookup: the [`RecordId`] stored under `key`, or `Ok(None)` if
-    /// the key is not present.
+    /// Point lookup: all [`RecordId`]s stored under `key`, in ascending
+    /// `RecordId` order (empty `Vec` if `key` is not present).
     ///
     /// Implemented in Milestone 5.
-    pub fn get(&self, key: &Value) -> Result<Option<RecordId>> {
+    pub fn get(&self, key: &Value) -> Result<Vec<RecordId>> {
         todo!("Milestone 5")
     }
 
-    /// Removes `key` from the tree. Returns `Ok(true)` if the key was
-    /// present (and is now gone), `Ok(false)` if it was not present.
+    /// Removes the exact `(key, rid)` entry from the tree. Returns
+    /// `Ok(true)` if the entry was present (and is now gone), `Ok(false)`
+    /// if it was not present.
     ///
     /// Lazy deletion is acceptable: remove the entry from its leaf without
-    /// merging or redistributing underfull nodes. After a successful
-    /// delete, [`BPlusTree::get`] for that key returns `Ok(None)` and range
-    /// scans skip it; a subsequent [`BPlusTree::insert`] of the same key
-    /// succeeds again.
+    /// merging or redistributing underfull nodes.
     ///
     /// Implemented in Milestone 5.
-    pub fn delete(&mut self, key: &Value) -> Result<bool> {
+    pub fn delete(&mut self, key: &Value, rid: RecordId) -> Result<bool> {
         todo!("Milestone 5")
     }
 
-    /// Ordered scan of every `(key, rid)` pair between `lower` and `upper`
-    /// per the given [`Bound`]s (any combination of `Included` / `Excluded` /
-    /// `Unbounded` on either side).
+    /// Ordered scan of every `(key, rid)` pair whose `key` falls between
+    /// `lower` and `upper` per the given [`Bound`]s (any combination of
+    /// `Included` / `Excluded` / `Unbounded` on either side).
     ///
     /// Descends once to the first qualifying leaf, then the returned
     /// [`RangeIter`] walks the leaf sibling chain, yielding pairs in
-    /// ascending key order and stopping as soon as a key exceeds `upper`.
-    /// An empty or inverted range (e.g. `lower > upper`) yields no items —
-    /// it is not an error.
+    /// ascending `(key, rid)` order and stopping as soon as a key exceeds
+    /// `upper`. An empty or inverted range (e.g. `lower > upper`) yields no
+    /// items — it is not an error.
     ///
     /// Implemented in Milestone 5.
     pub fn range(&self, lower: Bound<Value>, upper: Bound<Value>) -> Result<RangeIter> {
@@ -154,16 +173,16 @@ impl BPlusTree {
     }
 
     /// Test hook: verifies the structural invariants of the tree and
-    /// returns `Err` (any variant; `Error::Execution` with a descriptive
-    /// message is conventional) on the first violation found.
+    /// returns `Err` (`Error::Execution` with a descriptive message) on the
+    /// first violation found.
     ///
     /// Check at least:
     ///
-    /// - **Sortedness**: keys strictly ascending within every node, and
-    ///   across the whole leaf chain (no duplicates anywhere).
+    /// - **Sortedness**: `(key, rid)` pairs strictly ascending within every
+    ///   node, and across the whole leaf chain (no duplicate `(key, rid)`).
     /// - **Balance**: every leaf is at the same depth.
-    /// - **Key ranges**: each child's keys fall within the bounds implied
-    ///   by the separator keys of its parent.
+    /// - **Key ranges**: each child's `(key, rid)` entries fall within the
+    ///   bounds implied by the separator entries of its parent.
     /// - **Leaf chain**: following sibling links visits exactly the leaves
     ///   reachable from the root, in order.
     ///
@@ -179,7 +198,7 @@ impl BPlusTree {
 
 /// Ordered iterator over `(key, rid)` pairs produced by
 /// [`BPlusTree::range`]. Walks the leaf sibling chain; yields items in
-/// ascending key order and ends once the upper bound is passed.
+/// ascending `(key, rid)` order and ends once the upper bound is passed.
 ///
 /// Page-read failures surface as `Some(Err(_))`; after the first error the
 /// iterator should fuse (keep returning `None`).
@@ -203,8 +222,9 @@ pub struct RangeIter {
 impl Iterator for RangeIter {
     type Item = Result<(Value, RecordId)>;
 
-    /// Yields the next `(key, rid)` pair in ascending key order, stepping
-    /// to the next sibling leaf when the current one is exhausted.
+    /// Yields the next `(key, rid)` pair in ascending `(key, rid)` order,
+    /// stepping to the next sibling leaf when the current one is exhausted
+    /// (skipping over any empty leaves produced by lazy deletion).
     ///
     /// Implemented in Milestone 5.
     fn next(&mut self) -> Option<Self::Item> {

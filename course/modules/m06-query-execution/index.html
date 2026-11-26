@@ -103,8 +103,13 @@ let mut exec = planner.create_executor(&amp;plan)?; // LogicalPlan -&gt; Box&lt;
   (<a href="../m08-query-optimization/index.html">M08</a>).</p>
 
   <figure>
-    <svg viewBox="0 0 940 400" role="img">
+    <svg viewBox="0 0 940 426" role="img">
       <title>One logical plan on the left and two candidate physical plans on the right for the same SQL query.</title>
+      <defs>
+        <marker id="m06-f1-arr-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
       <!-- panel headers -->
       <text x="160" y="26" text-anchor="middle" class="d-text" font-weight="650">Logical plan — what</text>
       <text x="475" y="26" text-anchor="middle" class="d-text" font-weight="650">Physical plan A — how</text>
@@ -153,10 +158,10 @@ let mut exec = planner.create_executor(&amp;plan)?; // LogicalPlan -&gt; Box&lt;
       <line x1="790" y1="152" x2="790" y2="180" class="d-line"/>
       <text x="790" y="290" text-anchor="middle" class="d-text-sm">index order makes the Sort node</text>
       <text x="790" y="308" text-anchor="middle" class="d-text-sm">unnecessary; B+Tree arrives in MS5</text>
-      <!-- chooser arrows -->
-      <line x1="270" y1="200" x2="365" y2="200" class="d-line-hl"/>
-      <line x1="270" y1="200" x2="680" y2="380" class="d-line-hl"/>
-      <text x="330" y="388" class="d-text-sm">the planner picks the cheaper realization (M08)</text>
+      <!-- chooser arrows routed cleanly around Plan A -->
+      <path d="M 260 200 H 375" class="d-line-hl" marker-end="url(#m06-f1-arr-hl)"/>
+      <path d="M 310 200 V 380 H 635 V 208 H 690" class="d-line-hl" marker-end="url(#m06-f1-arr-hl)"/>
+      <text x="475" y="408" text-anchor="middle" class="d-text-sm">the planner picks the cheaper realization (M08)</text>
     </svg>
     <figcaption>Figure 1 — one logical plan, two candidate physical plans for
     <code>SELECT name, balance FROM accounts WHERE balance &gt;= 100 ORDER BY balance LIMIT 2</code>.
@@ -174,9 +179,9 @@ let mut exec = planner.create_executor(&amp;plan)?; // LogicalPlan -&gt; Box&lt;
   <code>plan::LogicalPlan</code> enum is the same shape:</p>
 
   <pre><code>pub enum LogicalPlan {
-    SeqScan    { table: TableInfo, filter: Option&lt;BoundExpr&gt; },
+    SeqScan    { table_idx: usize, table: TableInfo, filter: Option&lt;BoundExpr&gt; },
     Filter     { input: Box&lt;LogicalPlan&gt;, predicate: BoundExpr },
-    Projection { input: Box&lt;LogicalPlan&gt;, exprs: Vec&lt;BoundExpr&gt; },
+    Projection { input: Box&lt;LogicalPlan&gt;, exprs: Vec&lt;BoundExpr&gt;, schema: Schema },
     Sort       { input: Box&lt;LogicalPlan&gt;, keys: Vec&lt;(BoundExpr, bool)&gt; },
     Limit      { input: Box&lt;LogicalPlan&gt;, limit: u64 },
     Values     { rows: Vec&lt;Vec&lt;BoundExpr&gt;&gt;, schema: Schema },
@@ -252,18 +257,26 @@ let mut exec = planner.create_executor(&amp;plan)?; // LogicalPlan -&gt; Box&lt;
   aggregation.<sup class="cite"><a href="#ref-1">1</a></sup> FerricDB's version is the trait you will
   implement nine times in Milestone 4:</p>
 
-  <pre><code>/// Volcano iterator contract. next() returns Ok(None) at end of stream.
+  <pre><code>/// One row flowing between Volcano operators, carrying an optional RecordId
+/// from base scans/filters so Update and Delete compose cleanly.
+pub struct ExecRow { pub values: Vec&lt;Value&gt;, pub rid: Option&lt;RecordId&gt; }
+
+/// Volcano iterator contract. next() returns Ok(None) at end of stream.
 pub trait Executor {
     fn schema(&amp;self) -&gt; &amp;Schema;
     fn open(&amp;mut self) -&gt; Result&lt;()&gt;;
-    fn next(&amp;mut self) -&gt; Result&lt;Option&lt;Vec&lt;Value&gt;&gt;&gt;;
+    fn next(&amp;mut self) -&gt; Result&lt;Option&lt;ExecRow&gt;&gt;;
     fn close(&amp;mut self) -&gt; Result&lt;()&gt;;
 }</code></pre>
 
   <p>(Naming is cosmetic and varies by system: the survey writes <code>init/get_next/close</code>,<sup class="cite"><a href="#ref-1">1</a></sup>
-  BusTub writes <code>Init/Next</code>,<sup class="cite"><a href="#ref-2">2</a></sup> toyDB reuses
-  Rust's own <code>Iterator::next</code>.<sup class="cite"><a href="#ref-4">4</a></sup> FerricDB's
-  <code>open/next/close</code> is a course choice.) The lifecycle:</p>
+  BusTub writes <code>Init/Next</code> and returns each tuple alongside its RID,<sup class="cite"><a href="#ref-2">2</a></sup>
+  toyDB reuses Rust's own <code>Iterator::next</code>.<sup class="cite"><a href="#ref-4">4</a></sup>
+  FerricDB's <code>open/next/close</code> returning <code>ExecRow { values, rid }</code> is a course
+  choice: base scans attach <code>rid: Some(rid)</code> and <code>Filter</code> forwards it
+  unchanged so <code>Update</code> and <code>Delete</code> know which slot to modify, while
+  operators that synthesize rows — <code>Projection</code>, <code>Values</code>, joins,
+  <code>Aggregate</code> — set <code>rid: None</code>.) The lifecycle:</p>
 
   <ul>
     <li><strong>open()</strong> — acquire resources and initialize state: look up the table's first
@@ -279,6 +292,14 @@ pub trait Executor {
   <figure>
     <svg viewBox="0 0 940 330" role="img">
       <title>Three-phase lifecycle of an iterator plan: open cascades down, next pulls rows up repeatedly, close cascades down.</title>
+      <defs>
+        <marker id="m06-f2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+        <marker id="m06-f2-arr-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+        </marker>
+      </defs>
       <!-- phase 1: open -->
       <text x="160" y="28" text-anchor="middle" class="d-text" font-weight="650">1 · open()</text>
       <rect x="80" y="48" width="160" height="38" rx="8" class="d-box"/>
@@ -287,8 +308,8 @@ pub trait Executor {
       <text x="160" y="152" text-anchor="middle" class="d-mono">Filter</text>
       <rect x="80" y="208" width="160" height="38" rx="8" class="d-box"/>
       <text x="160" y="232" text-anchor="middle" class="d-mono">SeqScan</text>
-      <line x1="140" y1="86" x2="140" y2="128" class="d-line-hl"/>
-      <line x1="140" y1="166" x2="140" y2="208" class="d-line-hl"/>
+      <line x1="140" y1="86" x2="140" y2="128" class="d-line-hl" marker-end="url(#m06-f2-arr-hl)"/>
+      <line x1="140" y1="166" x2="140" y2="208" class="d-line-hl" marker-end="url(#m06-f2-arr-hl)"/>
       <text x="150" y="111" class="d-mono-sm">open()</text>
       <text x="150" y="191" class="d-mono-sm">open()</text>
       <text x="160" y="286" text-anchor="middle" class="d-text-sm">allocate state, pin nothing yet;</text>
@@ -301,10 +322,10 @@ pub trait Executor {
       <text x="475" y="152" text-anchor="middle" class="d-mono">Filter</text>
       <rect x="395" y="208" width="160" height="38" rx="8" class="d-box-hl"/>
       <text x="475" y="232" text-anchor="middle" class="d-mono">SeqScan</text>
-      <line x1="440" y1="86" x2="440" y2="128" class="d-line-hl"/>
-      <line x1="440" y1="166" x2="440" y2="208" class="d-line-hl"/>
-      <line x1="510" y1="128" x2="510" y2="86" class="d-line-hl"/>
-      <line x1="510" y1="208" x2="510" y2="166" class="d-line-hl"/>
+      <line x1="440" y1="86" x2="440" y2="128" class="d-line-hl" marker-end="url(#m06-f2-arr-hl)"/>
+      <line x1="440" y1="166" x2="440" y2="208" class="d-line-hl" marker-end="url(#m06-f2-arr-hl)"/>
+      <line x1="510" y1="128" x2="510" y2="86" class="d-line-hl" marker-end="url(#m06-f2-arr-hl)"/>
+      <line x1="510" y1="208" x2="510" y2="166" class="d-line-hl" marker-end="url(#m06-f2-arr-hl)"/>
       <text x="380" y="111" text-anchor="end" class="d-mono-sm">next() ↓</text>
       <text x="380" y="191" text-anchor="end" class="d-mono-sm">next() ↓</text>
       <text x="522" y="111" class="d-mono-sm">↑ Some(row) | None</text>
@@ -319,8 +340,8 @@ pub trait Executor {
       <text x="790" y="152" text-anchor="middle" class="d-mono">Filter</text>
       <rect x="710" y="208" width="160" height="38" rx="8" class="d-box"/>
       <text x="790" y="232" text-anchor="middle" class="d-mono">SeqScan</text>
-      <line x1="770" y1="86" x2="770" y2="128" class="d-line"/>
-      <line x1="770" y1="166" x2="770" y2="208" class="d-line"/>
+      <line x1="770" y1="86" x2="770" y2="128" class="d-line" marker-end="url(#m06-f2-arr)"/>
+      <line x1="770" y1="166" x2="770" y2="208" class="d-line" marker-end="url(#m06-f2-arr)"/>
       <text x="780" y="111" class="d-mono-sm">close()</text>
       <text x="780" y="191" class="d-mono-sm">close()</text>
       <text x="790" y="286" text-anchor="middle" class="d-text-sm">free buffers, unpin pages, drop</text>
@@ -385,7 +406,8 @@ exec.close()?;</code></pre>
     M-tuples simplifies the executor and eliminates a classic bug — forgetting to unpin a page, a
     "buffer leak" — but the copies themselves can become the bottleneck, so high-performance engines
     support both.<sup class="cite"><a href="#ref-1">1</a></sup> FerricDB always copies: a row is an
-    owned <code>Vec&lt;Value&gt;</code>, decoded from the page inside SeqScan. That is a course
+    owned <code>ExecRow</code> holding <code>values: Vec&lt;Value&gt;</code> (plus an optional
+    <code>RecordId</code>), decoded from the page inside SeqScan. That is a course
     choice, trading memory bandwidth for never having a dangling page reference — the borrow checker
     would fight us on BP-tuples, and it would be right to.</p>
   </div>
@@ -499,8 +521,8 @@ Limit 2
   child completely on the first pull, sort the buffered rows, then stream them out one per call. The
   contract is preserved; only the latency profile changes. That means everything downstream of a Sort
   loses the time-to-first-row benefit, and a <code>LIMIT</code> above a Sort cannot save the scan —
-  though it can save comparisons, a trick (top-k via a bounded heap) you will meet in
-  <a href="../m07-joins-sorting-aggregation/index.html">M07</a>.</p>
+  though production engines can save comparisons via a bounded top-<em>k</em> heap instead of
+  sorting the entire stream.</p>
 
   <h3 id="sub-alternatives">Materialization and vectorization, surveyed</h3>
 
@@ -555,7 +577,7 @@ Limit 2
   <p>FerricDB stays tuple-at-a-time for the whole course. The reasoning is pedagogical: every
   operator's state machine is visible in a page of Rust, and correctness bugs surface as a single
   wrong row rather than a corrupted batch boundary. If you later want the vectorized flavor, the
-  refactor is mechanical — change <code>next()</code> to return <code>Vec&lt;Vec&lt;Value&gt;&gt;</code>
+  refactor is mechanical — change <code>next()</code> to return <code>Vec&lt;ExecRow&gt;</code>
   and teach each operator to loop.</p>
 
   <h2 id="sec-expressions">Evaluating expressions over tuples</h2>
@@ -665,21 +687,25 @@ Limit 2
 
   <p><strong>Limit</strong> keeps a counter; after emitting <code>limit</code> rows, it answers
   <code>None</code> forever <em>without touching its child</em> — the short-circuit you watched in the
-  stepper. If the child ends first, Limit simply passes the <code>None</code> through; a limit larger
+  stepper. If the child ends first, Limit passes the <code>None</code> straight through; a limit larger
   than the input has no effect.<sup class="cite"><a href="#ref-2">2</a></sup></p>
 
   <p><strong>Sort</strong> is Milestone 4's only blocking operator. On the first <code>next()</code>
   (or in <code>open()</code>, your choice — BusTub frames the same decision for its pipeline
   breakers<sup class="cite"><a href="#ref-2">2</a></sup>), drain the child into a
   <code>Vec</code>, sort with a comparator built from the plan's <code>(expression, descending)</code>
-  key list and <code>Value::sql_cmp</code>, then stream from the buffer. This is precisely toyDB's
+  key list and <code>Value::sql_cmp</code>, then stream from the buffer. Because
+  <code>Value::sql_cmp</code> returns <code>None</code> when either operand is <code>NULL</code>, your
+  comparator must impose a total order on <code>NULL</code>s: FerricDB's course convention is
+  <strong><code>NULLS LAST</code> for both <code>ASC</code> and <code>DESC</code></strong> (verified
+  by <code>ms4_order_by_limit_and_null_ordering</code>). Buffering in memory is precisely toyDB's
   approach — its Order node buffers everything in memory<sup class="cite"><a href="#ref-4">4</a></sup> —
   and it is a labeled course choice: real engines cannot assume the input fits, which is why
   PostgreSQL spills sorts to temp files beyond <code>work_mem</code><sup class="cite"><a href="#ref-5">5</a></sup>
   and CMU's project builds a two-way external merge sort with multi-column keys, ASC/DESC directions,
   and NULLS FIRST/LAST handling.<sup class="cite"><a href="#ref-2">2</a></sup> FerricDB defers
-  external sorting to Milestone 6 (<code>ExternalSorter</code>, with a fixed page budget); M06's sort
-  is allowed to be a <code>Vec</code> and a comparator.</p>
+  external sorting to Milestone 6 (<code>ExternalSorter</code>, with a fixed page budget);
+  Milestone 4's sort is allowed to be a <code>Vec</code> and a comparator.</p>
 
   <h3 id="sub-write-ops">Writing: Insert, Update, Delete</h3>
 
@@ -701,14 +727,17 @@ Limit 2
   <code>Vec&lt;Value&gt;</code> row does not say. BusTub solves this by having every executor's
   <code>Next</code> return record identifiers (RIDs) alongside tuples, so a Delete can address the
   exact slot its child produced.<sup class="cite"><a href="#ref-2">2</a></sup> FerricDB adopts the
-  same idea as a course convention: a scan feeding a DML operator threads each row's
-  <code>RecordId</code> (page id + slot — the analog of Postgres's <code>ctid</code>) along with the
-  row; Milestone 4's spec fixes the exact encoding. Deletion itself is a metadata write, not removal:
-  mark the tuple dead via its <code>TupleMeta</code>, exactly as BusTub sets <code>is_deleted_</code>
-  rather than physically removing the tuple.<sup class="cite"><a href="#ref-2">2</a></sup> Space
-  reclamation is a separate, later concern — and in
-  <a href="../m09-transactions-mvcc/index.html">M09</a> those same metadata bits grow into MVCC
-  version visibility.</p>
+  same idea via <code>ExecRow { values, rid }</code>: base scans populate
+  <code>rid: Some(RecordId)</code> (page id + slot — the analog of Postgres's <code>ctid</code>) and
+  <code>Filter</code> preserves it unchanged, so <code>Delete</code> and <code>Update</code> compose
+  cleanly over any scan/filter pipeline. Deletion itself is a logical mark, not immediate physical
+  compaction: in Milestone 4, <code>Delete</code> tombstones the slot's line pointer via
+  <code>HeapFile::delete(rid)</code> (analogous to BusTub setting <code>is_deleted_</code> on the
+  tuple header rather than removing bytes in place<sup class="cite"><a href="#ref-2">2</a></sup>),
+  while <code>TupleMeta</code> stays zeroed until
+  <a href="../m09-transactions-mvcc/index.html">M09</a> / Milestone 8 switches <code>DELETE</code>
+  to stamping <code>TupleMeta::xmax</code> for MVCC visibility and defers slot tombstoning plus
+  space reclamation to <code>VACUUM</code>.</p>
 
   <p><strong>Update</strong> is read-modify-write: pull a row and its RID, evaluate the SET
   expressions (each assignment in FerricDB's plan is a <code>(column-index, expression)</code> pair),
@@ -731,13 +760,18 @@ Limit 2
   <figure>
     <svg viewBox="0 0 820 430" role="img">
       <title>Two update plans: a pipelined index scan feeding Update, which is unsafe, and a batch read-then-write plan with RID materialization, which is safe.</title>
+      <defs>
+        <marker id="m06-f3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+      </defs>
       <text x="200" y="28" text-anchor="middle" class="d-text" font-weight="650">Pipelined — unsafe</text>
       <rect x="100" y="50" width="200" height="46" rx="8" class="d-box-bad"/>
       <text x="200" y="78" text-anchor="middle" class="d-mono">Update EMP</text>
       <rect x="100" y="140" width="200" height="56" rx="8" class="d-box"/>
       <text x="200" y="163" text-anchor="middle" class="d-mono">IndexScan EMP(salary)</text>
       <text x="200" y="183" text-anchor="middle" class="d-text-sm">salary &lt; 20000</text>
-      <line x1="200" y1="140" x2="200" y2="96" class="d-line"/>
+      <line x1="200" y1="140" x2="200" y2="96" class="d-line" marker-end="url(#m06-f3-arr)"/>
       <text x="200" y="240" text-anchor="middle" class="d-text-sm">updated tuples can move ahead of the</text>
       <text x="200" y="258" text-anchor="middle" class="d-text-sm">scan cursor and be raised repeatedly</text>
       <text x="620" y="28" text-anchor="middle" class="d-text" font-weight="650">Batch read-then-write — safe</text>
@@ -752,10 +786,10 @@ Limit 2
       <rect x="520" y="322" width="200" height="56" rx="8" class="d-box"/>
       <text x="620" y="345" text-anchor="middle" class="d-mono">IndexScan EMP(salary)</text>
       <text x="620" y="365" text-anchor="middle" class="d-text-sm">salary &lt; 20000</text>
-      <line x1="620" y1="118" x2="620" y2="92" class="d-line"/>
-      <line x1="620" y1="186" x2="620" y2="160" class="d-line"/>
-      <line x1="620" y1="254" x2="620" y2="228" class="d-line"/>
-      <line x1="620" y1="322" x2="620" y2="296" class="d-line"/>
+      <line x1="620" y1="118" x2="620" y2="92" class="d-line" marker-end="url(#m06-f3-arr)"/>
+      <line x1="620" y1="186" x2="620" y2="160" class="d-line" marker-end="url(#m06-f3-arr)"/>
+      <line x1="620" y1="254" x2="620" y2="228" class="d-line" marker-end="url(#m06-f3-arr)"/>
+      <line x1="620" y1="322" x2="620" y2="296" class="d-line" marker-end="url(#m06-f3-arr)"/>
       <text x="620" y="410" text-anchor="middle" class="d-text-sm">all victims are identified before the first write</text>
     </svg>
     <figcaption>Figure 3 — the Halloween problem and its batch fix, redrawn after the survey's
@@ -763,10 +797,19 @@ Limit 2
     tuple is modified, so the scan can never re-encounter its own writes.<sup class="cite"><a href="#ref-1">1</a></sup></figcaption>
   </figure>
 
-  <p>Milestone 4 sidesteps the trap — with no indexes yet, a SeqScan-fed Update cannot re-encounter a
-  moved tuple that way — but the moment MS5 gives your planner an IndexScan, this figure becomes a
-  correctness requirement, and FerricDB takes the survey's first fix: the planner never chooses an
-  index on a column the statement updates.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  <p>Do not assume a sequential scan is immune. In Milestone 4, <code>Update</code> tombstones the old
+  tuple and writes the new version via <code>HeapFile::insert</code>, which appends the replacement at
+  a higher slot on the same page or on an appended page at the tail of the heap chain. A live
+  <code>SeqScan</code> walking <code>(page_id, slot)</code> in ascending order can therefore encounter
+  its own newly inserted tuples later in the very same scan — even with zero indexes — and update
+  qualifying rows repeatedly (for example, <code>UPDATE n SET x = x + 1 WHERE x &lt; 100</code>
+  re-incrementing rows 95–98 all the way to 100). Milestone 4 therefore adopts Figure 3's batch fix:
+  <code>Update</code> drains its child completely first, materializing every matching
+  <code>(RecordId, new_values)</code> pair using the <code>rid</code> on each <code>ExecRow</code>
+  returned by <code>Executor::next</code>, closes the scan, and only then applies the deletes and
+  inserts — verified directly by the provided test <code>ms4_halloween_guard</code>. When Milestone 5
+  adds <code>IndexScan</code>, the same materialization step shields index-driven updates as
+  well.<sup class="cite"><a href="#ref-1">1</a></sup></p>
 
   <h2 id="sec-quiz">Check your understanding</h2>
 
@@ -814,7 +857,7 @@ Limit 2
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="Updating a tuple can move it — for example, re-inserting it further along the very index the scan is traversing. The scan then rediscovers the updated tuple and updates it again, violating the SQL rule that a statement must not see its own writes: every under-$20K employee gets raised repeatedly until they cross $20K. The fixes are to avoid index scans on the updated column, or to materialize all victim RIDs before writing anything.">
+  <fieldset class="quiz" data-explain="Updating a tuple can move it ahead of the scan cursor — either further along an index on the updated column, or onto a higher slot / appended heap page during a sequential scan when Update tombstones and re-inserts. The scan then rediscovers the updated tuple and updates it again, violating the SQL rule that a statement must not see its own writes. Materializing all matching (RecordId, new_values) entries before applying any writes prevents this for both heap scans and index scans.">
     <legend class="quiz-q">What goes wrong in the Halloween problem?</legend>
     <label><input type="radio" name="q5"> Two concurrent transactions update the same row and one update is lost</label>
     <label><input type="radio" name="q5"> The Update executor deadlocks with its own scan on a page latch</label>
@@ -857,13 +900,12 @@ Limit 2
     <h2 id="sec-deeper">Go deeper</h2>
     <ul>
       <li>The full toyDB architecture walkthrough — read the parser and optimizer chapters around the
-      two cited here to see the whole Rust pipeline end to end.
-      <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">link</a></li>
-      <li>PostgreSQL manual, “Using EXPLAIN” — practice reading real plan trees against the concepts
-      from this module. <a href="https://www.postgresql.org/docs/current/using-explain.html" rel="external">link</a></li>
-      <li><em>Readings in Database Systems</em> (5th ed.) — the query-optimization chapter
-      contextualizes where next-generation executors diverge from Volcano.
-      <a href="http://www.redbook.io/" rel="external">link</a></li>
+      two cited here to see the whole Rust pipeline end to end:
+      <a href="https://github.com/erikgrinaker/toydb/blob/main/docs/architecture/index.md" rel="external">toyDB Architecture Guide</a>.</li>
+      <li>Practice reading real plan trees against the concepts from this module:
+      <a href="https://www.postgresql.org/docs/current/using-explain.html" rel="external">PostgreSQL Manual — Using EXPLAIN</a>.</li>
+      <li>The query-optimization chapter contextualizes where next-generation executors diverge from
+      Volcano: <a href="http://www.redbook.io/" rel="external">Readings in Database Systems (5th ed.)</a>.</li>
     </ul>
 
     <h2 id="sec-milestone">Milestone link</h2>
@@ -884,10 +926,11 @@ Limit 2
    animates each root next() call. Vanilla JS, no globals. */
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
   (function () {
     var tree = document.getElementById("vx-tree");
     var tableEl = document.getElementById("vx-table");
-    if (!tree || !tableEl || !window.Course) return;
+    if (!tree || !tableEl) return;
 
     /* ---- fixed data: accounts(id, name, balance) ---- */
     var ROWS = [
@@ -933,7 +976,6 @@ document.addEventListener("DOMContentLoaded", function () {
       if (i !== 0) svg.appendChild(ctr);
       counterEls.push(ctr);
     }
-    var clientCtr = Course.svgEl("text", { x: MID_X, y: NODES[0].y + 28 + 22, "text-anchor": "middle", "class": "d-mono-sm" }, "");
     /* edge label: shows next()/tuple/None beside the active edge */
     var edgeLabel = Course.svgEl("text", { x: MID_X + 14, y: 0, "class": "d-mono-sm", visibility: "hidden" }, "");
     svg.appendChild(edgeLabel);
@@ -981,7 +1023,7 @@ document.addEventListener("DOMContentLoaded", function () {
       ev.push({ edge: 0, dir: "down", node: 1, elabel: "↓ next()", callInc: 1,
         log: "Client calls Limit.next()" });
       if (emitted >= LIMIT) {
-        ev.push({ edge: 0, dir: "up", node: 1, elabel: "↑ None", finish: true,
+        ev.push({ edge: 0, dir: "up", node: 0, elabel: "↑ None", finish: true,
           log: "Limit already emitted " + LIMIT + " rows — returns None WITHOUT calling Projection. Short-circuit: rows " + (scanPos + 1) + "–8 were never read." });
         return ev;
       }
@@ -1000,30 +1042,44 @@ document.addEventListener("DOMContentLoaded", function () {
           return ev;
         }
         var r = ROWS[scanPos], idx = scanPos;
+        var fullTuple = "(" + r[0] + ", " + r[1] + ", " + r[2] + ")";
+        var projTuple = "(" + r[1] + ", " + r[2] + ")";
         scanPos++;
         ev.push({ node: 4, readRow: idx,
-          log: "SeqScan reads heap row " + r[0] + ": (" + r[0] + ", " + r[1] + ", " + r[2] + ")" });
-        ev.push({ edge: 3, dir: "up", node: 3, elabel: "↑ (" + r[1] + ", " + r[2] + ")", rowInc: 4,
-          log: "SeqScan returns (" + r[0] + ", " + r[1] + ", " + r[2] + ") to Filter" });
+          log: "SeqScan reads heap row " + r[0] + ": " + fullTuple });
+        ev.push({ edge: 3, dir: "up", node: 3, elabel: "↑ " + fullTuple, rowInc: 4,
+          log: "SeqScan returns " + fullTuple + " to Filter" });
         if (r[2] >= 100) {
-          ev.push({ node: 3, log: "Filter: " + r[2] + " ≥ 100 is TRUE — pass the row up" });
-          ev.push({ edge: 2, dir: "up", node: 2, elabel: "↑ (" + r[1] + ", " + r[2] + ")", rowInc: 3,
-            log: "Filter returns the row to Projection" });
-          ev.push({ node: 2, log: "Projection evaluates [name, balance] → (" + r[1] + ", " + r[2] + ")" });
-          ev.push({ edge: 1, dir: "up", node: 1, elabel: "↑ (" + r[1] + ", " + r[2] + ")", rowInc: 2,
-            log: "Projection returns (" + r[1] + ", " + r[2] + ") to Limit" });
+          ev.push({ node: 3, settleRow: idx, settleLabel: "passed",
+            log: "Filter: " + r[2] + " ≥ 100 is TRUE — pass " + fullTuple + " up" });
+          ev.push({ edge: 2, dir: "up", node: 2, elabel: "↑ " + fullTuple, rowInc: 3,
+            log: "Filter returns " + fullTuple + " to Projection" });
+          ev.push({ node: 2, log: "Projection evaluates [name, balance] → " + projTuple });
+          ev.push({ edge: 1, dir: "up", node: 1, elabel: "↑ " + projTuple, rowInc: 2,
+            log: "Projection returns " + projTuple + " to Limit" });
           emitted++;
-          ev.push({ edge: 0, dir: "up", node: 0, elabel: "↑ (" + r[1] + ", " + r[2] + ")", rowInc: 1,
-            clientRow: "(" + r[1] + ", " + r[2] + ")",
-            log: "Limit (" + emitted + "/" + LIMIT + ") returns (" + r[1] + ", " + r[2] + ") to the client" });
+          ev.push({ edge: 0, dir: "up", node: 0, elabel: "↑ " + projTuple, rowInc: 1,
+            clientRow: projTuple,
+            log: "Limit (" + emitted + "/" + LIMIT + ") returns " + projTuple + " to the client" });
           return ev;
         }
-        ev.push({ node: 3, log: "Filter: " + r[2] + " ≥ 100 is FALSE — discard, ask SeqScan again" });
+        ev.push({ node: 3, settleRow: idx, settleLabel: "filtered out",
+          log: "Filter: " + r[2] + " ≥ 100 is FALSE — discard, ask SeqScan again" });
       }
     }
 
     /* ---- playback ---- */
     var results = [];
+    function clearReadingState() {
+      for (var j = 0; j < bodyRows.length; j++) {
+        if (bodyRows[j].cells[4].textContent === "reading…") {
+          bodyRows[j].cells[4].textContent = "read";
+          bodyRows[j].style.outline = "";
+          bodyRows[j].style.opacity = "0.6";
+        }
+      }
+    }
+
     function applyEvent(e) {
       var j;
       for (j = 0; j < edgeEls.length; j++) edgeEls[j].setAttribute("class", "d-line");
@@ -1043,16 +1099,15 @@ document.addEventListener("DOMContentLoaded", function () {
       if (e.rowInc) rowsOut[e.rowInc]++;
       refreshCounters();
       if (e.readRow != null && e.readRow >= 0) {
-        for (j = 0; j < bodyRows.length; j++) {
-          if (j === e.readRow) {
-            bodyRows[j].style.outline = "2px solid var(--accent)";
-            bodyRows[j].cells[4].textContent = "reading…";
-          } else if (bodyRows[j].cells[4].textContent) {
-            bodyRows[j].style.outline = "";
-            bodyRows[j].style.opacity = "0.6";
-            if (bodyRows[j].cells[4].textContent === "reading…") bodyRows[j].cells[4].textContent = "read";
-          }
-        }
+        clearReadingState();
+        bodyRows[e.readRow].style.outline = "2px solid var(--accent)";
+        bodyRows[e.readRow].style.opacity = "";
+        bodyRows[e.readRow].cells[4].textContent = "reading…";
+      }
+      if (e.settleRow != null && e.settleRow >= 0) {
+        bodyRows[e.settleRow].style.outline = "";
+        bodyRows[e.settleRow].style.opacity = e.settleLabel === "passed" ? "" : "0.6";
+        bodyRows[e.settleRow].cells[4].textContent = e.settleLabel;
       }
       if (e.clientRow) {
         results.push(e.clientRow);
@@ -1060,14 +1115,11 @@ document.addEventListener("DOMContentLoaded", function () {
       }
       if (e.finish) {
         finished = true;
+        clearReadingState();
         for (j = 0; j < bodyRows.length; j++) {
           if (!bodyRows[j].cells[4].textContent) {
             bodyRows[j].style.opacity = "0.35";
             bodyRows[j].cells[4].textContent = "never read";
-          } else if (bodyRows[j].cells[4].textContent === "reading…") {
-            bodyRows[j].cells[4].textContent = "read";
-            bodyRows[j].style.outline = "";
-            bodyRows[j].style.opacity = "0.6";
           }
         }
       }
@@ -1083,6 +1135,7 @@ document.addEventListener("DOMContentLoaded", function () {
       timer = setInterval(function () {
         if (i3 >= events.length) {
           clearInterval(timer); timer = null;
+          clearReadingState();
           if (finished) {
             pullBtn.disabled = true;
             statusEl.textContent = "Done: SeqScan read " + rowsOut[4] + " of 8 rows. Reset to run again.";

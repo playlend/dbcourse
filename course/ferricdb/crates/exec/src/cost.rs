@@ -13,7 +13,6 @@
 #![allow(unused_variables, dead_code)] // stubs: remove once you implement
 
 use ferricdb_catalog::{Catalog, TableInfo};
-use ferricdb_common::Result;
 
 use crate::binder::BoundExpr;
 use crate::plan::LogicalPlan;
@@ -42,7 +41,8 @@ impl<'a> CostModel<'a> {
     /// Reference shapes: `SeqScan` = `SEQ_PAGE_COST · pages +
     /// CPU_TUPLE_COST · rows`; `IndexScan` = `RANDOM_PAGE_COST · (height +
     /// matching leaf pages + matching heap fetches) + cpu` (state your
-    /// clustering assumption); joins per the Module 7 formulas over
+    /// clustering assumption); joins per the Milestone 7 recursive
+    /// `NestedLoopJoin` and asymmetric build-left `HashJoin` formulas over
     /// estimated input cardinalities.
     pub fn plan_cost(&self, plan: &LogicalPlan) -> f64 {
         todo!("Milestone 7")
@@ -58,9 +58,5 @@ impl<'a> CostModel<'a> {
     /// tables, `min == max`.
     pub fn selectivity(&self, table: &TableInfo, pred: &BoundExpr) -> f64 {
         todo!("Milestone 7")
-    }
-
-    fn _uses(&self) -> Result<()> {
-        Ok(())
     }
 }

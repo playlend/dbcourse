@@ -24,8 +24,9 @@
 
 <main>
   <h1>M08 · Query Optimization</h1>
-  <p class="subtitle">How a database decides: rewrite rules, statistics, selectivity, cost
-  models, and the Selinger dynamic program that has ordered joins since 1979.</p>
+  <p class="subtitle">How a database decides: rule-based logical rewrites, catalog statistics,
+  selectivity estimation, cost models, and the Selinger dynamic program that has ordered joins
+  since 1979.</p>
 
   <noscript><p class="noscript-warn">The cost calculator, join-order explorer, and quizzes on
   this page need JavaScript; all explanatory content is readable without it.</p></noscript>
@@ -34,227 +35,742 @@
     <strong>On this page</strong>
     <ol>
       <li><a href="#sec-why">The declarative bargain comes due</a></li>
-      <li><a href="#sec-rewrites">Rule-based rewrites</a></li>
-      <li><a href="#sec-stats">Statistics and selectivity</a></li>
-      <li><a href="#sec-cost">Cost models</a></li>
+      <li><a href="#sec-rewrites">Rule-based logical rewrites</a></li>
+      <li><a href="#sec-stats">Statistics and selectivity estimation</a></li>
+      <li><a href="#sec-cost">Cost models and access-path selection</a></li>
       <li><a href="#sec-calc">The cost calculator</a></li>
       <li><a href="#sec-selinger">Selinger join ordering</a></li>
       <li><a href="#sec-dp">The join-order explorer</a></li>
-      <li><a href="#sec-explain">Reading EXPLAIN</a></li>
+      <li><a href="#sec-explain">Reading EXPLAIN and EXPLAIN ANALYZE</a></li>
       <li><a href="#sec-quiz">Check your understanding</a></li>
       <li><a href="#sec-sources">Primary sources</a></li>
     </ol>
   </div>
 
-  <p>Module 1 made a promise on SQL's behalf: say <em>what</em> you want and the system will
-  find a good <em>how</em>. Modules 6 and 7 built the hows — scans, joins, sorts. This module
-  builds the chooser. It is the most consequential component in the system for real-world
-  performance: the difference between a good and bad plan for the same query is routinely
-  several orders of magnitude, which is why the optimizer paper this module leans on — Selinger
-  et al.'s 1979 System R paper — may be the most influential database paper ever
-  written.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  <p><a href="../m01-relational-model-sql/index.html">Module 1</a> made a promise on SQL's behalf:
+  declare <em>what</em> rows you want and let the engine discover a fast <em>how</em>.
+  <a href="../m06-query-execution/index.html">Modules 6</a> and
+  <a href="../m07-joins-sorting-aggregation/index.html">7</a> built the hows — sequential scans,
+  B+Tree index scans, nested-loop and hash joins, hash aggregation, and external merge sort. This
+  module builds the chooser. For real-world performance, the query optimizer is the single highest-leverage
+  component in the engine: two semantically identical physical plans for the same SQL query routinely
+  differ in runtime by three to five orders of magnitude. That is why the paper this module builds on
+  — Selinger et&nbsp;al.'s 1979 System&nbsp;R optimizer paper — remains one of the most influential
+  papers in computer science.<sup class="cite"><a href="#ref-1">1</a></sup></p>
 
   <h2 id="sec-why">The declarative bargain comes due</h2>
-  <p>An optimizer answers three questions, in increasing order of difficulty: <em>which
-  equivalent form</em> of the query to run (rewrites), <em>which access path</em> to use for
-  each table (seq scan vs index), and <em>which join order and algorithms</em> to use — where
-  the search space is n! permutations for n tables.<sup class="cite"><a href="#ref-1">1</a></sup>
-  PostgreSQL answers them with a near-exhaustive search when the table count is modest,
-  switching to a genetic (heuristic) optimizer only past a threshold —
-  evidence of how much a thorough search is worth.<sup class="cite"><a href="#ref-4">4</a></sup>
-  FerricDB's Milestone 7 follows the same recipe at teaching scale: rewrites, then a cost model
-  over statistics, then Selinger-style ordering for up to ~6 tables.</p>
+  <p>A query optimizer translates a bound logical plan into an executable physical plan by answering
+  three distinct questions, ordered from cheapest to hardest:<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  <ol>
+    <li><strong>Logical equivalence (rewrites):</strong> Which algebraically equivalent tree does the
+      least unnecessary work before we even touch statistics? Pushing filters down below joins,
+      pruning unread columns, and folding constant expressions are wins across almost every dataset.</li>
+    <li><strong>Access-path selection:</strong> For each base table, should we scan the entire heap
+      sequentially (<code>SeqScan</code>) or probe an available B+Tree index (<code>IndexScan</code>)?
+      As <a href="../m04-data-structures-indexes/index.html">Module 4</a> previewed, an index is not
+      automatically faster — random heap fetches can lose badly to a sequential sweep when many rows
+      match.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+    <li><strong>Join ordering and physical algorithm selection:</strong> For <em>n</em> joined tables,
+      how should the joins be parenthesized and ordered, and should each join use a nested loop, hash
+      join, or sort-merge join? Even restricting to linear join chains leaves <em>n</em>! orderings;
+      allowing arbitrary tree shapes grows super-exponentially.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+  </ol>
 
-  <h2 id="sec-rewrites">Rule-based rewrites</h2>
-  <p>Some transformations are wins essentially always, no statistics required. These run first,
-  as pure tree-to-tree rewrites on the logical plan:</p>
+  <p>Notice the clean architectural split between <strong>logical optimization</strong> (transforming
+  one relational-algebra expression into an equivalent one without committing to physical operators)
+  and <strong>physical optimization</strong> (choosing scans, join algorithms, and orderings using a
+  cost model over table statistics). Historical and modern optimizers organize this search in two
+  broad styles, summarized in the Red Book's Chapter&nbsp;7 commentary:<sup class="cite"><a href="#ref-6">6</a></sup></p>
   <ul>
-    <li><strong>Predicate pushdown.</strong> A filter above a join that references only one side
-      moves below the join. Filtering early shrinks every intermediate result that follows —
-      the single most valuable rewrite in existence. (Correctness rule: a predicate may only
-      push below an operator if every column it references survives there.)</li>
-    <li><strong>Projection pruning.</strong> Columns nobody upstream uses are dropped at the
-      lowest possible point, narrowing every tuple in flight.</li>
-    <li><strong>Constant folding.</strong> <code>price * (1 + 0.08)</code> becomes
-      <code>price * 1.08</code> once, at plan time, instead of per row. Folding a predicate to
-      constant <em>false</em> can delete a whole subtree.</li>
+    <li><strong>Bottom-up dynamic programming (System&nbsp;R / PostgreSQL):</strong> Apply heuristic
+      logical rewrites first, then assemble physical plans from single-table access paths upward by
+      subset size, pruning suboptimal partial plans at every level.<sup class="cite"><a href="#ref-1">1</a></sup>
+      PostgreSQL uses this near-exhaustive search up to <code>geqo_threshold</code> (default 12
+      relations), falling back to a genetic heuristic only when the table count exceeds that
+      limit.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+    <li><strong>Top-down memoized search (Volcano / Cascades):</strong> Represent equivalence classes of
+      sub-expressions in a compact memo structure and expand logical-to-logical and logical-to-physical
+      rules recursively from the root downward, using branch-and-bound cost limits to prune whole
+      branches early — the architecture behind SQL Server, CockroachDB, and Apache Calcite.<sup class="cite"><a href="#ref-6">6</a></sup></li>
   </ul>
-  <p>Postgres's rewriter stage plays a related role (view and rule expansion) before its planner
-  applies these cost-independent transformations internally.<sup class="cite"><a href="#ref-2">2</a></sup></p>
+  <p>Despite forty-five years of research into top-down frameworks and adaptive execution, the Red
+  Book notes that Selinger's core three-piece blueprint — statistics, a cost model, and dynamic
+  programming over subsets — still anchors production optimizers, and its hardest unsolved problem
+  is unchanged: <em>accurate cardinality estimation</em>.<sup class="cite"><a href="#ref-6">6</a></sup>
+  FerricDB's Milestone&nbsp;7 follows the System&nbsp;R / PostgreSQL recipe at teaching scale inside
+  <code>course/ferricdb/crates/exec</code>: rule-based logical rewrites, catalog statistics gathered
+  by <code>ANALYZE</code>, a PostgreSQL-inspired cost model, cost-based access paths, and left-deep
+  join ordering for up to ~6 tables.</p>
 
-  <h2 id="sec-stats">Statistics and selectivity</h2>
-  <p>Everything cost-based rests on one number per predicate: <strong>selectivity</strong>, the
-  fraction of rows expected to survive. Selinger's paper introduced the estimation playbook that
-  every engine still follows — using whatever statistics exist, plus honest guesses where they
-  don't:<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  <h2 id="sec-rewrites">Rule-based logical rewrites</h2>
+  <p>Rule-based transformations run before any cost calculation because they dominate unconditionally:
+  shrinking intermediate cardinality or tuple width early cannot make a downstream operator more
+  expensive (ignoring rare corner cases such as volatile user-defined functions). In PostgreSQL's
+  pipeline, the rewriter stage expands views and rules before the planner applies cost-independent
+  simplifications internally.<sup class="cite"><a href="#ref-2">2</a></sup> In FerricDB,
+  <code>Planner::optimize</code> applies three tree-to-tree rewrites over <code>LogicalPlan</code>
+  to a fixpoint:</p>
+
+  <ul>
+    <li><strong>Constant folding.</strong> Evaluate sub-expressions whose inputs are all literals once
+      at plan time instead of repeating the arithmetic per tuple: <code>o.total * (1 + 0.08)</code>
+      becomes <code>o.total * 1.08</code>, and <code>1 = 0 AND col &gt; 5</code> folds to
+      <code>false</code>, letting the planner replace an entire subtree with an empty scan.</li>
+    <li><strong>Predicate pushdown.</strong> Split conjunctive predicates (<code>P1 AND P2</code>)
+      into separate conjuncts and move each conjunct as close to the base scans as legality permits.
+      A predicate sitting above a join that references columns from only the left input moves onto the
+      left child; one referencing only the right input moves onto the right child; one referencing
+      both sides stays attached to the join (becoming the join's equi-join keys or residual
+      <code>on</code> condition). <em>Correctness invariant:</em> a predicate may cross below an
+      operator if and only if every column it references is produced by that child subtree (and for
+      outer joins — not in FerricDB's core grammar — null-supplying sides require extra care).</li>
+    <li><strong>Projection pruning (and redundant-projection cleanup).</strong> In a full optimizer,
+      a top-down walk tracks the exact set of columns needed by the final <code>SELECT</code> list,
+      <code>WHERE</code>, <code>JOIN ON</code>, <code>GROUP BY</code>, and <code>ORDER BY</code>
+      clauses, dropping unused columns as low in the tree as possible so hash tables, sort buffers,
+      and row allocations stay narrow. In FerricDB's <code>LogicalPlan</code>, base scans preserve
+      full table schemas so <code>create_executor</code> can resolve
+      <code>BoundExpr::Column { table, column }</code> across reordered joins without remapping
+      tables; therefore Milestone&nbsp;7 implements <em>redundant-projection cleanup</em> (collapsing
+      stacked pass-through <code>Projection</code> nodes while leaving the top-level
+      <code>Projection</code> intact) rather than inserting inner column-dropping projections below
+      joins.</li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 940 370" role="img">
+      <title>Before and after rule-based logical rewrites on a two-table join plan: constant folding
+      simplifies arithmetic in the root projection, predicate pushdown moves single-table filters
+      below the join, and projection pruning narrows tuples on both inputs.</title>
+      <defs>
+        <marker id="m08-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+        <marker id="m08-arr-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" style="fill:var(--accent)"/>
+        </marker>
+      </defs>
+
+      <!-- Left panel: before -->
+      <rect x="14" y="14" width="400" height="342" rx="8" class="d-box"/>
+      <text x="214" y="38" text-anchor="middle" class="d-text" font-weight="600">Before rewrites (naive bound tree)</text>
+
+      <rect x="40" y="54" width="348" height="44" rx="6" class="d-box"/>
+      <text x="214" y="73" text-anchor="middle" class="d-mono-sm">Projection(c.name, o.total * (1 + 0.08))</text>
+      <text x="214" y="89" text-anchor="middle" class="d-text-sm">re-evaluates (1 + 0.08) on every row</text>
+
+      <rect x="40" y="122" width="348" height="44" rx="6" class="d-box-warn"/>
+      <text x="214" y="141" text-anchor="middle" class="d-mono-sm">Filter(c.tier = 'gold' AND o.total &gt; 50)</text>
+      <text x="214" y="157" text-anchor="middle" class="d-text-sm">filters AFTER joining all rows</text>
+
+      <rect x="114" y="190" width="200" height="40" rx="6" class="d-box-hl"/>
+      <text x="214" y="215" text-anchor="middle" class="d-mono-sm">Join(c.cid = o.cid)</text>
+
+      <rect x="28" y="264" width="174" height="54" rx="6" class="d-box"/>
+      <text x="115" y="286" text-anchor="middle" class="d-mono-sm">SeqScan(customer)</text>
+      <text x="115" y="304" text-anchor="middle" class="d-text-sm">all cols · 5,000 rows</text>
+
+      <rect x="226" y="264" width="174" height="54" rx="6" class="d-box"/>
+      <text x="313" y="286" text-anchor="middle" class="d-mono-sm">SeqScan(orders)</text>
+      <text x="313" y="304" text-anchor="middle" class="d-text-sm">all cols · 10,000 rows</text>
+
+      <path d="M 115 264 L 180 232" class="d-line" marker-end="url(#m08-arr)"/>
+      <path d="M 313 264 L 248 232" class="d-line" marker-end="url(#m08-arr)"/>
+      <path d="M 214 190 L 214 168" class="d-line" marker-end="url(#m08-arr)"/>
+      <path d="M 214 122 L 214 100" class="d-line" marker-end="url(#m08-arr)"/>
+
+      <text x="214" y="341" text-anchor="middle" class="d-text-sm">Join builds and probes full wide tables before filtering</text>
+
+      <!-- Center transform arrow -->
+      <path d="M 422 185 H 482" class="d-line-hl" marker-end="url(#m08-arr-hl)"/>
+      <text x="452" y="164" text-anchor="middle" class="d-text-sm">3 rewrite</text>
+      <text x="452" y="177" text-anchor="middle" class="d-text-sm">rules</text>
+
+      <!-- Right panel: after -->
+      <rect x="490" y="14" width="436" height="342" rx="8" class="d-box"/>
+      <text x="708" y="38" text-anchor="middle" class="d-text" font-weight="600">After rewrites (folded, pushed, pruned)</text>
+
+      <rect x="548" y="52" width="320" height="44" rx="6" class="d-box-good"/>
+      <text x="708" y="71" text-anchor="middle" class="d-mono-sm">Projection(c.name, o.total * 1.08)</text>
+      <text x="708" y="87" text-anchor="middle" class="d-text-sm">constant folded once at plan time</text>
+
+      <rect x="608" y="114" width="200" height="36" rx="6" class="d-box-hl"/>
+      <text x="708" y="137" text-anchor="middle" class="d-mono-sm">Join(c.cid = o.cid)</text>
+
+      <rect x="506" y="172" width="192" height="34" rx="6" class="d-box-good"/>
+      <text x="602" y="193" text-anchor="middle" class="d-mono-sm">Project(cid, name) [pruned]</text>
+
+      <rect x="718" y="172" width="192" height="34" rx="6" class="d-box-good"/>
+      <text x="814" y="193" text-anchor="middle" class="d-mono-sm">Project(cid, total) [pruned]</text>
+
+      <rect x="506" y="222" width="192" height="34" rx="6" class="d-box-good"/>
+      <text x="602" y="243" text-anchor="middle" class="d-mono-sm">Filter(tier = 'gold')</text>
+
+      <rect x="718" y="222" width="192" height="34" rx="6" class="d-box-good"/>
+      <text x="814" y="243" text-anchor="middle" class="d-mono-sm">Filter(total &gt; 50)</text>
+
+      <rect x="506" y="274" width="192" height="44" rx="6" class="d-box"/>
+      <text x="602" y="293" text-anchor="middle" class="d-mono-sm">SeqScan(customer)</text>
+      <text x="602" y="310" text-anchor="middle" class="d-text-sm">only ~200 rows reach join</text>
+
+      <rect x="718" y="274" width="192" height="44" rx="6" class="d-box"/>
+      <text x="814" y="293" text-anchor="middle" class="d-mono-sm">SeqScan(orders)</text>
+      <text x="814" y="310" text-anchor="middle" class="d-text-sm">filtered &amp; narrowed early</text>
+
+      <path d="M 602 274 L 602 258" class="d-line" marker-end="url(#m08-arr)"/>
+      <path d="M 602 222 L 602 208" class="d-line" marker-end="url(#m08-arr)"/>
+      <path d="M 602 172 L 672 152" class="d-line" marker-end="url(#m08-arr)"/>
+
+      <path d="M 814 274 L 814 258" class="d-line" marker-end="url(#m08-arr)"/>
+      <path d="M 814 222 L 814 208" class="d-line" marker-end="url(#m08-arr)"/>
+      <path d="M 814 172 L 744 152" class="d-line" marker-end="url(#m08-arr)"/>
+
+      <path d="M 708 114 L 708 98" class="d-line" marker-end="url(#m08-arr)"/>
+
+      <text x="708" y="341" text-anchor="middle" class="d-text-sm">Arrows show tuple flow upward; pushed filters can also unlock index scans</text>
+    </svg>
+    <figcaption>Figure 1 — Textbook rule-based logical rewrites applied to
+    <code>SELECT c.name, o.total * (1 + 0.08) FROM customer c JOIN orders o ON c.cid = o.cid WHERE c.tier = 'gold' AND o.total &gt; 50</code>.
+    Pushing <code>tier = 'gold'</code> below the join both shrinks the hash-join build side and lets
+    access-path selection consider an index on <code>customer(tier)</code>. (In FerricDB's
+    Milestone&nbsp;7, <code>Planner::optimize</code> applies constant folding, predicate pushdown,
+    and redundant-projection cleanup, keeping base scan schemas full so
+    <code>(table_idx, col_idx)</code> references stay valid across join reordering.)</figcaption>
+  </figure>
+
+  <p>Observe the synergy between logical rewrites and physical optimization: once
+  <code>Filter(tier = 'gold')</code> sits directly above <code>SeqScan(customer)</code> (or fused
+  into its <code>filter</code> field), the cost-based access-path phase can immediately spot an index
+  on <code>customer(tier)</code> and price an <code>IndexScan</code> against the <code>SeqScan</code>.
+  Without pushdown, the index would never even be considered.</p>
+
+  <h2 id="sec-stats">Statistics and selectivity estimation</h2>
+  <p>Once rule-based rewrites finish, every remaining decision — scan type, join order, join build
+  side — depends on estimating how many rows flow out of each operator. That rests on one number per
+  predicate: its <strong>selectivity factor</strong> <code>F ∈ [0, 1]</code>, the expected fraction
+  of input rows satisfying the predicate. Multiply the table's row count <code>N</code> by
+  <code>F</code> and you get the estimated output cardinality.</p>
+
+  <p>To compute <code>F</code> without reading the table at query-planning time, the engine stores
+  compact summaries in its system catalog whenever the DBA (or autovacuum) runs <code>ANALYZE</code>.
+  In System&nbsp;R, the catalog stored four quantities: table row count (<code>NCARD</code>), table
+  page count (<code>TCARD</code>), number of distinct keys per indexed column (<code>ICARD</code>),
+  and high/low key bounds.<sup class="cite"><a href="#ref-1">1</a></sup> FerricDB mirrors this budget
+  in <code>crates/catalog</code>: <code>TableStats { row_count, page_count, columns }</code> with
+  per-column <code>ColumnStats { min, max, distinct_estimate, null_count }</code>.</p>
+
+  <p>Selinger et&nbsp;al. introduced the selectivity formulas that still serve as every database
+  engine's baseline — using catalog statistics when available and falling back to documented defaults
+  when a table has never been analyzed or a literal cannot be interpolated:<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Predicate</th><th>Selectivity F (Selinger 1979)</th><th>Assumption</th></tr></thead>
+      <thead>
+        <tr>
+          <th>Predicate shape</th>
+          <th>With statistics (Selinger 1979)</th>
+          <th>Fallback (no stats / non-interpolatable)</th>
+          <th>Underlying assumption</th>
+        </tr>
+      </thead>
       <tbody>
-        <tr><td><code>col = value</code></td><td>1 / ICARD(col) with an index; 1/10 without</td>
-          <td>values evenly distributed over ICARD distinct keys</td></tr>
-        <tr><td><code>col1 = col2</code></td><td>1 / MAX(ICARD(col1), ICARD(col2))</td>
-          <td>every key of the smaller domain matches in the larger</td></tr>
-        <tr><td><code>col &gt; value</code></td><td>(high − value) / (high − low); 1/3 if not
-          interpolatable</td><td>linear interpolation across the key range</td></tr>
+        <tr>
+          <td><code>col = value</code></td>
+          <td><code>1 / ICARD(col)</code> (<code>1 / distinct_estimate</code>)</td>
+          <td><code>1 / 10</code> (0.10)</td>
+          <td>Uniform distribution across all distinct keys</td>
+        </tr>
+        <tr>
+          <td><code>col1 = col2</code> (equi-join)</td>
+          <td><code>1 / max(ICARD(col1), ICARD(col2))</code></td>
+          <td><code>1 / 10</code> (0.10)</td>
+          <td>Containment: every key in the smaller domain matches in the larger</td>
+        </tr>
+        <tr>
+          <td><code>col &gt; value</code></td>
+          <td><code>(max − value) / (max − min)</code></td>
+          <td><code>1 / 3</code> (0.333)</td>
+          <td>Uniform spacing across <code>[min, max]</code></td>
+        </tr>
+        <tr>
+          <td><code>col &lt; value</code></td>
+          <td><code>(value − min) / (max − min)</code></td>
+          <td><code>1 / 3</code> (0.333)</td>
+          <td>Uniform spacing across <code>[min, max]</code></td>
+        </tr>
+        <tr>
+          <td><code>col BETWEEN v1 AND v2</code></td>
+          <td><code>(v2 − v1) / (max − min)</code></td>
+          <td><code>1 / 4</code> (0.25)</td>
+          <td>Linear interpolation over <code>[min, max]</code> (clamped to <code>[0, 1]</code>)</td>
+        </tr>
+        <tr>
+          <td><code>P1 AND P2</code></td>
+          <td><code>F(P1) · F(P2)</code></td>
+          <td>same composition</td>
+          <td>Statistical independence between predicates</td>
+        </tr>
+        <tr>
+          <td><code>P1 OR P2</code></td>
+          <td><code>F(P1) + F(P2) − F(P1) · F(P2)</code></td>
+          <td>same composition</td>
+          <td>Inclusion–exclusion under independence</td>
+        </tr>
+        <tr>
+          <td><code>NOT P</code></td>
+          <td><code>1 − F(P)</code></td>
+          <td>same composition</td>
+          <td>Complement over non-NULL rows (clamped to <code>[0, 1]</code>)</td>
+        </tr>
       </tbody>
     </table>
   </div>
-  <p>ICARD — the number of distinct keys — plus min and max per column: that is the entire
-  statistics budget of System R, and it is exactly what FerricDB's <code>ANALYZE</code> gathers
-  (row count, per-column min/max, distinct estimate).<sup class="cite"><a href="#ref-1">1</a></sup>
-  Two honest caveats you must teach your users (i.e., yourself): the uniformity assumption fails
-  on skewed data (Postgres adds histograms and most-common-value lists for this), and
-  multiplying selectivities of ANDed predicates assumes they are independent — correlated
-  predicates make the estimate optimistic, sometimes catastrophically. Milestone 7 documents
-  both assumptions in your cost model's rustdoc.</p>
 
-  <h2 id="sec-cost">Cost models</h2>
-  <p>Selinger's cost formula was <code>COST = PAGE&nbsp;FETCHES + W × RSI&nbsp;CALLS</code> —
-  I/O plus a weighted CPU proxy (tuples returned), with W an adjustable
-  knob.<sup class="cite"><a href="#ref-1">1</a></sup> Forty-five years later, PostgreSQL's model
-  is recognizably the same idea with more terms. Postgres splits every node's cost into
-  <em>start-up</em> (before the first tuple) and <em>run</em> (to completion), and computes a
-  sequential scan's run cost as:<sup class="cite"><a href="#ref-3">3</a></sup></p>
-  <pre><code>run_cost = (cpu_tuple_cost + cpu_operator_cost) × N_tuples
-         +  seq_page_cost × N_pages
--- defaults: seq_page_cost = 1.0, cpu_tuple_cost = 0.01, cpu_operator_cost = 0.0025</code></pre>
-  <p>while an index scan pays <code>random_page_cost</code> (default <strong>4.0</strong>) per
-  page it touches non-sequentially — index pages and heap pages
-  both.<sup class="cite"><a href="#ref-3">3</a></sup> The units are deliberately arbitrary:
-  everything is relative to one sequential page read.<sup class="cite"><a href="#ref-5">5</a></sup>
-  That 4× ratio between random and sequential access is the entire drama of access-path
-  selection: an index scan reads <em>fewer</em> pages, but each one costs <em>more</em>, so
-  there is a selectivity crossover below which the index wins and above which the sequential
-  scan does. FerricDB adopts the three Postgres constants unchanged (a course choice, matching
-  the defaults documented above<sup class="cite"><a href="#ref-3">3</a></sup>) in
-  <code>exec::cost</code>.</p>
+  <p>Watch the degenerate edge cases when you implement <code>CostModel::selectivity</code> in
+  <code>crates/exec/src/cost.rs</code>: an empty table (<code>row_count == 0</code>), a constant
+  column (<code>min == max</code>, which divides by zero if you interpolate blindly), a literal
+  outside <code>[min, max]</code> (which produces negative fractions or fractions above 1 unless
+  clamped), and <code>NULL</code> comparisons (SQL three-valued logic rejects NULLs in
+  <code>WHERE</code>, so high <code>null_count</code> scales non-null selectivity by
+  <code>(row_count − null_count) / row_count</code>). Always clamp the final result to
+  <code>[0.0, 1.0]</code>.</p>
 
-  <p><strong>A worked example</strong> with FerricDB's model — a table of N = 100,000 tuples on
-  P = 1,000 pages, index of height 2 with 300 leaf pages, query
-  <code>WHERE id BETWEEN … (selectivity s)</code>:</p>
+  <div class="callout pitfall">
+    <span class="callout-title">Where Selinger's assumptions break in production</span>
+    <p>Every optimizer bug war story traces back to one of two violated assumptions:<sup class="cite"><a href="#ref-6">6</a></sup></p>
+    <ul>
+      <li><strong>Data skew breaks uniformity.</strong> If 95% of an <code>orders</code> table has
+        <code>status = 'shipped'</code> and 5% splits across nine other statuses, <code>1 / 10</code>
+        guesses 10% for both <code>'shipped'</code> (9.5× too low — tempting the planner into an
+        index scan that destroys performance) and <code>'disputed'</code> (100× too high). Production
+        PostgreSQL combats single-column skew by storing a <em>Most Common Values (MCV)</em> list
+        with exact frequencies alongside an <em>equi-depth histogram</em> for the remaining values in
+        <code>pg_statistic</code>.<sup class="cite"><a href="#ref-3">3</a></sup></li>
+      <li><strong>Column correlation breaks independence.</strong> Suppose a 100,000-row table has 100
+        cities and 50 states, and every row with <code>city = 'Austin'</code> also has
+        <code>state = 'TX'</code>. Multiplying <code>F(city = 'Austin') · F(state = 'TX')</code>
+        gives <code>(1/100) · (1/50) = 1/5,000</code> (20 rows) when the true count is 1,000 rows — a
+        50× underestimate that compounds exponentially across multi-table joins.<sup class="cite"><a href="#ref-6">6</a></sup>
+        Modern PostgreSQL mitigates this with <code>CREATE STATISTICS</code> multivariate statistics,
+        while FerricDB explicitly documents both uniformity and independence in
+        <code>crates/exec/src/cost.rs</code> so you recognize their footprint in
+        <code>EXPLAIN ANALYZE</code>.</li>
+    </ul>
+  </div>
+
+  <h2 id="sec-cost">Cost models and access-path selection</h2>
+  <p>With estimated cardinalities in hand, the optimizer scores candidate physical plans using a
+  <strong>cost model</strong>. Selinger's original System&nbsp;R formula was intentionally spartan:
+  <code>COST = PAGE&nbsp;FETCHES + W × RSI&nbsp;CALLS</code> — total disk pages fetched plus a
+  weighted proxy for CPU work (tuples passed across the storage interface), with <code>W</code> an
+  adjustable system constant.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+
+  <p>Forty-five years later, PostgreSQL's cost model is the direct descendant of that equation. Every
+  plan node reports two numbers — <strong>start-up cost</strong> (work before the first output tuple
+  can be returned, such as sorting an input or building a hash table) and <strong>total cost</strong>
+  (start-up plus run cost to emit all tuples) — measured in dimensionless units normalized so that
+  one sequential page read equals <code>1.0</code>.<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-5">5</a></sup>
+  PostgreSQL builds operator costs from five default constants documented in interdb&nbsp;§3.2:<sup class="cite"><a href="#ref-3">3</a></sup></p>
+
   <div class="table-wrap">
     <table>
-      <thead><tr><th></th><th>Formula</th><th>s = 0.001 (100 rows)</th><th>s = 0.30 (30,000 rows)</th></tr></thead>
+      <thead>
+        <tr><th>PostgreSQL constant</th><th>Default</th><th>Meaning</th><th>In FerricDB <code>crates/exec/src/cost.rs</code></th></tr>
+      </thead>
       <tbody>
-        <tr><td>Seq scan</td><td>1.0·P + 0.0125·N</td><td>1,000 + 1,250 = <strong>2,250</strong></td>
-          <td>1,000 + 1,250 = <strong>2,250</strong> (always)</td></tr>
-        <tr><td>Index scan</td><td>4.0·(2 + ⌈s·300⌉ + ⌈s·N⌉·clustering) + cpu</td>
-          <td>4.0·(2 + 1 + 100) + 1.5 ≈ <strong>414</strong></td>
-          <td>4.0·(2 + 90 + 30,000·f) ≈ <strong>tens of thousands</strong></td></tr>
+        <tr><td><code>seq_page_cost</code></td><td><code>1.0</code></td><td>One sequential 8&nbsp;KB disk page read (the unit)</td><td><code>SEQ_PAGE_COST = 1.0</code></td></tr>
+        <tr><td><code>random_page_cost</code></td><td><code>4.0</code></td><td>One non-sequential 8&nbsp;KB disk page read (4× penalty)</td><td><code>RANDOM_PAGE_COST = 4.0</code></td></tr>
+        <tr><td><code>cpu_tuple_cost</code></td><td><code>0.01</code></td><td>CPU work to process one heap tuple</td><td><code>CPU_TUPLE_COST = 0.01</code></td></tr>
+        <tr><td><code>cpu_index_tuple_cost</code></td><td><code>0.005</code></td><td>CPU work to process one B+Tree index entry</td><td><em>omitted (folded into tuple cost)</em></td></tr>
+        <tr><td><code>cpu_operator_cost</code></td><td><code>0.0025</code></td><td>CPU work to evaluate one predicate operator</td><td><em>omitted (folded into tuple cost)</em></td></tr>
       </tbody>
     </table>
   </div>
-  <p>At 0.1% selectivity the index wins by 5×; at 30% it loses by more than 10×, because every
-  matching row risks a separate random heap page fetch. (The clustering factor f — how well heap
-  order matches index order — decides how many; the calculator below exposes it.) A seq scan's
-  cost is flat in s; an index scan's is linear in s with a steep slope. Where the lines cross is
-  the planner's decision boundary.</p>
+
+  <p>FerricDB adopts the first three PostgreSQL defaults verbatim — <code>SEQ_PAGE_COST = 1.0</code>,
+  <code>RANDOM_PAGE_COST = 4.0</code>, and <code>CPU_TUPLE_COST = 0.01</code> — as a course choice
+  matching PostgreSQL's defaults,<sup class="cite"><a href="#ref-3">3</a></sup> dropping the two
+  sub-cent CPU terms because page I/O dominates the access-path boundary. (On modern NVMe SSDs, where
+  random reads are nearly as fast as sequential reads, DBAs routinely lower PostgreSQL's
+  <code>random_page_cost</code> from <code>4.0</code> toward <code>1.1–1.5</code>, shifting the
+  crossover in favor of indexes.)</p>
+
+  <p>Using PostgreSQL's five default constants, a sequential scan over a table of <em>P</em> pages and
+  <em>N</em> tuples pays a flat cost independent of how many rows survive the
+  <code>WHERE</code> filter:<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  <pre><code>seq_cost(P, N) = seq_page_cost × P + (cpu_tuple_cost + cpu_operator_cost) × N
+               = 1.0 × P + 0.0125 × N</code></pre>
+
+  <p>Now compare a B+Tree index scan of height <em>h</em> with <em>I</em> leaf pages and predicate
+  selectivity <em>s</em> (matching <code>M = s × N</code> rows). Beyond reading the B+Tree path and
+  matching leaf pages, the scan must fetch matching heap tuples from the table. How many heap pages it
+  touches — and whether those reads are random or sequential — depends critically on
+  <strong>clustering</strong> (what PostgreSQL tracks as index-to-heap physical
+  <em>correlation</em> <code>c ∈ [0.0, 1.0]</code>):<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  <ul>
+    <li><strong><code>c = 0.0</code> (completely unclustered):</strong> Heap order is unrelated to key
+      order. Every matching row risks a separate random heap page fetch (<code>M</code> reads at
+      <code>random_page_cost = 4.0</code> each).</li>
+    <li><strong><code>c = 1.0</code> (perfectly clustered):</strong> Heap rows sit in the exact same
+      physical order as the index keys (for instance, an append-only primary key or a freshly
+      <code>CLUSTER</code>ed table). The scan visits only <code>⌈s × P⌉</code> distinct heap pages,
+      reading them sequentially at <code>seq_page_cost = 1.0</code>.</li>
+  </ul>
+  <p>Interpolating linearly across <code>c ∈ [0, 1]</code> gives a transparent teaching formula
+  shared by the worked example and the interactive calculator below:</p>
+  <pre><code>heap_pages(s, c)     = ⌈s·P⌉ + (1 − c) × max(0, s·N − ⌈s·P⌉)
+heap_page_cost(c)    = (1 − c) × random_page_cost + c × seq_page_cost
+index_cost(s, P, N, c) = random_page_cost × (h + ⌈s·I⌉)
+                       + heap_page_cost(c) × heap_pages(s, c)
+                       + (cpu_tuple_cost + cpu_index_tuple_cost) × (s·N)</code></pre>
+
+  <p><strong>Worked example.</strong> Take a table with <code>P = 1,000</code> pages and
+  <code>rpp = 100</code> rows/page (<code>N = 100,000</code> tuples), plus a B+Tree index of height
+  <code>h = 2</code> with <code>I = 300</code> leaf pages, answering a range query
+  <code>WHERE id BETWEEN a AND b</code> of selectivity <code>s</code>:</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Access path</th>
+          <th><code>s = 0.001</code> (100 rows)</th>
+          <th><code>s = 0.30</code> (30,000 rows)</th>
+          <th>Crossover selectivity</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><strong>Seq scan</strong> (flat in <code>s</code>)</td>
+          <td><code>1.0·1,000 + 0.0125·100,000</code> = <strong>2,250</strong></td>
+          <td><strong>2,250</strong> (always reads every page once)</td>
+          <td>—</td>
+        </tr>
+        <tr>
+          <td><strong>Index scan, unclustered (<code>c = 0.00</code>)</strong></td>
+          <td><code>4·(2+1) + 4·100 + 0.015·100</code> = <strong>413.5</strong> (5.4× win)</td>
+          <td><code>4·(2+90) + 4·30,000 + 0.015·30,000</code> = <strong>120,818</strong> (54× loss)</td>
+          <td><strong>0.56%</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Index scan, moderate (<code>c = 0.50</code>)</strong></td>
+          <td><code>4·(2+1) + 2.5·50.5 + 1.5</code> = <strong>139.8</strong> (16× win)</td>
+          <td><code>4·(2+90) + 2.5·15,150 + 450</code> = <strong>38,693</strong> (17× loss)</td>
+          <td><strong>1.74%</strong></td>
+        </tr>
+        <tr>
+          <td><strong>Index scan, clustered (<code>c = 1.00</code>)</strong></td>
+          <td><code>4·(2+1) + 1.0·1 + 1.5</code> = <strong>14.5</strong> (155× win)</td>
+          <td><code>4·(2+90) + 1.0·300 + 450</code> = <strong>1,118</strong> (2.0× win)</td>
+          <td><strong>&gt; 25%</strong></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <p>That 4× random-to-sequential ratio plus page scatter creates a knife-edge decision boundary: on
+  an unclustered secondary index over a dense 100-rows/page table, matching even <strong>1%</strong>
+  of the table can already make a sequential scan cheaper than bouncing around 1,000 random heap
+  pages! When your Milestone&nbsp;7 planner prices both scans over catalog statistics, it replaces
+  Milestone&nbsp;5's naive "always use an index if one exists" rule with this exact comparison.</p>
 
   <h2 id="sec-calc">The cost calculator</h2>
   <div class="widget" id="cc">
     <p class="widget-title">Seq scan vs index scan — find the crossover</p>
-    <p class="widget-sub">Postgres default constants (seq_page_cost 1.0, random_page_cost 4.0,
-    cpu_tuple_cost 0.01, cpu_operator_cost 0.0025). Drag the sliders; the chart plots cost
-    against selectivity and marks the crossover.</p>
+    <p class="widget-sub">PostgreSQL default constants (<code>seq_page_cost = 1.0</code>,
+    <code>random_page_cost = 4.0</code>, <code>cpu_tuple_cost = 0.01</code>,
+    <code>cpu_index_tuple_cost = 0.005</code>, <code>cpu_operator_cost = 0.0025</code>).
+    Clustering <code>c = 0.00</code> means completely unclustered (random heap reads);
+    <code>c = 1.00</code> means perfectly clustered (sequential heap reads matching index order).</p>
     <div class="controls">
       <label>table pages <input type="range" id="cc-pages" min="100" max="5000" step="100" value="1000"> <b id="cc-pages-v">1000</b></label>
       <label>rows/page <input type="range" id="cc-rpp" min="20" max="200" step="20" value="100"> <b id="cc-rpp-v">100</b></label>
-      <label>clustering <input type="range" id="cc-clu" min="0" max="100" step="5" value="20"> <b id="cc-clu-v">0.20</b></label>
+      <label>clustering <input type="range" id="cc-clu" min="0" max="100" step="5" value="50"> <b id="cc-clu-v">0.50</b></label>
       <button class="btn" type="button" id="cc-reset">↺ Reset</button>
     </div>
     <div id="cc-chart"></div>
     <div class="stepper-caption" id="cc-caption" role="status"></div>
   </div>
-  <p>Try dragging <em>clustering</em> to 1.0 (index order = heap order, like a freshly built
-  primary key): the crossover races rightward — a clustered index stays competitive even at high
-  selectivity, because its heap reads become nearly sequential. This is why real planners track
-  a clustering/correlation statistic per index.</p>
+  <p>Run three quick experiments with the sliders. First, drag <em>clustering</em> down to
+  <code>0.00</code>: at 100 rows/page, the index scan shoots past the sequential scan line at
+  <code>0.56%</code> selectivity — matching the worked-example table above. Second, drag
+  <em>clustering</em> up to <code>0.90</code> and then <code>1.00</code>: as heap reads coalesce onto
+  fewer pages and blend from <code>random_page_cost = 4.0</code> down toward
+  <code>seq_page_cost = 1.0</code>, the crossover races past <code>13%</code> and exits the right
+  edge of the chart entirely. Third, reduce <em>rows/page</em> to <code>20</code> (wide tuples):
+  fewer matching rows per selectivity step means fewer random heap hits, pushing the crossover
+  rightward.</p>
 
   <h2 id="sec-selinger">Selinger join ordering</h2>
-  <p>For n tables there are n! join orders, and the cost of different orders differs
-  substantially — that much is obvious. Selinger's insight is what makes searching survivable:
-  <em>once the first k relations are joined, the best way to join the (k+1)-st does not depend
-  on the order the first k were joined in</em> — the applicable predicates, possible join
-  methods, and available orderings are the same for any ordering of the same
-  set.<sup class="cite"><a href="#ref-1">1</a></sup> So organize the search by <strong>subsets,
-  not permutations</strong>: find the best plan for every subset of size 1, then use those to
-  build every subset of size 2, then 3 — classic dynamic programming, keeping one best plan per
-  subset and discarding the rest.<sup class="cite"><a href="#ref-1">1</a></sup></p>
-  <p>One refinement made the paper immortal: a subset's "best" plan is kept <em>per interesting
-  order</em> — a plan that is more expensive but delivers rows sorted on an ORDER BY, GROUP BY,
-  or equi-join column may enable a cheap merge join (which requires join-column order) or a free
-  sort later, so it survives the pruning alongside the outright
-  cheapest.<sup class="cite"><a href="#ref-1">1</a></sup> System R also restricted the search to
-  <strong>left-deep</strong> trees (each join's inner input is a base table), shrinking the
-  space from all tree shapes to orderings — a restriction FerricDB keeps and Postgres does not.
-  Postgres, for its part, prefers joining pairs that actually share a join clause, which prunes
-  most cross products without forbidding them.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+  <p>Single-table access paths are cheap to choose because there are only a handful of indexes per
+  table. Multi-table joins are the combinatorial cliff. Join is both associative and commutative
+  (for inner joins), so joining <em>n</em> relations can be parenthesized and ordered in two
+  different regimes:</p>
+  <ul>
+    <li><strong>Left-deep trees (System&nbsp;R and FerricDB):</strong> Every join's right (inner)
+      input is a base table, never the output of another join. For <em>n</em> tables there are
+      <code>n!</code> left-deep permutations (24 for 4 tables, 720 for 6, 3.6&nbsp;million for 10).
+      System&nbsp;R chose left-deep trees both to shrink the search space and because nested-loop and
+      probe-side streaming can pipeline tuples from one join straight into the next without
+      materializing intermediate right-hand subtrees.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+    <li><strong>Bushy trees (PostgreSQL):</strong> Both inputs of a join may themselves be join
+      trees — for example <code>(C ⋈ O) ⋈ (L ⋈ S)</code>. Bushy trees allow two selective sub-joins to
+      shrink independently before their outputs meet, at the cost of a larger search space of
+      <code>(2n − 2)! / (n − 1)!</code> binary trees (120 for 4 tables, 30,240 for 6, 665,280 for 7). PostgreSQL
+      explores bushy plans too while preferring pairs linked by an explicit join predicate, avoiding
+      cross products whenever a connected join graph exists.<sup class="cite"><a href="#ref-4">4</a></sup></li>
+  </ul>
+
+  <figure>
+    <svg viewBox="0 0 920 315" role="img">
+      <title>Comparison of a left-deep join tree (System R and FerricDB) versus a bushy join tree
+      (PostgreSQL) over four tables C, O, L, and S.</title>
+      <defs>
+        <marker id="m08-jarr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor" opacity="0.7"/>
+        </marker>
+      </defs>
+
+      <!-- Left panel: Left-deep -->
+      <rect x="16" y="14" width="432" height="287" rx="8" class="d-box"/>
+      <text x="232" y="38" text-anchor="middle" class="d-text" font-weight="600">Left-deep tree (System R / FerricDB)</text>
+
+      <rect x="220" y="54" width="60" height="32" rx="16" class="d-box-hl"/>
+      <text x="250" y="75" text-anchor="middle" class="d-mono">⋈₃</text>
+
+      <rect x="148" y="114" width="60" height="32" rx="16" class="d-box-hl"/>
+      <text x="178" y="135" text-anchor="middle" class="d-mono">⋈₂</text>
+      <rect x="318" y="114" width="90" height="32" rx="6" class="d-box-good"/>
+      <text x="363" y="135" text-anchor="middle" class="d-mono-sm">S (400)</text>
+
+      <rect x="80" y="174" width="60" height="32" rx="16" class="d-box-hl"/>
+      <text x="110" y="195" text-anchor="middle" class="d-mono">⋈₁</text>
+      <rect x="230" y="174" width="90" height="32" rx="6" class="d-box-good"/>
+      <text x="275" y="195" text-anchor="middle" class="d-mono-sm">L (40k)</text>
+
+      <rect x="30" y="234" width="80" height="32" rx="6" class="d-box-good"/>
+      <text x="70" y="255" text-anchor="middle" class="d-mono-sm">C (200)</text>
+      <rect x="128" y="234" width="84" height="32" rx="6" class="d-box-good"/>
+      <text x="170" y="255" text-anchor="middle" class="d-mono-sm">O (10k)</text>
+
+      <path d="M 70 234 L 98 208" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 170 234 L 124 208" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 110 174 L 164 148" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 275 174 L 194 148" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 178 114 L 234 88" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 363 114 L 268 88" class="d-line" marker-end="url(#m08-jarr)"/>
+
+      <text x="232" y="289" text-anchor="middle" class="d-text-sm">Every right input is a base table · n! orders, 2ⁿ DP subsets</text>
+
+      <!-- Right panel: Bushy -->
+      <rect x="472" y="14" width="432" height="287" rx="8" class="d-box"/>
+      <text x="688" y="38" text-anchor="middle" class="d-text" font-weight="600">Bushy tree (PostgreSQL)</text>
+
+      <rect x="658" y="58" width="60" height="32" rx="16" class="d-box-hl"/>
+      <text x="688" y="79" text-anchor="middle" class="d-mono">⋈₃</text>
+
+      <rect x="546" y="138" width="60" height="32" rx="16" class="d-box-warn"/>
+      <text x="576" y="159" text-anchor="middle" class="d-mono">⋈₁</text>
+
+      <rect x="770" y="138" width="60" height="32" rx="16" class="d-box-warn"/>
+      <text x="800" y="159" text-anchor="middle" class="d-mono">⋈₂</text>
+
+      <rect x="488" y="220" width="80" height="32" rx="6" class="d-box-good"/>
+      <text x="528" y="241" text-anchor="middle" class="d-mono-sm">C (200)</text>
+
+      <rect x="582" y="220" width="84" height="32" rx="6" class="d-box-good"/>
+      <text x="624" y="241" text-anchor="middle" class="d-mono-sm">O (10k)</text>
+
+      <rect x="708" y="220" width="84" height="32" rx="6" class="d-box-good"/>
+      <text x="750" y="241" text-anchor="middle" class="d-mono-sm">L (40k)</text>
+
+      <rect x="806" y="220" width="80" height="32" rx="6" class="d-box-good"/>
+      <text x="846" y="241" text-anchor="middle" class="d-mono-sm">S (400)</text>
+
+      <path d="M 528 220 L 564 172" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 624 220 L 588 172" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 750 220 L 788 172" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 846 220 L 812 172" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 576 138 L 668 92" class="d-line" marker-end="url(#m08-jarr)"/>
+      <path d="M 800 138 L 708 92" class="d-line" marker-end="url(#m08-jarr)"/>
+
+      <text x="688" y="132" text-anchor="middle" class="d-text-sm">both inputs may be</text>
+      <text x="688" y="146" text-anchor="middle" class="d-text-sm">intermediate joins</text>
+
+      <text x="688" y="289" text-anchor="middle" class="d-text-sm">Richer space: (2n−2)!/(n−1)! shapes (120 vs 24 at n=4)</text>
+    </svg>
+    <figcaption>Figure 2 — Left-deep versus bushy join trees on four tables
+    <code>{C, O, L, S}</code>. Restricting to left-deep trees collapses the search space while
+    letting left-to-right join chains pipeline cleanly.<sup class="cite"><a href="#ref-1">1</a></sup><sup class="cite"><a href="#ref-4">4</a></sup></figcaption>
+  </figure>
+
+  <p>Even within left-deep trees, enumerating all <code>n!</code> permutations blows up rapidly.
+  Selinger's dynamic-programming insight is the <strong>principle of optimality over relation
+  subsets</strong>: <em>once a given set <code>S</code> of <code>k</code> relations has been joined,
+  its output rows, available columns, and applicable predicates to any remaining table <code>T</code>
+  are completely independent of the order in which <code>S</code> was built</em>.<sup class="cite"><a href="#ref-1">1</a></sup>
+  Therefore, index the DP memo table by the <strong>subset bitmask <code>S</code></strong>, not by
+  the permutation:</p>
+  <ol>
+    <li><strong>Level 1 (singletons):</strong> For each base table <code>{T}</code>, find the cheapest
+      access path (<code>SeqScan</code> vs usable <code>IndexScan</code>s).</li>
+    <li><strong>Levels <code>k = 2 … n</code>:</strong> For every subset <code>S</code> of size
+      <code>k</code>, try every way of extending a remembered <code>(k − 1)</code>-subset
+      <code>S \ {T}</code> with base table <code>T</code> (<code>best[S \ {T}] ⋈ T</code>), cost
+      the resulting join using the chosen physical algorithm, and discard every candidate except the
+      cheapest.<sup class="cite"><a href="#ref-1">1</a></sup></li>
+  </ol>
+  <p>For <code>n = 6</code> tables, naive permutation enumeration inspects <code>6! = 720</code> full
+  plans; Selinger's bitmask DP populates only <code>2⁶ − 1 = 63</code> subset entries and evaluates
+  at most <code>n · 2ⁿ⁻¹ = 192</code> join transitions.</p>
+
+  <p>One refinement made the 1979 paper immortal: <strong>interesting orders</strong>. Suppose plan
+  <code>P₁</code> for subset <code>{C, O}</code> costs <code>12,000</code> and delivers rows in
+  arbitrary hash order, while plan <code>P₂</code> costs <code>14,000</code> (using an index scan on
+  <code>O.oid</code>) and delivers rows already sorted by <code>O.oid</code>. A naive DP would
+  prune <code>P₂</code> immediately — and miss the fact that the next join on <code>O.oid = L.oid</code>
+  could run a cheap sort-merge join or satisfy a final <code>ORDER BY O.oid</code> with zero extra
+  sorting! System&nbsp;R therefore keeps, per subset <code>S</code>, both the outright cheapest plan
+  <em>and</em> the cheapest plan for each "interesting" sort order (columns appearing in later join
+  predicates, <code>GROUP BY</code>, or <code>ORDER BY</code>).<sup class="cite"><a href="#ref-1">1</a></sup>
+  Milestone&nbsp;7's starter DP starts with one best plan per subset (since FerricDB builds hash join
+  and nested-loop join in Milestone&nbsp;6) and leaves interesting orders as a clean extension once
+  you add sort-merge join.</p>
 
   <h2 id="sec-dp">The join-order explorer</h2>
-  <p>Four tables, fixed sizes and join selectivities. Step through the DP levels and watch
-  24 permutations collapse into 15 subset entries, with losers pruned at every level.</p>
-  <div class="widget" id="jo">
-    <p class="widget-title">Selinger DP over {C, O, L, S}</p>
-    <p class="widget-sub">customer (1k rows) ⋈ orders (10k) ⋈ lineitem (40k) ⋈ supplier (100).
-    Join selectivities: C–O 1/1000, O–L 1/10000, L–S 1/100; missing pairs are cross products.
-    Cost of a join = outer rows + inner rows + output rows (a teaching model).</p>
-    <div id="jo-stepper"></div>
-    <div class="log" id="jo-table" style="max-height:22rem"></div>
-  </div>
-  <p>Two things to watch. First, the pruning: at level 2 the pair {C, O} keeps
-  <code>C ⋈ O</code> and discards <code>O ⋈ C</code> — same set, one survivor. Second, the
-  payoff: the final best order avoids the cross products entirely and starts from the most
-  selective join, which is not the order the tables appeared in. No greedy rule finds that
-  reliably; the DP proves it optimal for the model.</p>
+  <p>Consider a four-table query written with the largest table first in the SQL <code>FROM</code>
+  clause — <code>FROM lineitem L JOIN orders O ON L.oid = O.oid JOIN supplier S ON L.sid = S.sid
+  JOIN customer C ON O.cid = C.cid WHERE C.tier = 'gold' AND S.region = 'EU'</code>. After predicate
+  pushdown shrinks <code>C</code> to 200 rows and <code>S</code> to 400 rows, FerricDB's
+  <code>HashJoin</code> builds its hash table on the <strong>left</strong> input and streams the
+  <strong>right</strong> input as probes, making join cost asymmetric:
+  <code>cost(L ⋈ R) = 2 × rows(L) + rows(R) + rows(out)</code> (hashing and storing the left build
+  table costs roughly twice per tuple compared to streaming right probes). Step through the DP levels
+  below and watch 24 left-deep permutations collapse into 15 subset entries, with losers strictly
+  pruned at every level.</p>
 
-  <h2 id="sec-explain">Reading EXPLAIN</h2>
-  <p>The optimizer's work product is visible: <code>EXPLAIN</code> prints the chosen plan tree
-  with, per node, the estimated start-up cost, total cost, row count, and row width — in those
-  arbitrary cost units — like <code>Seq Scan on tenk1 (cost=0.00..445.00 rows=10000
-  width=244)</code>.<sup class="cite"><a href="#ref-5">5</a></sup> <code>EXPLAIN ANALYZE</code>
-  goes further: it <em>actually executes</em> the query and reports true row counts and times
-  alongside the estimates — including side effects, so wrap data-modifying statements in a
-  rollback.<sup class="cite"><a href="#ref-5">5</a></sup> Reading the two side by side is the
-  optimizer debugging loop: a huge gap between estimated and actual rows points at a bad
-  statistic or a correlated predicate. Milestone 7 implements both (ANALYZE with actual counts
-  and timings), and its acceptance test is EXPLAIN-shaped: the plan must flip from seq scan to
-  index scan as the predicate's selectivity drops.</p>
+  <div class="widget" id="jo">
+    <p class="widget-title">Selinger DP over {C, O, L, S} with asymmetric HashJoin cost</p>
+    <p class="widget-sub">Filtered base cardinalities: <code>C</code> (200), <code>O</code> (10,000),
+    <code>L</code> (40,000), <code>S</code> (400). Join selectivities: <code>C–O = 1/5,000</code>,
+    <code>O–L = 1/10,000</code>, <code>L–S = 1/2,000</code>; unconnected pairs are cross products
+    (<code>F = 1</code>). Per-join cost = <code>2·left + right + out</code> (build left, probe right).</p>
+    <div id="jo-stepper"></div>
+    <div class="log" id="jo-table" style="max-height:24rem"></div>
+  </div>
+
+  <p>Notice three concrete wins in the trace above. First, at level&nbsp;2, join direction is no
+  longer a tie: for <code>{C, O}</code>, building the hash table on 200-row <code>C</code> and
+  probing with 10,000-row <code>O</code> gives <code>(C ⋈ O)</code> at cost <code>10,800</code>,
+  strictly beating <code>(O ⋈ C)</code> at cost <code>20,600</code> (which gets pruned immediately).
+  The same happens on every pair: <code>(S ⋈ L)</code> (<code>48,800</code>) beats
+  <code>(L ⋈ S)</code> (<code>88,400</code>), and <code>(O ⋈ L)</code> (<code>100,000</code>) beats
+  <code>(L ⋈ O)</code> (<code>130,000</code>). Second, every cross-product pair (such as
+  <code>{C, L}</code> with 8,000,000 rows) is priced honestly and loses at higher levels without
+  special-case hacks. Third, the optimal four-table plan <code>(((C ⋈ O) ⋈ L) ⋈ S)</code> finishes at
+  cost <code>57,120</code> — starting from the sharpest filtered pair <code>(C ⋈ O)</code> (only 400
+  intermediate rows) even though <code>C</code> appeared <em>last</em> in the SQL <code>FROM</code>
+  clause, and beating the naive SQL order <code>(((L ⋈ O) ⋈ S) ⋈ C)</code> (cost
+  <code>234,920</code>) by more than <strong>4.1×</strong>.</p>
+
+  <h2 id="sec-explain">Reading EXPLAIN and EXPLAIN ANALYZE</h2>
+  <p>An optimizer is a black box unless you can inspect what it chose and check whether its guesses
+  matched reality. <code>EXPLAIN</code> prints the chosen plan tree without executing it, annotating
+  every operator with its estimated start-up cost, total cost, output row count, and average row
+  width in bytes — for example, PostgreSQL's
+  <code>Seq Scan on tenk1 (cost=0.00..445.00 rows=10000 width=244)</code>.<sup class="cite"><a href="#ref-5">5</a></sup>
+  <code>EXPLAIN ANALYZE</code> goes one step further: it <em>actually executes</em> the plan, wraps
+  each operator in a row counter and clock, and prints actual execution times, actual row counts,
+  and loop counts alongside the estimates.<sup class="cite"><a href="#ref-5">5</a></sup></p>
+
+  <p>Because <code>EXPLAIN ANALYZE</code> truly executes the statement, running it on an
+  <code>INSERT</code>, <code>UPDATE</code>, or <code>DELETE</code> mutates the database even though
+  the output rows are discarded — always wrap data-modifying <code>EXPLAIN ANALYZE</code> calls
+  inside <code>BEGIN; … ROLLBACK;</code>.<sup class="cite"><a href="#ref-5">5</a></sup></p>
+
+  <p><strong>A worked diagnostic loop.</strong> Suppose a 100,000-row <code>customers</code> table
+  has 100 cities and 50 states, with <code>city = 'Austin'</code> perfectly correlated with
+  <code>state = 'TX'</code> (1,000 rows match both), joined to an indexed <code>orders</code> table.
+  Compare <code>EXPLAIN</code> (estimates only) against <code>EXPLAIN ANALYZE</code> (estimates plus
+  ground truth):</p>
+
+  <pre><code>-- Query: SELECT c.name, o.total FROM customers c JOIN orders o ON c.cid = o.cid
+--        WHERE c.city = 'Austin' AND c.state = 'TX';
+
+-- 1. EXPLAIN (plan-time estimates only; assumes city and state are independent)
+NestedLoopJoin  (cost=0.42..168.90 rows=40)
+  -&gt; SeqScan on customers c  (cost=0.00..2250.00 rows=20)
+       Filter: (city = 'Austin' AND state = 'TX')
+  -&gt; IndexScan on orders o using idx_orders_cid  (cost=0.42..8.44 rows=2)
+       Index Cond: (o.cid = c.cid)
+
+-- 2. EXPLAIN ANALYZE (actual execution reveals a 50x cardinality error!)
+NestedLoopJoin  (cost=0.42..168.90 rows=40) (actual time=0.81..412.60 rows=2000 loops=1)
+  -&gt; SeqScan on customers c  (cost=0.00..2250.00 rows=20) (actual time=0.35..14.20 rows=1000 loops=1)
+       Filter: (city = 'Austin' AND state = 'TX')
+  -&gt; IndexScan on orders o using idx_orders_cid  (cost=0.42..8.44 rows=2) (actual time=0.38..0.39 rows=2 loops=1000)
+       Index Cond: (o.cid = c.cid)</code></pre>
+
+  <p>Read those numbers from the leaves up — the exact debugging loop every database engineer uses:
+  <code>SeqScan on customers</code> predicted <code>rows=20</code>
+  (<code>100,000 × (1/100) × (1/50)</code>) because the cost model assumed <code>city</code> and
+  <code>state</code> were independent, whereas <code>actual rows=1000</code> was 50× higher! Fooled
+  into expecting only 20 outer rows, the planner chose a <code>NestedLoopJoin</code> probing
+  <code>idx_orders_cid</code> — which then executed <code>loops=1000</code> random B+Tree lookups
+  taking 412&nbsp;ms, whereas a <code>HashJoin</code> scanning <code>orders</code> sequentially would
+  have finished in a fraction of the time. Whenever estimated rows and actual rows diverge by an order
+  of magnitude, suspect stale <code>ANALYZE</code> statistics, skewed values, or correlated
+  predicates.<sup class="cite"><a href="#ref-5">5</a></sup><sup class="cite"><a href="#ref-6">6</a></sup></p>
+
+  <p>In Milestone&nbsp;7, you will build both <code>EXPLAIN</code> and <code>EXPLAIN ANALYZE</code>
+  in <code>crates/exec</code>, and your acceptance test <code>ms7_analyze_then_explain_picks_access_path</code>
+  verifies the access-path flip directly: after <code>ANALYZE</code>, a selective point lookup
+  <code>WHERE id = 42</code> prints <code>IndexScan</code>, while an unselective range
+  <code>WHERE id &gt; 2</code> on the same indexed column flips to <code>SeqScan</code>.</p>
 
   <h2 id="sec-quiz">Check your understanding</h2>
 
-  <fieldset class="quiz" data-explain="A seq scan reads every page once, sequentially — its cost does not depend on how many rows match. The index scan's cost grows with matching rows (random heap fetches), which is why high selectivity favors the seq scan.">
-    <legend class="quiz-q">Why is the seq scan's cost flat across all selectivities?</legend>
-    <label><input type="radio" name="q1" data-correct> It reads every page exactly once regardless of how many rows match</label>
+  <fieldset class="quiz" data-explain="A seq scan reads every page once, sequentially — its cost does not depend on how many rows match. An unclustered index scan's cost rises linearly with matching rows because each match risks a random heap page fetch (4× cost), which is why high selectivity favors the seq scan.">
+    <legend class="quiz-q">1. Why is the sequential scan's cost flat across all selectivities?</legend>
+    <label><input type="radio" name="q1" data-correct> It reads every heap page exactly once regardless of how many rows match</label>
     <label><input type="radio" name="q1"> The buffer pool caches it after the first read</label>
-    <label><input type="radio" name="q1"> Because cpu_tuple_cost is negligible</label>
+    <label><input type="radio" name="q1"> Because <code>cpu_tuple_cost</code> cancels out selectivity</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="Selinger: with an index, F = 1/ICARD — one value out of the distinct keys, assuming even distribution. The 1/10 guess applies only without an index. Both are honest defaults, not measurements; skew breaks them.">
-    <legend class="quiz-q">Selectivity of col = value when col has an index with 500 distinct keys?</legend>
+  <fieldset class="quiz" data-explain="Selinger's baseline formula uses F = 1 / ICARD when distinct-key statistics exist, assuming values are uniformly distributed across the 500 distinct keys. The 1/10 default applies only when no column statistics are available. Both fail on heavily skewed distributions.">
+    <legend class="quiz-q">2. Under Selinger's rules, what is the selectivity of <code>col = value</code> when <code>ANALYZE</code> reports 500 distinct keys?</legend>
     <label><input type="radio" name="q2"> 1/10 — the standard equality guess</label>
     <label><input type="radio" name="q2" data-correct> 1/500 — one distinct key out of ICARD, assuming uniformity</label>
-    <label><input type="radio" name="q2"> Impossible to estimate without a histogram</label>
+    <label><input type="radio" name="q2"> 1/3 — linear range interpolation</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="The DP keys its memo by SET of joined relations, because the best way to extend a join depends only on which relations are in, not the order they got there. Per set, it keeps the cheapest plan — plus any plan whose output order is 'interesting' (useful for a later merge join, ORDER BY, or GROUP BY).">
-    <legend class="quiz-q">What does the Selinger DP keep per subset of relations?</legend>
-    <label><input type="radio" name="q3"> Every join order, for later comparison</label>
-    <label><input type="radio" name="q3" data-correct> The cheapest plan — plus the cheapest per interesting output order</label>
-    <label><input type="radio" name="q3"> The first order that avoids cross products</label>
+  <fieldset class="quiz" data-explain="Under the independence assumption, F(P1 AND P2) = F(P1) · F(P2) = 0.01 × 0.02 = 0.0002 (20 rows out of 100,000). Because city and state are correlated in reality, this underestimates by 50× — the classic cardinality-estimation error visible in EXPLAIN ANALYZE.">
+    <legend class="quiz-q">3. A 100,000-row table has <code>F(city = 'Austin') = 0.01</code> and <code>F(state = 'TX') = 0.02</code>. What row count does Selinger's independence rule predict for their <code>AND</code>?</legend>
+    <label><input type="radio" name="q3"> 1,000 rows — taking the smaller selectivity</label>
+    <label><input type="radio" name="q3" data-correct> 20 rows — multiplying 0.01 × 0.02 = 0.0002 × 100,000</label>
+    <label><input type="radio" name="q3"> 2,980 rows — using inclusion–exclusion</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="EXPLAIN ANALYZE really runs the query — the docs warn that side effects happen as usual even though the output rows are discarded. Wrapping in BEGIN…ROLLBACK is the documented way to analyze an UPDATE or DELETE safely.">
-    <legend class="quiz-q">What must you remember before running EXPLAIN ANALYZE on a DELETE?</legend>
-    <label><input type="radio" name="q4"> Nothing — EXPLAIN never executes anything</label>
-    <label><input type="radio" name="q4" data-correct> It actually executes the statement — wrap it in a transaction you roll back</label>
-    <label><input type="radio" name="q4"> It requires superuser privileges</label>
+  <fieldset class="quiz" data-explain="Selinger's DP indexes its memo by the SET (bitmask) of joined relations, because the best way to join the remaining tables depends only on which tables are already joined, not the order they arrived in. Per set, System R retains the overall cheapest plan plus the cheapest plan for each interesting sort order.">
+    <legend class="quiz-q">4. What does the Selinger dynamic program retain for each subset of joined relations?</legend>
+    <label><input type="radio" name="q4"> Every permutation of the subset, sorted by row count</label>
+    <label><input type="radio" name="q4" data-correct> The overall cheapest plan — plus the cheapest plan per interesting output order</label>
+    <label><input type="radio" name="q4"> Only the first join order that avoids cross products</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="EXPLAIN ANALYZE genuinely executes the statement to gather actual timings and row counts — any INSERT, UPDATE, or DELETE side effects take place even though output tuples are discarded. Wrapping in BEGIN … ROLLBACK lets you inspect actual plan behavior safely.">
+    <legend class="quiz-q">5. What precaution is mandatory before running <code>EXPLAIN ANALYZE</code> on a <code>DELETE</code> statement?</legend>
+    <label><input type="radio" name="q5"> None — <code>EXPLAIN ANALYZE</code> runs in a read-only sandbox</label>
+    <label><input type="radio" name="q5" data-correct> Wrap it in <code>BEGIN; … ROLLBACK;</code> because <code>EXPLAIN ANALYZE</code> actually executes the delete</label>
+    <label><input type="radio" name="q5"> Run <code>VACUUM</code> beforehand so row counts are exact</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
@@ -266,26 +782,26 @@
         <li id="ref-1">Selinger, Astrahan, Chamberlin, Lorie, Price, "Access Path Selection in a
           Relational Database Management System", SIGMOD 1979 — the cost formula
           (PAGE FETCHES + W·RSI CALLS), the selectivity-factor table, dynamic programming over
-          subsets, and interesting orders.
-          <a href="https://web.stanford.edu/class/cs345d-01/rl/selinger.pdf" rel="external">https://web.stanford.edu/class/cs345d-01/rl/selinger.pdf</a></li>
+          subsets, left-deep trees, and interesting orders.
+          <a href="https://dl.acm.org/doi/10.1145/582095.582099" rel="external">https://dl.acm.org/doi/10.1145/582095.582099</a></li>
         <li id="ref-2">Hironobu Suzuki, The Internals of PostgreSQL, §3.1 — the rewriter and
           planner stages in the query-processing pipeline.
           <a href="https://www.interdb.jp/pg/pgsql03/01.html" rel="external">https://www.interdb.jp/pg/pgsql03/01.html</a></li>
         <li id="ref-3">Hironobu Suzuki, The Internals of PostgreSQL, §3.2 — cost estimation:
-          start-up/run/total, the seq-scan and index-scan formulas, and the default cost
-          constants (1.0 / 0.01 / 0.0025 / 4.0 / 0.005).
+          start-up/run/total, correlation, seq-scan and index-scan formulas, and the five default
+          cost constants (1.0 / 0.01 / 0.0025 / 4.0 / 0.005).
           <a href="https://www.interdb.jp/pg/pgsql03/02.html" rel="external">https://www.interdb.jp/pg/pgsql03/02.html</a></li>
         <li id="ref-4">PostgreSQL Documentation, "Planner/Optimizer" — near-exhaustive search,
-          the genetic optimizer past geqo_threshold, paths vs plans, and join-clause-driven
-          pair selection.
+          the genetic optimizer past <code>geqo_threshold</code>, bushy vs left-deep paths, and
+          join-clause-driven pair selection.
           <a href="https://www.postgresql.org/docs/current/planner-optimizer.html" rel="external">https://www.postgresql.org/docs/current/planner-optimizer.html</a></li>
         <li id="ref-5">PostgreSQL Documentation, "Using EXPLAIN" — the cost/rows/width fields,
-          arbitrary cost units, and EXPLAIN ANALYZE's real execution with true counts and
-          times.
+          arbitrary cost units, and <code>EXPLAIN ANALYZE</code>'s real execution with true counts,
+          timings, and side-effect warning.
           <a href="https://www.postgresql.org/docs/current/using-explain.html" rel="external">https://www.postgresql.org/docs/current/using-explain.html</a></li>
         <li id="ref-6">Bailis, Hellerstein, Stonebraker (eds.), Readings in Database Systems,
-          5th ed., Ch. 7 commentary — perspective on where optimizer research went after
-          System R.
+          5th ed., Ch. 7 commentary — perspective on System R's longevity, Cascades top-down
+          optimization, and cardinality estimation as the enduring bottleneck.
           <a href="http://www.redbook.io/ch7-queryoptimization.html" rel="external">http://www.redbook.io/ch7-queryoptimization.html</a></li>
       </ol>
     </div>
@@ -294,18 +810,21 @@
     <ul>
       <li>The Red Book Ch. 7 commentary (ref 6) — why Selinger's architecture survived and what
         modern optimizers (Cascades, adaptive execution) changed.</li>
-      <li>The Internals of PostgreSQL, §3.3 — how Postgres creates the plan tree of a
-        single-table query, with the actual arithmetic for more node types.
+      <li>The Internals of PostgreSQL, §3.3 — how Postgres builds the plan tree of a
+        single-table query, with worked arithmetic for more node types.
         <a href="https://www.interdb.jp/pg/pgsql03/03.html" rel="external">interdb.jp/pg/pgsql03/03.html</a></li>
       <li>PostgreSQL docs, "Planner Cost Constants" — every knob in the cost model and when DBAs
-        tune them (SSD random_page_cost lore included).
+        tune them (SSD <code>random_page_cost</code> guidance included).
         <a href="https://www.postgresql.org/docs/current/runtime-config-query.html" rel="external">postgresql.org/docs/current/runtime-config-query.html</a></li>
+      <li>PostgreSQL docs, "Statistics Used by the Planner" — MCV lists, histograms, and
+        <code>CREATE STATISTICS</code> for correlated columns.
+        <a href="https://www.postgresql.org/docs/current/planner-stats.html" rel="external">postgresql.org/docs/current/planner-stats.html</a></li>
     </ul>
 
     <h2 id="sec-milestone">Milestone link</h2>
     <p>What to build now: <a href="../../project/milestone-07/index.html">Milestone 7 — Query
-    Optimization</a>: rewrite rules, ANALYZE, the cost model with these constants, greedy-or-DP
-    join ordering, and EXPLAIN / EXPLAIN ANALYZE.</p>
+    Optimization</a>: rewrite rules, <code>ANALYZE</code>, the cost model with these constants,
+    greedy-or-DP join ordering, and <code>EXPLAIN</code> / <code>EXPLAIN ANALYZE</code>.</p>
 
     <nav class="prevnext">
       <a href="../../project/milestone-06/index.html"><span class="dir">← Previous</span> Milestone 6 · Joins, Aggregation, External Sort</a>
@@ -317,24 +836,45 @@
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
 
   /* ---------------- cost calculator ---------------- */
-  var SEQ = 1.0, RAND = 4.0, CPU_T = 0.01, CPU_O = 0.0025;
+  var SEQ = 1.0, RAND = 4.0, CPU_T = 0.01, CPU_I = 0.005, CPU_O = 0.0025;
   var ccPages = document.getElementById("cc-pages");
   var ccRpp = document.getElementById("cc-rpp");
   var ccClu = document.getElementById("cc-clu");
   var ccChart = document.getElementById("cc-chart");
   var ccCap = document.getElementById("cc-caption");
 
-  function seqCost(P, N) { return SEQ * P + (CPU_T + CPU_O) * N; }
+  function seqCost(P, N) {
+    return SEQ * P + (CPU_T + CPU_O) * N;
+  }
+
   function idxCost(s, P, N, clu) {
     var indexPages = Math.max(1, Math.round(P * 0.3));
     var height = 2;
     var matching = s * N;
-    // heap pages touched: between ceil(s*P) (perfectly clustered) and one per row
-    var heapReads = Math.ceil(s * P) + (1 - clu) * Math.max(0, matching - s * P);
-    var leafReads = Math.ceil(s * indexPages);
-    return RAND * (height + leafReads + heapReads) + (CPU_T + 0.005) * matching;
+    var minHeap = s > 0 ? Math.ceil(s * P) : 0;
+    // clu = 0.0 (unclustered): up to 1 random heap page per row at RAND = 4.0
+    // clu = 1.0 (clustered): ceil(s * P) sequential heap pages at SEQ = 1.0
+    var heapReads = minHeap + (1 - clu) * Math.max(0, matching - minHeap);
+    var heapPageCost = (1 - clu) * RAND + clu * SEQ;
+    var leafReads = s > 0 ? Math.ceil(s * indexPages) : 0;
+    return RAND * (height + leafReads) + heapPageCost * heapReads + (CPU_T + CPU_I) * matching;
+  }
+
+  function fmtCost(v) {
+    if (v >= 10000) return (v / 1000).toFixed(0) + "k";
+    if (v >= 1000) return (v / 1000).toFixed(1) + "k";
+    return String(Math.round(v));
+  }
+
+  function niceMaxY(raw) {
+    if (raw <= 100) return 100;
+    var mag = Math.pow(10, Math.floor(Math.log(raw) / Math.LN10));
+    var norm = raw / mag;
+    var mult = norm <= 1.5 ? 1.5 : norm <= 2 ? 2 : norm <= 3 ? 3 : norm <= 5 ? 5 : norm <= 8 ? 8 : 10;
+    return mult * mag;
   }
 
   function drawCalc() {
@@ -344,120 +884,233 @@ document.addEventListener("DOMContentLoaded", function () {
     document.getElementById("cc-rpp-v").textContent = String(rpp);
     document.getElementById("cc-clu-v").textContent = clu.toFixed(2);
 
-    var W = 880, H = 300, mL = 70, mB = 40, mT = 16, mR = 20;
-    var sMax = 0.2;
-    var pts = 120, sc = [], ic = [], maxY = 0;
+    var W = 880, H = 310, mL = 78, mB = 46, mT = 24, mR = 26;
+    var sMax = 0.25;
+    var pts = 250;
+    var scVal = seqCost(P, N);
+    var ic = [];
     for (var i = 0; i <= pts; i++) {
       var s = sMax * i / pts;
-      sc.push(seqCost(P, N));
       ic.push(idxCost(s, P, N, clu));
-      maxY = Math.max(maxY, sc[i], Math.min(ic[i], seqCost(P, N) * 4));
     }
-    maxY *= 1.08;
-    function X(i) { return mL + (W - mL - mR) * i / pts; }
-    function Y(v) { return H - mB - (H - mB - mT) * Math.min(v, maxY) / maxY; }
+    var rawMaxY = Math.max(scVal * 2.4, Math.min(ic[pts] * 1.12, scVal * 3.2));
+    var maxY = niceMaxY(rawMaxY);
+
+    function X(frac) { return mL + (W - mL - mR) * frac; }
+    function Y(v) { return H - mB - (H - mB - mT) * (v / maxY); }
 
     ccChart.textContent = "";
     var svg = Course.svgEl("svg", { viewBox: "0 0 " + W + " " + H, role: "img" });
     svg.appendChild(Course.svgEl("title", null,
-      "Cost versus selectivity for sequential scan (flat) and index scan (rising), with crossover."));
+      "Cost versus selectivity for sequential scan (flat) and index scan (rising), marking the crossover selectivity."));
+
+    // Horizontal grid lines + Y-axis numeric ticks
+    var ySteps = 4;
+    for (var t = 0; t <= ySteps; t++) {
+      var val = maxY * t / ySteps;
+      var yPos = Y(val);
+      if (t > 0) {
+        svg.appendChild(Course.svgEl("line", {
+          x1: mL, y1: yPos, x2: W - mR, y2: yPos,
+          "class": "d-line", "stroke-dasharray": "2 4", opacity: "0.35"
+        }));
+      }
+      svg.appendChild(Course.svgEl("text", {
+        x: mL - 8, y: yPos + 4, "text-anchor": "end", "class": "d-mono-sm"
+      }, fmtCost(val)));
+    }
+
+    // Axes
     svg.appendChild(Course.svgEl("line", { x1: mL, y1: H - mB, x2: W - mR, y2: H - mB, "class": "d-line" }));
     svg.appendChild(Course.svgEl("line", { x1: mL, y1: mT, x2: mL, y2: H - mB, "class": "d-line" }));
-    svg.appendChild(Course.svgEl("text", { x: (W + mL) / 2, y: H - 8, "text-anchor": "middle", "class": "d-text-sm" }, "selectivity (0 → 0.20)"));
-    svg.appendChild(Course.svgEl("text", { x: 16, y: (H - mB + mT) / 2, "class": "d-text-sm", transform: "rotate(-90 16 " + ((H - mB + mT) / 2) + ")", "text-anchor": "middle" }, "cost (arbitrary units)"));
-    [0, 0.05, 0.1, 0.15, 0.2].forEach(function (s) {
-      var x = mL + (W - mL - mR) * s / sMax;
-      svg.appendChild(Course.svgEl("text", { x: x, y: H - mB + 16, "text-anchor": "middle", "class": "d-mono-sm" }, s.toFixed(2)));
-    });
-    function path(arr, cls) {
-      var d = arr.map(function (v, i) { return (i ? "L " : "M ") + X(i) + " " + Y(v); }).join(" ");
-      var p = Course.svgEl("path", { d: d, "class": cls });
-      p.setAttribute("fill", "none");
-      return p;
-    }
-    svg.appendChild(path(sc, "d-line-hl"));
-    svg.appendChild(path(ic, "d-line"));
-    svg.appendChild(Course.svgEl("text", { x: W - mR - 6, y: Y(sc[pts]) - 8, "text-anchor": "end", "class": "d-text-sm" }, "seq scan (flat)"));
-    svg.appendChild(Course.svgEl("text", { x: W - mR - 6, y: Math.max(mT + 12, Y(Math.min(ic[pts], maxY)) + 16), "text-anchor": "end", "class": "d-text-sm" }, "index scan"));
+    svg.appendChild(Course.svgEl("text", {
+      x: (W + mL - mR) / 2, y: H - 8, "text-anchor": "middle", "class": "d-text-sm"
+    }, "selectivity (0% → 25%)"));
+    svg.appendChild(Course.svgEl("text", {
+      x: 16, y: (H - mB + mT) / 2, "class": "d-text-sm",
+      transform: "rotate(-90 16 " + ((H - mB + mT) / 2) + ")", "text-anchor": "middle"
+    }, "cost (arbitrary units)"));
 
-    // crossover
-    var cross = -1;
-    for (var j = 1; j <= pts; j++) if (ic[j] >= sc[j] && ic[j - 1] < sc[j - 1]) { cross = j; break; }
-    if (ic[0] >= sc[0]) cross = 0;
-    if (cross >= 0) {
-      var cs = sMax * cross / pts;
-      svg.appendChild(Course.svgEl("line", { x1: X(cross), y1: mT, x2: X(cross), y2: H - mB, "class": "d-line", "stroke-dasharray": "4 4" }));
-      svg.appendChild(Course.svgEl("text", { x: X(cross) + 6, y: mT + 14, "class": "d-text-sm" }, "crossover ≈ " + (cs * 100).toFixed(1) + "%"));
-      ccCap.textContent = "Below ≈" + (cs * 100).toFixed(1) + "% selectivity the index scan wins; above it, the " +
-        "sequential scan (cost " + Math.round(sc[0]).toLocaleString() + ") is cheaper. Table: " +
+    [0, 0.05, 0.10, 0.15, 0.20, 0.25].forEach(function (sTick) {
+      var x = X(sTick / sMax);
+      svg.appendChild(Course.svgEl("line", { x1: x, y1: H - mB, x2: x, y2: H - mB + 5, "class": "d-line" }));
+      svg.appendChild(Course.svgEl("text", {
+        x: x, y: H - mB + 19, "text-anchor": "middle", "class": "d-mono-sm"
+      }, Math.round(sTick * 100) + "%"));
+    });
+
+    // Sequential scan flat line
+    var seqY = Y(scVal);
+    svg.appendChild(Course.svgEl("line", {
+      x1: mL, y1: seqY, x2: W - mR, y2: seqY, "class": "d-line-hl"
+    }));
+
+    // Index scan curve — clip cleanly where it exits maxY (no misleading horizontal plateau)
+    var idxPts = [];
+    var clippedAtFrac = null;
+    for (var k = 0; k <= pts; k++) {
+      var frac = k / pts;
+      if (ic[k] <= maxY) {
+        idxPts.push((idxPts.length ? "L " : "M ") + X(frac).toFixed(1) + " " + Y(ic[k]).toFixed(1));
+      } else {
+        if (k > 0 && ic[k - 1] <= maxY) {
+          var alpha = (maxY - ic[k - 1]) / (ic[k] - ic[k - 1]);
+          clippedAtFrac = (k - 1 + alpha) / pts;
+          idxPts.push("L " + X(clippedAtFrac).toFixed(1) + " " + mT.toFixed(1));
+        }
+        break;
+      }
+    }
+    if (idxPts.length) {
+      var pIdx = Course.svgEl("path", { d: idxPts.join(" "), "class": "d-line" });
+      pIdx.setAttribute("fill", "none");
+      pIdx.setAttribute("stroke-width", "2.2");
+      svg.appendChild(pIdx);
+    }
+
+    // Find exact crossover via linear interpolation
+    var crossFrac = -1;
+    if (ic[0] >= scVal) {
+      crossFrac = 0;
+    } else {
+      for (var j = 1; j <= pts; j++) {
+        if (ic[j] >= scVal && ic[j - 1] < scVal) {
+          var tCross = (scVal - ic[j - 1]) / (ic[j] - ic[j - 1]);
+          crossFrac = (j - 1 + tCross) / pts;
+          break;
+        }
+      }
+    }
+
+    // Seq scan label (right side, below line if index ends close above it, else above line)
+    var seqLabelY = seqY - 8;
+    if (clippedAtFrac === null && Math.abs(Y(ic[pts]) - seqY) < 22) {
+      seqLabelY = seqY + 15;
+    }
+    svg.appendChild(Course.svgEl("text", {
+      x: W - mR - 6, y: seqLabelY, "text-anchor": "end", "class": "d-text-sm"
+    }, "seq scan = " + Math.round(scVal).toLocaleString() + " (flat)"));
+
+    // Index scan label (placed away from crossover and seq scan labels)
+    if (clippedAtFrac !== null) {
+      var exitX = X(clippedAtFrac);
+      var onRight = exitX < W - mR - 175;
+      svg.appendChild(Course.svgEl("text", {
+        x: onRight ? exitX + 8 : exitX - 8,
+        y: mT + 13,
+        "text-anchor": onRight ? "start" : "end",
+        "class": "d-text-sm"
+      }, "index scan ↑ (off-scale)"));
+    } else {
+      var endY = Y(ic[pts]);
+      var idxLabelY = Math.min(H - mB - 8, Math.max(mT + 14, endY - 8));
+      if (Math.abs(idxLabelY - seqLabelY) < 16) idxLabelY = Math.min(H - mB - 8, endY + 16);
+      svg.appendChild(Course.svgEl("text", {
+        x: W - mR - 6, y: idxLabelY, "text-anchor": "end", "class": "d-text-sm"
+      }, "index scan = " + Math.round(ic[pts]).toLocaleString()));
+    }
+
+    // Crossover line, dot, and non-colliding label
+    if (crossFrac >= 0) {
+      var cs = sMax * crossFrac;
+      var cx = X(crossFrac);
+      svg.appendChild(Course.svgEl("line", {
+        x1: cx, y1: mT, x2: cx, y2: H - mB, "class": "d-line", "stroke-dasharray": "4 4"
+      }));
+      svg.appendChild(Course.svgEl("circle", { cx: cx, cy: seqY, r: 4.5, "class": "d-box-hl" }));
+      var cLabelAnchor = cx > W - mR - 165 ? "end" : "start";
+      var cLabelX = cLabelAnchor === "start" ? cx + 8 : cx - 8;
+      var cLabelY = seqY - 12;
+      if (clippedAtFrac !== null && Math.abs(cx - X(clippedAtFrac)) < 150 && Math.abs(cLabelY - (mT + 13)) < 22) {
+        cLabelY = Math.min(H - mB - 10, seqY + 18);
+      }
+      svg.appendChild(Course.svgEl("text", {
+        x: cLabelX, y: cLabelY, "text-anchor": cLabelAnchor, "class": "d-text-sm", "font-weight": "600"
+      }, "crossover ≈ " + (cs * 100).toFixed(2) + "%"));
+
+      ccCap.textContent = "Below ≈" + (cs * 100).toFixed(2) + "% selectivity the index scan wins; above it, the " +
+        "sequential scan (cost " + Math.round(scVal).toLocaleString() + ") is cheaper. Table: " +
         P.toLocaleString() + " pages, " + N.toLocaleString() + " rows, clustering " + clu.toFixed(2) + ".";
     } else {
-      ccCap.textContent = "The index scan beats the seq scan across this whole selectivity range — " +
-        "high clustering makes its heap reads nearly sequential.";
+      ccCap.textContent = "The index scan (max " + Math.round(ic[pts]).toLocaleString() + " at 25%) beats the " +
+        "sequential scan (" + Math.round(scVal).toLocaleString() + ") across this entire 0–25% range — " +
+        "high clustering (" + clu.toFixed(2) + ") makes its heap reads nearly sequential.";
     }
+
+    ccChart.appendChild(svg);
   }
+
   [ccPages, ccRpp, ccClu].forEach(function (el) { el.addEventListener("input", drawCalc); });
   document.getElementById("cc-reset").addEventListener("click", function () {
-    ccPages.value = 1000; ccRpp.value = 100; ccClu.value = 20; drawCalc();
+    ccPages.value = 1000; ccRpp.value = 100; ccClu.value = 50; drawCalc();
   });
   drawCalc();
 
   /* ---------------- Selinger DP explorer ---------------- */
-  var TABLES = { C: 1000, O: 10000, L: 40000, S: 100 };
-  var SELS = { "C|O": 1 / 1000, "O|L": 1 / 10000, "L|S": 1 / 100 };
+  // Filtered base table cardinalities after predicate pushdown
+  var TABLES = { C: 200, O: 10000, L: 40000, S: 400 };
+  var SELS = { "C|O": 1 / 5000, "O|L": 1 / 10000, "L|S": 1 / 2000 };
   function selOf(a, b) {
     return SELS[a + "|" + b] || SELS[b + "|" + a] || 1; // 1 = cross product
   }
   function joinRows(setRows, setNames, t) {
-    var s = 1, any = false;
+    var s = 1;
     setNames.forEach(function (n) {
       var f = selOf(n, t);
-      if (f !== 1) { s *= f; any = true; }
+      if (f !== 1) s *= f;
     });
-    if (!any) s = 1; // pure cross product keeps s = 1
     return Math.max(1, Math.round(setRows * TABLES[t] * s));
+  }
+  // Asymmetric HashJoin cost matching FerricDB's build-left, probe-right executor
+  function hashJoinCost(leftRows, rightRows, outRows) {
+    return 2 * leftRows + rightRows + outRows;
   }
 
   var names = ["C", "O", "L", "S"];
-  var memo = {};      // key: sorted set string -> {order, rows, cost}
-  var levels = [[], [], [], []]; // level index = size-1, entries: text lines
+  var memo = {};                 // sorted subset key -> { order, rows, cost }
+  var levels = [[], [], [], []]; // level index = subset size - 1
   names.forEach(function (n) {
     memo[n] = { order: n, rows: TABLES[n], cost: 0 };
-    levels[0].push(n + ":  rows=" + TABLES[n].toLocaleString() + "  cost=0  (base table)");
+    levels[0].push(n + ":  rows=" + TABLES[n].toLocaleString() + "  cost=0  (base table after pushed filter)");
   });
+
   function subsets(arr, k) {
     if (k === 0) return [[]];
     if (!arr.length) return [];
     var rest = subsets(arr.slice(1), k - 1).map(function (s) { return [arr[0]].concat(s); });
     return rest.concat(subsets(arr.slice(1), k));
   }
+
   [2, 3, 4].forEach(function (size) {
     subsets(names, size).forEach(function (set) {
       var key = set.slice().sort().join("");
-      var best = null, tried = 0;
+      var cands = [];
       set.forEach(function (t) {
         var restKey = set.filter(function (x) { return x !== t; }).sort().join("");
         var sub = memo[restKey];
         if (!sub) return;
-        tried++;
         var rows = joinRows(sub.rows, restKey.split(""), t);
-        var cost = sub.cost + sub.rows + TABLES[t] + rows;
-        if (!best || cost < best.cost) best = { order: "(" + sub.order + " ⋈ " + t + ")", rows: rows, cost: cost };
+        var cost = sub.cost + hashJoinCost(sub.rows, TABLES[t], rows);
+        cands.push({ order: "(" + sub.order + " ⋈ " + t + ")", rows: rows, cost: cost });
       });
+      cands.sort(function (a, b) { return a.cost - b.cost; });
+      var best = cands[0];
+      var second = cands[1];
       memo[key] = best;
-      levels[size - 1].push("{" + key + "}: best " + best.order +
+      var line = "{" + key + "}: best " + best.order +
         "  rows=" + best.rows.toLocaleString() +
         "  cost=" + best.cost.toLocaleString() +
-        "  (kept 1 of " + tried + " candidates)");
+        "  (pruned " + (cands.length - 1) + "; runner-up " + second.order + " cost=" + second.cost.toLocaleString() + ")";
+      levels[size - 1].push(line);
     });
   });
 
   var joTable = document.getElementById("jo-table");
   var captions = [
-    "Level 1 — base tables. Every single-table 'plan' is just a scan; cost 0 in this teaching model.",
-    "Level 2 — pairs. For each SET of two tables the DP keeps one best plan and discards the rest. Cross-product pairs (like {C,L}) survive but with huge row counts.",
-    "Level 3 — triples. Each triple extends a remembered pair with one more table. No permutations are revisited: {C,O,L} considers only 3 candidates, not 6 orders.",
-    "Level 4 — the full join. The winner extends the best triple. Follow the parentheses: the optimal order chains the selective joins and never multiplies the cross products."
+    "Level 1 — base tables after predicate pushdown. Each single-table scan seeds the DP memo at join cost 0.",
+    "Level 2 — pairs. Asymmetric HashJoin cost strictly separates build-left from build-right: {C, O} keeps (C ⋈ O) at 10,800 and prunes (O ⋈ C) at 20,600.",
+    "Level 3 — triples. Each triple extends only the remembered best pairs: {C, O, L} evaluates 3 candidates instead of 6 orders, keeping ((C ⋈ O) ⋈ L) at 53,200.",
+    "Level 4 — full 4-table join. Winner: (((C ⋈ O) ⋈ L) ⋈ S) at cost 57,120 (320 rows) — avoiding cross products and beating naive SQL order (((L ⋈ O) ⋈ S) ⋈ C) at 234,920 by 4.1×."
   ];
   Course.stepper(document.getElementById("jo-stepper"), {
     total: 4,

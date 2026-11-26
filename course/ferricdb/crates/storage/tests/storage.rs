@@ -1,14 +1,18 @@
-//! Provided Milestone 1 test suite.
+//! Provided Milestone 1 test suite (plus MS8 compaction and MS9 put_at hooks).
 //!
-//! Every test is `#[ignore = "milestone 1"]`; run the group with
+//! Every test is `#[ignore = "milestone N"]`; run Milestone 1 with:
 //! `cargo test -p ferricdb-storage -- --include-ignored ms1_`.
 //! The tests compile against the stub API from day one, so signature drift
 //! is caught even before you start implementing.
 
 use std::sync::Arc;
 
-use ferricdb_common::{Column, DataType, RecordId, Schema, TupleMeta, Value, PAGE_SIZE};
-use ferricdb_storage::{tuple, DiskManager, HeapFile, HeapPage, Page, PageStore};
+use ferricdb_common::{
+    Column, DataType, Error, RecordId, Schema, TupleMeta, Value, INVALID_PAGE_ID, PAGE_SIZE,
+};
+use ferricdb_storage::{
+    tuple, DiskManager, HeapFile, HeapPage, HeapPageRef, Page, PageStore, PAGE_TYPE_HEAP,
+};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
@@ -80,6 +84,7 @@ fn ms1_page_lsn_roundtrip() {
 fn ms1_slotted_page_roundtrip() {
     let mut page = Page::new();
     let mut heap = HeapPage::init(&mut page);
+    assert_eq!(heap.next_page(), INVALID_PAGE_ID);
 
     let meta_a = TupleMeta { xmin: 7, xmax: 0 };
     let meta_b = TupleMeta { xmin: 8, xmax: 3 };
@@ -94,6 +99,14 @@ fn ms1_slotted_page_roundtrip() {
     let (mb, tb) = heap.get(slot_b).expect("slot B live");
     assert_eq!(mb, meta_b);
     assert_eq!(tb, b"bravo-bravo");
+
+    // Read-only view sees the exact same header and tuples without &mut Page.
+    assert!(HeapPageRef::is_initialized(&page));
+    assert_eq!(page.page_type(), PAGE_TYPE_HEAP);
+    let ro = HeapPageRef::attach(&page);
+    assert_eq!(ro.slot_count(), 2);
+    assert_eq!(ro.get(slot_a), Some((meta_a, &b"alpha"[..])));
+    assert_eq!(ro.get(slot_b), Some((meta_b, &b"bravo-bravo"[..])));
 }
 
 #[test]
@@ -108,6 +121,14 @@ fn ms1_tombstone_semantics() {
     assert!(heap.get(s0).is_none(), "tombstoned slot reads as absent");
     assert!(heap.get(s1).is_some(), "other slots unaffected");
     assert_eq!(heap.slot_count(), 2, "tombstones keep their line pointer");
+    assert!(
+        matches!(heap.delete(s0), Err(Error::InvalidSlot(_))),
+        "double-deleting a tombstoned slot errors"
+    );
+    assert!(
+        matches!(heap.delete(99), Err(Error::InvalidSlot(_))),
+        "deleting an out-of-range slot errors"
+    );
 }
 
 #[test]
@@ -187,7 +208,67 @@ fn ms1_tuple_serde_all_types_and_nulls() {
         let bytes = tuple::serialize(&schema, &row).expect("serialize");
         let back = tuple::deserialize(&schema, &bytes).expect("deserialize");
         assert_eq!(back, row);
+        // Check IEEE 754 bit identity on floats (preserves -0.0 sign bit).
+        for (a, b) in back.iter().zip(&row) {
+            if let (Value::Float(fa), Value::Float(fb)) = (a, b) {
+                assert_eq!(fa.to_bits(), fb.to_bits(), "float bits must round-trip");
+            }
+        }
     }
+}
+
+#[test]
+#[ignore = "milestone 1"]
+fn ms1_tuple_serde_wide_schema_multi_byte_bitmap() {
+    // 12 columns exercise a 2-byte null bitmap (ceil(12/8) == 2).
+    let schema = Schema {
+        columns: (0..12)
+            .map(|i| Column {
+                name: format!("c{i}"),
+                data_type: DataType::Integer,
+                nullable: true,
+            })
+            .collect(),
+    };
+    let row: Vec<Value> = (0..12)
+        .map(|i| {
+            if i % 3 == 0 || i == 10 {
+                Value::Null
+            } else {
+                Value::Integer(i * 100)
+            }
+        })
+        .collect();
+    let bytes = tuple::serialize(&schema, &row).expect("serialize wide row");
+    let back = tuple::deserialize(&schema, &bytes).expect("deserialize wide row");
+    assert_eq!(back, row);
+}
+
+#[test]
+#[ignore = "milestone 1"]
+fn ms1_tuple_serde_rejects_bad_inputs() {
+    let schema = test_schema();
+    // wrong arity
+    assert!(tuple::serialize(&schema, &[Value::Integer(1)]).is_err());
+    // NULL in non-nullable column 0
+    assert!(tuple::serialize(
+        &schema,
+        &[Value::Null, Value::Null, Value::Null, Value::Null]
+    )
+    .is_err());
+    // type mismatch (Text in Integer column)
+    assert!(tuple::serialize(
+        &schema,
+        &[
+            Value::Text("oops".into()),
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ]
+    )
+    .is_err());
+    // truncated buffer
+    assert!(tuple::deserialize(&schema, &[]).is_err());
 }
 
 #[test]
@@ -256,8 +337,11 @@ fn ms1_disk_manager_rejects_out_of_range_reads() {
     let disk = DiskManager::open(&dir.path().join("t.db")).unwrap();
     let mut out = Page::new();
     assert!(
-        disk.read_page(9999, &mut out).is_err(),
-        "unallocated page id must error"
+        matches!(
+            disk.read_page(9999, &mut out),
+            Err(Error::InvalidPage(9999))
+        ),
+        "unallocated page id must error with InvalidPage"
     );
 }
 
@@ -288,21 +372,32 @@ fn ms1_heapfile_roundtrip_and_scan() {
         );
     }
 
-    // delete every 10th, then scan sees exactly the survivors, in order
+    // delete every 10th, then scan sees exactly the survivors in (page, slot) order
     for rid in rids.iter().step_by(10) {
         heap.delete(*rid).unwrap();
     }
     let scanned: Vec<_> = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(scanned.len(), 500 - 50);
-    let expected: Vec<i64> = (0..500).filter(|i| i % 10 != 0).collect();
-    let got: Vec<i64> = scanned
+
+    // A short later row may validly backfill free space on an earlier page,
+    // so sort expected survivors by their assigned (page_id, slot) address.
+    let mut expected: Vec<(RecordId, i64)> = rids
         .iter()
-        .map(
-            |(_, _, b)| match tuple::deserialize(&schema, b).unwrap()[0] {
+        .enumerate()
+        .filter(|(i, _)| i % 10 != 0)
+        .map(|(i, &rid)| (rid, i as i64))
+        .collect();
+    expected.sort_by_key(|(rid, _)| *rid);
+
+    let got: Vec<(RecordId, i64)> = scanned
+        .iter()
+        .map(|(rid, _, b)| {
+            let id = match tuple::deserialize(&schema, b).unwrap()[0] {
                 Value::Integer(v) => v,
                 _ => panic!("first column is the id"),
-            },
-        )
+            };
+            (*rid, id)
+        })
         .collect();
     assert_eq!(
         got, expected,
@@ -331,7 +426,95 @@ fn ms1_heapfile_survives_reopen() {
     {
         let store: Arc<dyn PageStore> = Arc::new(DiskManager::open(&path).unwrap());
         let heap = HeapFile::open(store, first_page);
-        let n = heap.scan().count();
-        assert_eq!(n, 50, "all tuples visible after close/reopen");
+        let rows = heap.scan().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows.len(), 50, "all 50 tuples readable after close/reopen");
+        let mut ids: Vec<i64> = rows
+            .iter()
+            .map(
+                |(_, _, b)| match tuple::deserialize(&schema, b).unwrap()[0] {
+                    Value::Integer(v) => v,
+                    _ => panic!("first column is id"),
+                },
+            )
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..50).collect::<Vec<_>>());
     }
+}
+
+#[test]
+#[ignore = "milestone 1"]
+fn ms1_heapfile_rejects_oversized_tuple() {
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn PageStore> = Arc::new(DiskManager::open(&dir.path().join("t.db")).unwrap());
+    let heap = HeapFile::create(store).unwrap();
+    let huge = vec![0xAAu8; PAGE_SIZE];
+    assert!(
+        matches!(
+            heap.insert(TupleMeta::default(), &huge),
+            Err(Error::PageFull)
+        ),
+        "a tuple larger than one page must return Error::PageFull"
+    );
+}
+
+// -------------------------------------------------- MS8 & MS9 page hooks
+
+#[test]
+#[ignore = "milestone 8"]
+fn ms8_heap_page_compact_reclaims_space() {
+    let mut page = Page::new();
+    let mut heap = HeapPage::init(&mut page);
+    let mut slots = Vec::new();
+    for i in 0..20u8 {
+        slots.push(heap.insert(TupleMeta::default(), &[i; 200]).unwrap());
+    }
+    let free_before = heap.free_space();
+    for &s in slots.iter().step_by(2) {
+        heap.delete(s).unwrap();
+    }
+    let reclaimed = heap.compact();
+    assert!(
+        reclaimed >= 2000,
+        "compaction must reclaim dead tuple bodies"
+    );
+    assert!(heap.free_space() > free_before);
+    // Live slot numbers and payloads are preserved intact.
+    for (idx, &s) in slots.iter().enumerate() {
+        if idx % 2 == 0 {
+            assert!(heap.get(s).is_none());
+        } else {
+            let (_, bytes) = heap.get(s).expect("live slot preserved");
+            assert_eq!(bytes, &[idx as u8; 200]);
+        }
+    }
+}
+
+#[test]
+#[ignore = "milestone 9"]
+fn ms9_heap_page_put_at_redo_undo() {
+    let mut page = Page::new();
+    let mut heap = HeapPage::init(&mut page);
+    let m1 = TupleMeta { xmin: 1, xmax: 0 };
+    let m2 = TupleMeta { xmin: 2, xmax: 0 };
+
+    // Redo an insert directly at slot 2 (skips 0 and 1 as dead slots).
+    heap.put_at(2, m1, b"hello").unwrap();
+    assert_eq!(heap.get(0), None);
+    assert_eq!(heap.get(1), None);
+    assert_eq!(heap.get(2), Some((m1, &b"hello"[..])));
+
+    // Overwrite slot 2 with a longer payload (Update redo / undo).
+    heap.put_at(2, m2, b"a much longer updated payload")
+        .unwrap();
+    assert_eq!(
+        heap.get(2),
+        Some((m2, &b"a much longer updated payload"[..]))
+    );
+
+    // Tombstone, then resurrect slot 2 (Delete undo).
+    heap.delete(2).unwrap();
+    assert_eq!(heap.get(2), None);
+    heap.put_at(2, m1, b"hello").unwrap();
+    assert_eq!(heap.get(2), Some((m1, &b"hello"[..])));
 }

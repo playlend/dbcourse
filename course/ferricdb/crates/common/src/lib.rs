@@ -10,10 +10,6 @@
 //! You do not implement anything here. Read it once so you know what is
 //! available, then move on to `ferricdb-storage` (Milestone 1).
 
-// This crate ships fully implemented; the allow below matches the other
-// starter crates for consistency and is safe to remove.
-#![allow(unused_variables, dead_code)]
-
 use std::cmp::Ordering;
 
 /// Size of one on-disk page in bytes. Matches PostgreSQL's default block
@@ -37,8 +33,11 @@ pub type FrameId = usize;
 /// `xmax` is 0 has not been deleted by any transaction).
 pub type TxnId = u64;
 
-/// Log sequence number — the byte offset / ordinal position of a record
-/// in the write-ahead log (Milestone 9). `0` means "no LSN yet".
+/// Log sequence number — strictly increasing position of a record in the
+/// write-ahead log (Milestone 9). `0` is the sentinel meaning "no LSN yet"
+/// (fresh pages start at `pageLSN = 0`; the first transaction record has
+/// `prev_lsn = 0`). Real log records must always receive `Lsn >= 1` (for
+/// example, `1 + byte_offset` or the record's end byte offset).
 pub type Lsn = u64;
 
 /// Object identifier assigned by the catalog to tables and indexes
@@ -46,7 +45,7 @@ pub type Lsn = u64;
 pub type Oid = u32;
 
 /// The SQL data types FerricDB supports.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DataType {
     /// SQL BOOLEAN.
     Boolean,
@@ -62,6 +61,13 @@ pub enum DataType {
 ///
 /// `Value` is what executors pass between operators and what
 /// `ferricdb-storage::tuple` serializes into heap tuples.
+///
+/// Note that the derived [`PartialEq`] is **structural** (for tests and
+/// assertions: `Value::Null == Value::Null` is `true`, and
+/// `Value::Integer(3) != Value::Float(3.0)`), **not** SQL equality —
+/// executors must always use [`Value::sql_cmp`]. Because `Float(f64)` is
+/// neither `Eq` nor `Hash`, Milestone 6 hash operators (joins, `GROUP BY`)
+/// wrap keys in a small newtype that canonicalizes `-0.0` / `f64::to_bits()`.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Value {
     /// SQL NULL — the absence of a value, of no particular type.
@@ -119,7 +125,7 @@ impl Value {
 }
 
 /// One column of a table schema: its name, type, and nullability.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Column {
     /// Column name as declared in `CREATE TABLE` (stored lowercase by the
     /// binder's conventions; `Schema::index_of` matches exactly).
@@ -132,7 +138,7 @@ pub struct Column {
 
 /// An ordered list of [`Column`]s describing the shape of a tuple —
 /// a table's row layout or an executor's output row layout.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Schema {
     /// Columns in tuple order.
     pub columns: Vec<Column>,
@@ -158,19 +164,25 @@ impl Schema {
 /// Tuple version metadata, present in every stored tuple header from
 /// Milestone 1 (written as 0 until Milestone 8 starts using it).
 ///
-/// `xmin` is the transaction that created this tuple version; `xmax` is
-/// the transaction that deleted it (0 = not deleted). These drive MVCC
-/// visibility (`ferricdb-txn::Snapshot::is_visible`, Milestone 8).
+/// `xmin` is the transaction that created this tuple version (`0` means
+/// **frozen / bootstrap**, treated as committed in the distant past so
+/// pre-MS8 or catalog-bootstrapped tuples stay visible under MVCC);
+/// `xmax` is the transaction that deleted it (`0` = not deleted). These
+/// drive MVCC visibility (`ferricdb-txn::Snapshot::is_visible`, Milestone 8).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TupleMeta {
-    /// Id of the transaction that inserted this tuple version (0 = none).
+    /// Id of the transaction that inserted this tuple version (`0` = frozen/bootstrap).
     pub xmin: TxnId,
-    /// Id of the transaction that deleted this tuple version (0 = live).
+    /// Id of the transaction that deleted this tuple version (`0` = live).
     pub xmax: TxnId,
 }
 
 /// Physical tuple address: (page, slot) — Postgres calls this the ctid.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+///
+/// Ordered lexicographically by `(page_id, slot)` so B+Tree composite
+/// `(key, rid)` entries have a total order and heap scans can assert
+/// `(page_id, slot)` ordering directly.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RecordId {
     /// Page the tuple lives on.
     pub page_id: PageId,

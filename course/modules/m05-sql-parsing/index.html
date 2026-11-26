@@ -24,12 +24,12 @@
 
 <main>
   <h1>M05 · SQL Front-End: Tokenizing, Parsing, Binding</h1>
-  <p class="subtitle">From a string of characters to a checked, typed tree the planner can work
-  with — lexing, recursive descent, Pratt expression parsing, and name resolution against the
-  catalog.</p>
+  <p class="subtitle">From a flat string of SQL characters to a checked, typed tree the planner
+  can transform — hand-written lexing, recursive descent, Pratt expression parsing, and semantic
+  binding against a self-hosted system catalog.</p>
 
-  <noscript><p class="noscript-warn">The live tokenizer/AST demo and quizzes on this page need
-  JavaScript; all explanatory content is readable without it.</p></noscript>
+  <noscript><p class="noscript-warn">The live tokenizer/AST explorer and self-check quizzes on this
+  page need JavaScript; all explanatory prose, tables, and diagrams read fine without it.</p></noscript>
 
   <div class="toc">
     <strong>On this page</strong>
@@ -38,195 +38,470 @@
       <li><a href="#sec-lexing">Lexing: characters to tokens</a></li>
       <li><a href="#sec-rd">Recursive descent: tokens to statements</a></li>
       <li><a href="#sec-pratt">Pratt parsing: expressions done right</a></li>
-      <li><a href="#sec-demo">Live demo: tokenizer and AST</a></li>
+      <li><a href="#sec-demo">Live demo: tokenizer and AST explorer</a></li>
       <li><a href="#sec-ast">Designing the AST</a></li>
-      <li><a href="#sec-binding">Binding: names meet the catalog</a></li>
+      <li><a href="#sec-binding">Binding: names meet the self-hosted catalog</a></li>
       <li><a href="#sec-philosophies">Two philosophies: plan trees vs bytecode</a></li>
       <li><a href="#sec-quiz">Check your understanding</a></li>
       <li><a href="#sec-sources">Primary sources</a></li>
     </ol>
   </div>
 
-  <p>Everything below the front-end — buffer pool, heap files, and soon B+Trees — deals in bytes
-  and pages. Everything above it — planner, executor, transactions — deals in tables, columns,
-  and predicates. The front-end is the translation layer: it takes
-  <code>SELECT name FROM users WHERE age &gt;= 18;</code> as a string and delivers a data
-  structure that says, precisely and checkably, what the user meant. In FerricDB you will build
-  it by hand, the way production Rust parsers actually are: a hand-written lexer, a recursive
-  descent statement parser, and a Pratt parser for expressions — the exact architecture of
-  sqlparser-rs, the parser underneath much of the Rust database ecosystem.<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  <p>Everything you have built so far — fixed-size 8&nbsp;KB pages, slotted heap files, and the
+  buffer pool — speaks exclusively in byte offsets, page ids, and frame latches. Everything you
+  will build next — relational planners, cost-based optimizers, and Volcano executors — speaks in
+  tables, column ordinals, typed expressions, and predicates. The SQL front-end is the bridge
+  between those two worlds: it turns a raw string like
+  <code>SELECT name, age FROM users WHERE age &gt;= 18;</code> into a checked, typed data
+  structure that downstream layers can execute without ever touching raw SQL text again.</p>
+
+  <p>In FerricDB you build the front-end by hand in Rust, following the exact architecture of
+  <code>sqlparser-rs</code> (Apache DataFusion's SQL parser, widely used across the Rust database
+  ecosystem): a hand-written lexer, a recursive-descent statement parser, and a Pratt
+  (top-down operator-precedence) parser for expressions.<sup class="cite"><a href="#ref-1">1</a></sup>
+  You also pair it with a catalog-backed binder modeled on PostgreSQL's analyzer.<sup class="cite"><a href="#ref-3">3</a></sup>
+  Writing a parser by hand demystifies every syntax error you have ever seen from a database, and
+  it keeps your grammar small, explicit, and easy to extend across Milestones&nbsp;3 through&nbsp;8.</p>
 
   <h2 id="sec-pipeline">The front-end pipeline</h2>
-  <p>PostgreSQL processes every query through five subsystems: the <em>parser</em> builds a parse
-  tree from the SQL text; the <em>analyzer</em> performs semantic analysis and produces a query
-  tree; the <em>rewriter</em> applies rules; the <em>planner</em> turns the query tree into a
-  plan tree; and the <em>executor</em> runs it.<sup class="cite"><a href="#ref-3">3</a></sup>
-  FerricDB keeps the same shape with smaller words: <strong>lexer → parser → binder</strong>,
-  then planner and executor in Modules 6–8. The parser knows grammar but no schema; the binder
-  knows the schema but no grammar. Keeping those concerns apart is what makes both testable.</p>
+  <p>PostgreSQL routes every incoming SQL command through five distinct query-processing
+  subsystems:<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  <ol>
+    <li><strong>Parser:</strong> checks lexical and grammatical syntax and builds a raw
+      <em>parse tree</em> — without consulting any table metadata.</li>
+    <li><strong>Analyzer (semantic analysis):</strong> resolves table and column names against the
+      system catalogs, checks expression types, and produces a <em>query tree</em>.</li>
+    <li><strong>Rewriter:</strong> applies rule-system transformations (such as expanding views).</li>
+    <li><strong>Planner / Optimizer:</strong> turns the query tree into the cheapest physical
+      <em>plan tree</em> using statistics and a cost model.</li>
+    <li><strong>Executor:</strong> walks the plan tree to read and modify pages through the buffer
+      pool.</li>
+  </ol>
+
+  <p>FerricDB adopts the same modular architecture with leaner names and crate boundaries:
+  <strong>Lexer → Parser</strong> live in <code>crates/sql</code> (depending only on
+  <code>crates/common</code>), <strong>Catalog</strong> lives in <code>crates/catalog</code>
+  (backed by your Milestone&nbsp;1–2 <code>PageStore</code>), and the <strong>Binder</strong>
+  (PostgreSQL's analyzer) lives in <code>crates/exec/src/binder.rs</code>. Notice the clean
+  separation of responsibilities: the lexer sees only characters, the parser knows grammar but zero
+  schema, and the binder knows the schema (via the catalog) but zero syntax. Because
+  <code>crates/sql</code> never imports <code>crates/catalog</code>, you can fuzz and unit-test
+  every edge of the grammar in milliseconds without opening a single database file.</p>
 
   <figure>
-    <svg viewBox="0 0 920 190" role="img">
-      <title>FerricDB front-end pipeline: SQL text through lexer, parser, binder, to a bound
-      statement, with the catalog feeding the binder.</title>
-      <rect x="20" y="60" width="150" height="54" rx="8" class="d-box"/>
-      <text x="95" y="83" text-anchor="middle" class="d-text" font-weight="600">SQL text</text>
-      <text x="95" y="102" text-anchor="middle" class="d-mono-sm">"SELECT name…"</text>
-      <rect x="220" y="60" width="150" height="54" rx="8" class="d-box-hl"/>
-      <text x="295" y="83" text-anchor="middle" class="d-text" font-weight="600">Lexer</text>
-      <text x="295" y="102" text-anchor="middle" class="d-mono-sm">Vec&lt;Token&gt;</text>
-      <rect x="420" y="60" width="150" height="54" rx="8" class="d-box-hl"/>
-      <text x="495" y="83" text-anchor="middle" class="d-text" font-weight="600">Parser</text>
-      <text x="495" y="102" text-anchor="middle" class="d-mono-sm">ast::Statement</text>
-      <rect x="620" y="60" width="150" height="54" rx="8" class="d-box-hl"/>
-      <text x="695" y="83" text-anchor="middle" class="d-text" font-weight="600">Binder</text>
-      <text x="695" y="102" text-anchor="middle" class="d-mono-sm">BoundStatement</text>
-      <rect x="620" y="140" width="150" height="40" rx="8" class="d-box"/>
-      <text x="695" y="165" text-anchor="middle" class="d-text">Catalog</text>
-      <path d="M 170 87 H 220" class="d-line"/>
-      <path d="M 370 87 H 420" class="d-line"/>
-      <path d="M 570 87 H 620" class="d-line"/>
-      <path d="M 770 87 H 830" class="d-line"/>
-      <text x="855" y="91" class="d-text-sm">to planner</text>
-      <path d="M 695 140 V 114" class="d-line"/>
-      <text x="770" y="132" class="d-text-sm">names, types</text>
-      <text x="295" y="45" text-anchor="middle" class="d-text-sm">grammar only</text>
-      <text x="695" y="45" text-anchor="middle" class="d-text-sm">schema only</text>
+    <svg viewBox="0 0 920 225" role="img">
+      <title>FerricDB front-end pipeline: SQL text flows through Lexer (characters to tokens) and
+      Parser (grammar only) in crates/sql, into Binder (schema only) in crates/exec fed by Catalog
+      below, and onward to Planner.</title>
+      <defs>
+        <marker id="m05-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <!-- Stage role annotations above boxes -->
+      <text x="275" y="28" text-anchor="middle" class="d-text-sm">characters → tokens</text>
+      <text x="475" y="28" text-anchor="middle" class="d-text-sm">grammar only (crates/sql)</text>
+      <text x="675" y="28" text-anchor="middle" class="d-text-sm">schema &amp; types (crates/exec)</text>
+
+      <!-- Main pipeline boxes -->
+      <rect x="16" y="46" width="144" height="58" rx="8" class="d-box"/>
+      <text x="88" y="70" text-anchor="middle" class="d-text" font-weight="600">SQL text</text>
+      <text x="88" y="90" text-anchor="middle" class="d-mono-sm">"SELECT name…"</text>
+
+      <rect x="203" y="46" width="144" height="58" rx="8" class="d-box-hl"/>
+      <text x="275" y="70" text-anchor="middle" class="d-text" font-weight="600">Lexer</text>
+      <text x="275" y="90" text-anchor="middle" class="d-mono-sm">Vec&lt;Token&gt;</text>
+
+      <rect x="403" y="46" width="144" height="58" rx="8" class="d-box-hl"/>
+      <text x="475" y="70" text-anchor="middle" class="d-text" font-weight="600">Parser</text>
+      <text x="475" y="90" text-anchor="middle" class="d-mono-sm">ast::Statement</text>
+
+      <rect x="603" y="46" width="144" height="58" rx="8" class="d-box-hl"/>
+      <text x="675" y="70" text-anchor="middle" class="d-text" font-weight="600">Binder</text>
+      <text x="675" y="90" text-anchor="middle" class="d-mono-sm">BoundStatement</text>
+
+      <rect x="802" y="46" width="102" height="58" rx="8" class="d-box"/>
+      <text x="853" y="70" text-anchor="middle" class="d-text" font-weight="600">Planner</text>
+      <text x="853" y="90" text-anchor="middle" class="d-text-sm">M06 / MS4</text>
+
+      <!-- Catalog feeding Binder -->
+      <rect x="603" y="152" width="144" height="52" rx="8" class="d-box-good"/>
+      <text x="675" y="174" text-anchor="middle" class="d-text" font-weight="600">Catalog</text>
+      <text x="675" y="193" text-anchor="middle" class="d-mono-sm">__tables, __columns</text>
+
+      <!-- Directed arrows -->
+      <path d="M 160 75 H 201" class="d-line-hl" marker-end="url(#m05-arr)"/>
+      <path d="M 347 75 H 401" class="d-line-hl" marker-end="url(#m05-arr)"/>
+      <path d="M 547 75 H 601" class="d-line-hl" marker-end="url(#m05-arr)"/>
+      <path d="M 747 75 H 800" class="d-line-hl" marker-end="url(#m05-arr)"/>
+      <path d="M 675 152 V 106" class="d-line" marker-end="url(#m05-arr)"/>
+      <text x="687" y="133" text-anchor="start" class="d-text-sm">names, types, OIDs</text>
     </svg>
-    <figcaption>Figure 1 — FerricDB's front-end. Postgres's parser/analyzer split, with the
-    binder playing the analyzer's role.<sup class="cite"><a href="#ref-3">3</a></sup></figcaption>
+    <figcaption>Figure 1 — FerricDB's front-end mirrors PostgreSQL's parser/analyzer split:
+    syntax stays in <code>crates/sql</code> while schema lookup and type checking live in
+    <code>crates/exec::binder</code>.<sup class="cite"><a href="#ref-3">3</a></sup></figcaption>
   </figure>
 
   <h2 id="sec-lexing">Lexing: characters to tokens</h2>
-  <p>The lexer's job is deliberately dumb: chop the character stream into <strong>tokens</strong>
-  — keywords, identifiers, literals, operators, punctuation — and attach positions for error
-  messages. All the intelligence lives in three small policies:</p>
+  <p>A lexer (scanner / tokenizer) walks raw UTF-8 text once from left to right and emits a flat
+  sequence of typed <strong>tokens</strong> — keywords, identifiers, literals, operators, and
+  punctuation — discarding insignificant whitespace and comments. Putting character-level rules in
+  a dedicated pass keeps the parser free of whitespace checks and lets every downstream rule work
+  on discrete symbols.</p>
+
+  <p>Six concrete policies govern FerricDB's lexer (documented in
+  <code>course/ferricdb/crates/sql/src/lib.rs</code> and modeled on standard SQL and
+  PostgreSQL<sup class="cite"><a href="#ref-5">5</a></sup>):</p>
   <ul>
-    <li><strong>Keywords are case-insensitive; a keyword is just a promoted identifier.</strong>
-      Scan an identifier first (<code>[A-Za-z_][A-Za-z0-9_]*</code>), then check its uppercased
-      form against the keyword table. <code>select</code>, <code>Select</code>, and
-      <code>SELECT</code> are the same token; <code>selection</code> is an identifier.</li>
-    <li><strong>Maximal munch.</strong> At <code>&gt;=</code>, emit one <code>GtEq</code> token,
-      not <code>Gt</code> then <code>Eq</code>. Always take the longest operator that matches —
-      which just means checking two-character operators before one-character ones.</li>
-    <li><strong>Literals carry their value.</strong> <code>42</code> becomes
-      <code>Token::Integer(42)</code>, <code>'O''Brien'</code> becomes a string token with the
-      doubled quote already collapsed — SQL's string escape is <code>''</code>, not
-      <code>\'</code>. Numbers with a decimal point become floats.</li>
+    <li><strong>Keywords are case-insensitive; unquoted identifiers fold to lowercase.</strong>
+      When the scanner sees a leading ASCII letter or underscore (<code>[A-Za-z_]</code>), it
+      consumes the full word <code>[A-Za-z0-9_]*</code> and checks its case-folded form against the
+      keyword table. Thus <code>SELECT</code>, <code>select</code>, and <code>SeLeCt</code> all
+      produce <code>Token::Keyword(Keyword::Select)</code>, while <code>Selection</code> or
+      <code>Users</code> is not a reserved word and becomes <code>Token::Ident("selection")</code>
+      or <code>Token::Ident("users")</code>. Folding unquoted identifiers to lowercase matches
+      PostgreSQL's lexical rule so <code>CREATE TABLE Users</code> and <code>SELECT * FROM users</code>
+      refer to the exact same table.<sup class="cite"><a href="#ref-5">5</a></sup> (Double-quoted
+      case-preserving identifiers are deliberately out of scope in this course.)</li>
+    <li><strong><code>TRUE</code> / <code>FALSE</code> vs. <code>NULL</code>.</strong>
+      In FerricDB, <code>TRUE</code> and <code>FALSE</code> (any case) lex directly to
+      <code>Token::BoolLit(true)</code> and <code>Token::BoolLit(false)</code> rather than keyword
+      tokens. <code>NULL</code>, however, remains <code>Token::Keyword(Keyword::Null)</code>
+      because it plays multiple grammatical roles: a literal expression (<code>VALUES (NULL)</code>),
+      a column constraint (<code>NOT NULL</code>), and a postfix predicate
+      (<code>IS NOT NULL</code>).</li>
+    <li><strong>Maximal munch on operators and comments.</strong> At <code>&gt;=</code>, emit one
+      <code>Token::GtEq</code> rather than <code>Gt</code> followed by <code>Eq</code>; at
+      <code>&lt;&gt;</code> or <code>!=</code>, emit <code>Token::NotEq</code>; at <code>--</code>,
+      discard everything through the next newline (or end of input) as a SQL line comment rather
+      than emitting two <code>Token::Minus</code> tokens. Always test two-character sequences before
+      single-character operators.</li>
+    <li><strong>Typed literals with SQL escaping.</strong> Digit runs become
+      <code>Token::IntegerLit(i64)</code> (parsed immediately; overflow is a
+      <code>Error::Parse</code>, never a panic). A leading <code>-</code> is <em>not</em> folded
+      into the integer token — it lexes as <code>Token::Minus</code> so <code>x-1</code> parses as
+      subtraction rather than <code>Ident("x")</code> followed by <code>IntegerLit(-1)</code>.
+      Digits with an embedded decimal point (<code>digits.digits</code>, e.g., <code>3.14</code>)
+      become <code>Token::FloatLit(f64)</code>. Single-quoted strings preserve case inside the
+      quotes and unescape doubled single quotes (<code>'O''Brien'</code> →
+      <code>Token::StringLit("O'Brien")</code>) per standard SQL<sup class="cite"><a href="#ref-5">5</a></sup>
+      — never backslash escaping. An unterminated string reaching EOF must return
+      <code>Err(Error::Parse(...))</code>.</li>
+    <li><strong>Errors are values, never panics.</strong> A stray <code>!</code> not followed by
+      <code>=</code>, an integer overflowing <code>i64</code>, an unterminated string literal, or
+      any unrecognized character (<code>#</code>, <code>@</code>) returns
+      <code>Err(Error::Parse)</code> quoting the offending text.</li>
+    <li><strong>No source spans on <code>Token</code> (course choice).</strong> Production compilers
+      and parsers attach <code>(line, column)</code> byte spans to every token for caret diagnostics.
+      FerricDB omits spans from <code>Token</code> to keep the enum compact and pattern-matching
+      ergonomic in Milestone&nbsp;3 (adding spans is a clean optional refinement; the interactive
+      demo below still displays character offsets so you can trace positions visually).</li>
   </ul>
-  <p>One design choice worth pausing on: SQLite drives its pipeline by having the
-  <em>tokenizer call the parser</em> with one token at a time — the docs argue it is faster and
-  easier to make thread-safe than the parser pulling tokens.<sup class="cite"><a href="#ref-2">2</a></sup>
-  FerricDB (like sqlparser-rs) does the simplest correct thing instead: tokenize the whole input
-  into a <code>Vec&lt;Token&gt;</code> up front, then let the parser walk it with
-  <code>peek()</code>/<code>next()</code>. For statement-sized inputs the difference is
-  irrelevant, and the two-phase version is far easier to test — your <code>ms3_</code> lexer
-  tests assert on token vectors directly.</p>
+
+  <h3>Push vs. pull lexing</h3>
+  <p>There is an instructive architectural fork in how the lexer and parser hand tokens across their
+  boundary. SQLite uses a <em>push</em> design: the hand-written tokenizer runs the outer loop and
+  calls the generated parser with one token at a time, which SQLite's architecture guide notes is
+  both fast and naturally thread-safe without global state.<sup class="cite"><a href="#ref-2">2</a></sup>
+  FerricDB — like <code>sqlparser-rs</code><sup class="cite"><a href="#ref-1">1</a></sup> — uses a
+  two-phase <em>pull</em> design: <code>Lexer::tokenize(input)</code> produces a complete
+  <code>Vec&lt;Token&gt;</code> up front, and <code>Parser</code> walks a slice cursor over that
+  vector via <code>peek()</code> and <code>next()</code>. For statement-sized SQL inputs
+  (typically tens to hundreds of tokens), allocating one <code>Vec</code> takes nanoseconds, and
+  decoupling the two passes lets Milestone&nbsp;3's <code>ms3_lexer_*</code> tests assert exact
+  token vectors directly.</p>
 
   <h2 id="sec-rd">Recursive descent: tokens to statements</h2>
-  <p>A recursive descent parser is a grammar transcribed into functions: one function per rule,
-  each consuming the tokens it expects and delegating to other rule-functions for the parts it
-  contains.<sup class="cite"><a href="#ref-1">1</a></sup> FerricDB's statement grammar fits on a
-  napkin, and the parser reads like the napkin:</p>
+  <p>Once the input is a token vector, the parser turns flat tokens into nested tree nodes.
+  <strong>Recursive descent</strong> is the most direct way to parse structured statements: each
+  grammar production becomes one Rust method that inspects the next token, consumes the expected
+  punctuation and keywords, and recursively calls sub-methods for nested clauses.<sup class="cite"><a href="#ref-1">1</a></sup>
+  SQL's top-level statements are ideal for recursive descent because every statement announces
+  itself with a distinctive leading keyword (<code>SELECT</code>, <code>INSERT</code>,
+  <code>UPDATE</code>, <code>DELETE</code>, <code>CREATE</code>, <code>DROP</code>,
+  <code>BEGIN</code>, <code>COMMIT</code>, <code>ROLLBACK</code>, and later <code>ANALYZE</code>,
+  <code>EXPLAIN</code>, <code>VACUUM</code>):</p>
 
-  <pre><code>fn parse_statement(&amp;mut self) -&gt; Result&lt;Statement&gt; {
+  <pre><code>fn parse_statement(&amp;mut self) -&gt; Result&lt;ast::Statement&gt; {
     match self.peek() {
-        Token::Keyword(Kw::Select) =&gt; self.parse_select(),
-        Token::Keyword(Kw::Insert) =&gt; self.parse_insert(),
-        Token::Keyword(Kw::Create) =&gt; self.parse_create(),   // TABLE | INDEX
-        // … DROP, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK
-        other =&gt; Err(self.unexpected(other, "a statement keyword")),
+        Some(Token::Keyword(Keyword::Select)) =&gt; self.parse_select(),
+        Some(Token::Keyword(Keyword::Insert)) =&gt; self.parse_insert(),
+        Some(Token::Keyword(Keyword::Update)) =&gt; self.parse_update(),
+        Some(Token::Keyword(Keyword::Delete)) =&gt; self.parse_delete(),
+        Some(Token::Keyword(Keyword::Create)) =&gt; self.parse_create(), // TABLE | INDEX
+        Some(Token::Keyword(Keyword::Drop))   =&gt; self.parse_drop(),
+        Some(Token::Keyword(Keyword::Begin))  =&gt; { self.next(); Ok(Statement::Begin) }
+        Some(Token::Keyword(Keyword::Commit)) =&gt; { self.next(); Ok(Statement::Commit) }
+        Some(Token::Keyword(Keyword::Rollback)) =&gt; { self.next(); Ok(Statement::Rollback) }
+        other =&gt; Err(Error::Parse(format!("expected statement keyword, found {other:?}"))),
     }
-}
+}</code></pre>
 
-// SELECT projection FROM table [WHERE expr] [ORDER BY expr [DESC], …] [LIMIT n]
-fn parse_select(&amp;mut self) -&gt; Result&lt;Statement&gt; { /* one clause at a time */ }</code></pre>
-
-  <p>Two disciplines keep a recursive descent parser pleasant for its whole life. First, the
-  <strong>peek/expect split</strong>: <code>peek()</code> looks without consuming and drives
-  decisions; <code>expect(tok)</code> consumes exactly one required token or returns an error
-  naming what it wanted and what it found. If every consumption goes through those two, you can
-  never "eat" a token on a failed path and derail the error message. Second,
-  <strong>errors are values</strong>: parse functions return
-  <code>Result&lt;_, Error::Parse(String)&gt;</code> and bubble up with <code>?</code> — the
-  REPL prints one clean line, and the invalid-SQL test corpus asserts errors, never panics.</p>
+  <p>Three habits keep a hand-written recursive-descent parser clean as the grammar grows from
+  Milestone&nbsp;3 through Milestone&nbsp;8:</p>
+  <ol>
+    <li><strong>The <code>peek</code> / <code>expect</code> discipline.</strong> Branch on
+      <code>self.peek()</code> without consuming, and consume required tokens through helper methods
+      like <code>self.expect_keyword(Keyword::From)?</code> or
+      <code>self.expect(Token::LParen)?</code>. When a helper fails, it returns
+      <code>Err(Error::Parse(...))</code> naming both what was expected and what token was actually
+      sitting at the cursor. Never speculatively pop a token and hope to put it back.</li>
+    <li><strong>Optional clauses and multi-statement scripts.</strong> Notice how cleanly optional
+      clauses fall out of <code>peek()</code>: in <code>parse_select</code>, <code>FROM</code> is
+      optional (so <code>SELECT 1 + 1</code> parses with <code>from: vec![]</code>), followed by
+      optional <code>WHERE</code>, optional <code>GROUP BY</code> (MS6), optional
+      <code>ORDER BY</code> (defaulting each key to ascending <code>desc = false</code>), and
+      optional <code>LIMIT</code>. At the script level, <code>Parser::parse</code> loops while
+      tokens remain, skipping empty/stray semicolons (<code>; ;</code> → empty <code>Vec</code>)
+      and allowing an optional trailing semicolon.</li>
+    <li><strong>Left-associative <code>JOIN</code> chains vs. comma-separated <code>FROM</code>.</strong>
+      In Milestone&nbsp;6, <code>FROM a, b</code> keeps two separate entries in
+      <code>Select::from</code> (implicit cross product), whereas <code>FROM a JOIN b ON … JOIN c
+      ON …</code> loops inside <code>parse_table_ref</code> to nest <code>TableRef::Join</code>
+      left-associatively (<code>Join(Join(a, b), c)</code>) as a single entry in
+      <code>Select::from</code>.</li>
+  </ol>
 
   <h2 id="sec-pratt">Pratt parsing: expressions done right</h2>
-  <p>Statements parse cleanly with recursive descent because each one starts with a distinctive
-  keyword. Expressions don't: <code>price * 1.08 &gt;= 100 AND NOT discontinued</code> is a flat
-  stream of operands and infix operators, and the grammar question is <em>who binds
-  tighter</em>. You can encode precedence into recursive descent as a ladder of functions
-  (<code>parse_or</code> → <code>parse_and</code> → <code>parse_cmp</code> → …), but every new
-  precedence level means a new function, and the call depth grows with the number of levels, not
-  the expression. The elegant alternative — used by sqlparser-rs for exactly this job — is the
-  <strong>Pratt parser</strong>, also known as top-down operator-precedence
-  (TDOP).<sup class="cite"><a href="#ref-1">1</a></sup></p>
+  <p>Statements announce themselves with leading keywords, so recursive descent handles them
+  effortlessly. Expressions do not: in <code>a + 1 &gt; b AND NOT c IS NULL</code>, every infix
+  and postfix operator sits <em>between</em> or <em>after</em> operands, and the tree shape depends
+  entirely on operator precedence and associativity. Encoding eight precedence levels in pure
+  recursive descent requires eight boilerplate wrapper functions (<code>parse_or</code> calling
+  <code>parse_and</code> calling <code>parse_not</code> calling <code>parse_is_null</code> …),
+  making every literal traverse eight stack frames.</p>
 
-  <p>The whole algorithm is one loop and one number. Every operator gets a <em>binding
-  power</em>; the parse function takes the minimum power it is willing to bind:</p>
+  <p>The cleaner solution — and the exact technique <code>sqlparser-rs</code> uses for SQL
+  expressions<sup class="cite"><a href="#ref-1">1</a></sup> — is <strong>Pratt parsing</strong>
+  (top-down operator precedence, or TDOP). Instead of one function per precedence level, you write
+  <em>one</em> function parameterized by a minimum binding power <code>min_bp: u8</code>:</p>
 
-  <pre><code>fn parse_expr(&amp;mut self, min_bp: u8) -&gt; Result&lt;Expr&gt; {
-    // 1. prefix position: literal, column, '(' expr ')', or a prefix op
+  <pre><code>fn parse_expr(&amp;mut self, min_bp: u8) -&gt; Result&lt;ast::Expr&gt; {
+    // 1. Prefix / nud ("null denotation"): literals, columns, parens, prefix ops
     let mut lhs = match self.next() {
-        Token::Minus =&gt; Expr::Unary(Neg, parse_expr(PREFIX_BP)?),  // recurse
-        Token::Keyword(Kw::Not) =&gt; Expr::Unary(Not, parse_expr(NOT_BP)?),
-        tok =&gt; self.parse_primary(tok)?,
+        Some(Token::Keyword(Keyword::Not)) =&gt; {
+            ast::Expr::Unary(UnaryOp::Not, Box::new(self.parse_expr(3)?))
+        }
+        Some(Token::Minus) =&gt; {
+            ast::Expr::Unary(UnaryOp::Neg, Box::new(self.parse_expr(8)?))
+        }
+        Some(Token::LParen) =&gt; {
+            let inner = self.parse_expr(0)?;
+            self.expect(Token::RParen)?;
+            inner
+        }
+        Some(tok) =&gt; self.parse_primary(tok)?,
+        None =&gt; return Err(Error::Parse("unexpected end of input in expression".into())),
     };
-    // 2. infix loop: extend lhs while the next operator binds tightly enough
-    while let Some(op) = self.peek_infix_op() {
-        let bp = binding_power(op);
+
+    // 2. Postfix &amp; Infix / led ("left denotation") loop
+    loop {
+        // Postfix IS [NOT] NULL has binding power 4
+        if matches!(self.peek(), Some(Token::Keyword(Keyword::Is))) {
+            if 4 &lt; min_bp { break; }
+            self.next();
+            let negated = self.consume_if(Token::Keyword(Keyword::Not));
+            self.expect_keyword(Keyword::Null)?;
+            lhs = ast::Expr::IsNull(Box::new(lhs), negated);
+            continue;
+        }
+        let Some((op, bp)) = self.peek_infix_op() else { break };
         if bp &lt; min_bp { break; }
-        self.next();                       // consume the operator
-        let rhs = self.parse_expr(bp + 1)?; // +1 ⇒ left-associative
-        lhs = Expr::Binary(lhs, op, rhs);
+        self.next();                              // consume the infix operator
+        let rhs = self.parse_expr(bp + 1)?;       // bp + 1 ⇒ left-associative
+        lhs = ast::Expr::Binary(Box::new(lhs), op, Box::new(rhs));
     }
     Ok(lhs)
 }</code></pre>
 
-  <p>FerricDB's binding-power table, low to high — the same relative order every SQL engine
-  uses:</p>
+  <p>FerricDB's unified <strong>8-level binding-power table</strong> (shared verbatim between
+  <code>crates/sql/src/lib.rs</code> and <code>crates/sql/src/ast.rs</code>, modeled on
+  PostgreSQL's operator precedence table<sup class="cite"><a href="#ref-5">5</a></sup>):</p>
+
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Power</th><th>Operators</th><th>Note</th></tr></thead>
+      <thead>
+        <tr><th>Power</th><th>Operators</th><th>Position / Associativity</th><th>Example grouping</th></tr>
+      </thead>
       <tbody>
-        <tr><td>1</td><td><code>OR</code></td><td>binds loosest</td></tr>
-        <tr><td>2</td><td><code>AND</code></td><td></td></tr>
-        <tr><td>3</td><td><code>NOT</code></td><td>prefix</td></tr>
-        <tr><td>4</td><td><code>= != &lt;&gt; &lt; &lt;= &gt; &gt;= IS [NOT] NULL</code></td><td>comparisons</td></tr>
-        <tr><td>5</td><td><code>+ -</code></td><td>additive</td></tr>
-        <tr><td>6</td><td><code>* / %</code></td><td>multiplicative</td></tr>
-        <tr><td>7</td><td>unary <code>-</code></td><td>prefix</td></tr>
+        <tr><td><strong>1</strong></td><td><code>OR</code></td><td>infix, left-associative</td><td><code>a OR b OR c</code> ⇒ <code>(a OR b) OR c</code></td></tr>
+        <tr><td><strong>2</strong></td><td><code>AND</code></td><td>infix, left-associative</td><td><code>a OR b AND c</code> ⇒ <code>a OR (b AND c)</code></td></tr>
+        <tr><td><strong>3</strong></td><td><code>NOT</code></td><td>prefix</td><td><code>NOT a AND b</code> ⇒ <code>(NOT a) AND b</code></td></tr>
+        <tr><td><strong>4</strong></td><td><code>IS NULL</code>, <code>IS NOT NULL</code></td><td>postfix</td><td><code>NOT c IS NULL</code> ⇒ <code>NOT (c IS NULL)</code></td></tr>
+        <tr><td><strong>5</strong></td><td><code>=</code> <code>&lt;&gt;</code> <code>!=</code> <code>&lt;</code> <code>&lt;=</code> <code>&gt;</code> <code>&gt;=</code></td><td>infix, left-associative</td><td><code>a + 1 &gt; b</code> ⇒ <code>(a + 1) &gt; b</code></td></tr>
+        <tr><td><strong>6</strong></td><td><code>+</code> <code>-</code></td><td>infix, left-associative</td><td><code>a - b - c</code> ⇒ <code>(a - b) - c</code></td></tr>
+        <tr><td><strong>7</strong></td><td><code>*</code> <code>/</code> <code>%</code></td><td>infix, left-associative</td><td><code>1 + 2 * 3</code> ⇒ <code>1 + (2 * 3)</code></td></tr>
+        <tr><td><strong>8</strong></td><td>unary <code>-</code></td><td>prefix</td><td><code>-2 * 3</code> ⇒ <code>(-2) * 3</code></td></tr>
+        <tr><td><strong>9</strong></td><td>literals, <code>[q.]col</code>, <code>CAST(e AS t)</code>, <code>fn(args)</code>, <code>COUNT(*)</code>, <code>(e)</code></td><td>primary atoms</td><td>always bind tightest</td></tr>
       </tbody>
     </table>
   </div>
 
-  <p>Trace <code>1 + 2 * 3</code> through the loop and the magic demystifies. The outer call
-  (<code>min_bp = 0</code>) parses <code>1</code>, sees <code>+</code> (power 5, ≥ 0), and
-  recurses for the right side with <code>min_bp = 6</code>. That inner call parses
-  <code>2</code>, sees <code>*</code> (power 6, ≥ 6 — allowed), recurses again, gets
-  <code>3</code>, and returns <code>2 * 3</code>. The outer call finishes with
-  <code>1 + (2 * 3)</code>. Now trace <code>a OR b AND c</code>: <code>OR</code> is power 1, so
-  the recursion for its right side uses <code>min_bp = 2</code>, which lets <code>AND</code>
-  (power 2) proceed — yielding <code>a OR (b AND c)</code>, exactly SQL's rule. Precedence
-  emerges from a comparison between two integers. That is the entire trick.</p>
+  <h3>Worked traces: precedence and associativity by integer comparison</h3>
+  <p>Three short traces cover every mechanism in the Pratt loop:</p>
+  <ol>
+    <li><strong>Precedence (<code>1 + 2 * 3</code>):</strong> The outer call starts with
+      <code>min_bp = 0</code>, reads <code>1</code>, sees <code>+</code> (BP&nbsp;6 ≥ 0), consumes
+      <code>+</code>, and recurses for <code>rhs</code> with <code>min_bp = 7</code>. The inner
+      call reads <code>2</code>, sees <code>*</code> (BP&nbsp;7 ≥ 7 — allowed!), consumes
+      <code>*</code>, recurses with <code>min_bp = 8</code>, reads <code>3</code>, and returns
+      <code>Binary(2, Mul, 3)</code>. The outer call wraps that into
+      <code>Binary(1, Add, Binary(2, Mul, 3))</code>.</li>
+    <li><strong>Left-associativity (<code>a - b - c</code>):</strong> The outer call
+      (<code>min_bp = 0</code>) reads <code>a</code>, sees the first <code>-</code> (BP&nbsp;6 ≥ 0),
+      and recurses with <code>min_bp = 7</code> (<code>bp + 1</code>). The inner call reads
+      <code>b</code>, peeks at the second <code>-</code> (BP&nbsp;6 &lt; 7), and <em>breaks</em>,
+      returning bare <code>b</code>. The outer call finishes <code>lhs = (a - b)</code>, loops
+      again at <code>min_bp = 0</code>, sees the second <code>-</code> (BP&nbsp;6 ≥ 0), and builds
+      <code>(a - b) - c</code>. Had you passed <code>bp</code> instead of <code>bp + 1</code>, the
+      inner call would have swallowed the second <code>-</code> and built right-associative
+      <code>a - (b - c)</code>.</li>
+    <li><strong>Mixed prefix, postfix, comparison, and logic
+      (<code>a + 1 &gt; b AND NOT c IS NULL</code>):</strong> Figure&nbsp;2 traces how every
+      operator lands at its exact level: <code>+</code> (6) binds tighter than <code>&gt;</code>
+      (5), which binds tighter than <code>AND</code> (2); on the right of <code>AND</code>, prefix
+      <code>NOT</code> recurses with <code>min_bp = 3</code>, so postfix <code>IS NULL</code>
+      (BP&nbsp;4 ≥ 3) attaches to <code>c</code> <em>inside</em> <code>NOT</code>, giving
+      <code>((a + 1) &gt; b) AND (NOT (c IS NULL))</code>.</li>
+  </ol>
 
-  <h2 id="sec-demo">Live demo: tokenizer and AST</h2>
-  <p>This is a working lexer and Pratt parser for a subset of FerricDB's grammar
-  (<code>SELECT … FROM … WHERE … ORDER BY … LIMIT …</code> with full expressions). Type SQL and
-  watch both phases; the preset buttons reproduce the traces above.</p>
+  <figure>
+    <svg viewBox="0 0 920 356" role="img">
+      <title>Pratt expression parsing trace on a + 1 &gt; b AND NOT c IS NULL: flat token stream
+      with binding powers above, and the resulting AST tree below.</title>
+      <defs>
+        <marker id="m05-arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"/>
+        </marker>
+      </defs>
+
+      <!-- Top band: flat token stream with binding powers -->
+      <text x="24" y="22" class="d-text-sm" font-weight="600">Token stream &amp; Pratt binding powers (low binds loosest):</text>
+
+      <!-- Tokens across x=24..896 -->
+      <rect x="24" y="34" width="66" height="44" rx="6" class="d-box"/>
+      <text x="57" y="54" text-anchor="middle" class="d-mono">a</text>
+      <text x="57" y="70" text-anchor="middle" class="d-text-sm">atom</text>
+
+      <rect x="102" y="34" width="66" height="44" rx="6" class="d-box-hl"/>
+      <text x="135" y="54" text-anchor="middle" class="d-mono">+</text>
+      <text x="135" y="70" text-anchor="middle" class="d-mono-sm">bp 6</text>
+
+      <rect x="180" y="34" width="66" height="44" rx="6" class="d-box"/>
+      <text x="213" y="54" text-anchor="middle" class="d-mono">1</text>
+      <text x="213" y="70" text-anchor="middle" class="d-text-sm">atom</text>
+
+      <rect x="258" y="34" width="66" height="44" rx="6" class="d-box-hl"/>
+      <text x="291" y="54" text-anchor="middle" class="d-mono">&gt;</text>
+      <text x="291" y="70" text-anchor="middle" class="d-mono-sm">bp 5</text>
+
+      <rect x="336" y="34" width="66" height="44" rx="6" class="d-box"/>
+      <text x="369" y="54" text-anchor="middle" class="d-mono">b</text>
+      <text x="369" y="70" text-anchor="middle" class="d-text-sm">atom</text>
+
+      <rect x="418" y="34" width="84" height="44" rx="6" class="d-box-warn"/>
+      <text x="460" y="54" text-anchor="middle" class="d-mono">AND</text>
+      <text x="460" y="70" text-anchor="middle" class="d-mono-sm">bp 2 (root)</text>
+
+      <rect x="518" y="34" width="76" height="44" rx="6" class="d-box-hl"/>
+      <text x="556" y="54" text-anchor="middle" class="d-mono">NOT</text>
+      <text x="556" y="70" text-anchor="middle" class="d-mono-sm">pre 3</text>
+
+      <rect x="608" y="34" width="66" height="44" rx="6" class="d-box"/>
+      <text x="641" y="54" text-anchor="middle" class="d-mono">c</text>
+      <text x="641" y="70" text-anchor="middle" class="d-text-sm">atom</text>
+
+      <rect x="688" y="34" width="112" height="44" rx="6" class="d-box-hl"/>
+      <text x="744" y="54" text-anchor="middle" class="d-mono">IS NULL</text>
+      <text x="744" y="70" text-anchor="middle" class="d-mono-sm">post 4</text>
+
+      <!-- Arrow down to AST -->
+      <path d="M 460 78 V 112" class="d-line-hl" marker-end="url(#m05-arr2)"/>
+      <text x="472" y="100" text-anchor="start" class="d-text-sm">lowest binding power rises to the AST root</text>
+
+      <!-- AST Root: Binary(And) -->
+      <rect x="378" y="116" width="164" height="40" rx="8" class="d-box-warn"/>
+      <text x="460" y="141" text-anchor="middle" class="d-mono" font-weight="600">Binary(And)  [bp 2]</text>
+
+      <!-- Level 2: Binary(Gt) and Unary(Not) -->
+      <rect x="172" y="188" width="164" height="40" rx="8" class="d-box-hl"/>
+      <text x="254" y="213" text-anchor="middle" class="d-mono">Binary(Gt)  [bp 5]</text>
+
+      <rect x="614" y="188" width="164" height="40" rx="8" class="d-box-hl"/>
+      <text x="696" y="213" text-anchor="middle" class="d-mono">Unary(Not)  [pre 3]</text>
+
+      <!-- Edges root -> L2 -->
+      <path d="M 418 156 L 280 186" class="d-line" marker-end="url(#m05-arr2)"/>
+      <path d="M 502 156 L 670 186" class="d-line" marker-end="url(#m05-arr2)"/>
+
+      <!-- Level 3: Binary(Add), Column(b), IsNull -->
+      <rect x="82" y="256" width="164" height="38" rx="8" class="d-box-hl"/>
+      <text x="164" y="280" text-anchor="middle" class="d-mono">Binary(Add) [bp 6]</text>
+
+      <rect x="292" y="256" width="118" height="38" rx="8" class="d-box-good"/>
+      <text x="351" y="280" text-anchor="middle" class="d-mono">Column(b)</text>
+
+      <rect x="622" y="256" width="148" height="38" rx="8" class="d-box-hl"/>
+      <text x="696" y="280" text-anchor="middle" class="d-mono">IsNull  [post 4]</text>
+
+      <!-- Edges L2 -> L3 -->
+      <path d="M 224 228 L 178 254" class="d-line" marker-end="url(#m05-arr2)"/>
+      <path d="M 284 228 L 338 254" class="d-line" marker-end="url(#m05-arr2)"/>
+      <path d="M 696 228 V 254" class="d-line" marker-end="url(#m05-arr2)"/>
+
+      <!-- Level 4: Column(a), Literal(1), Column(c) -->
+      <rect x="34" y="314" width="116" height="34" rx="6" class="d-box-good"/>
+      <text x="92" y="336" text-anchor="middle" class="d-mono">Column(a)</text>
+
+      <rect x="176" y="314" width="116" height="34" rx="6" class="d-box-good"/>
+      <text x="234" y="336" text-anchor="middle" class="d-mono">Literal(1)</text>
+
+      <rect x="638" y="314" width="116" height="34" rx="6" class="d-box-good"/>
+      <text x="696" y="336" text-anchor="middle" class="d-mono">Column(c)</text>
+
+      <!-- Edges L3 -> L4 -->
+      <path d="M 136 294 L 106 312" class="d-line" marker-end="url(#m05-arr2)"/>
+      <path d="M 192 294 L 220 312" class="d-line" marker-end="url(#m05-arr2)"/>
+      <path d="M 696 294 V 312" class="d-line" marker-end="url(#m05-arr2)"/>
+    </svg>
+    <figcaption>Figure 2 — Pratt parsing on <code>a + 1 &gt; b AND NOT c IS NULL</code>. Tighter
+    operators sink toward the leaves; looser operators rise toward the root.</figcaption>
+  </figure>
+
+  <h3>Special primary forms: <code>CAST</code> and <code>COUNT(*)</code></h3>
+  <p>Two SQL expression forms live inside <code>parse_primary</code> rather than the infix loop.
+  First, <code>CAST(expr AS type)</code> starts with <code>Keyword::Cast</code>, parses a nested
+  expression at <code>min_bp = 0</code>, expects <code>AS</code> plus a SQL type keyword
+  (<code>BOOLEAN</code>, <code>INT</code>/<code>INTEGER</code>, <code>FLOAT</code>/<code>DOUBLE</code>,
+  <code>TEXT</code>/<code>VARCHAR</code>), and builds <code>Expr::Cast</code>. Second, function calls
+  start with an identifier followed by <code>(</code>: fold the function name to lowercase and parse
+  comma-separated argument expressions, with one special SQL rule for <code>COUNT(*)</code> —
+  seeing <code>*</code> immediately inside <code>COUNT(</code> produces
+  <code>Expr::Function("count".into(), vec![])</code> (matching
+  <code>AggExpr { func: AggFunc::Count, arg: None }</code> in Milestone&nbsp;6), while rejecting
+  <code>*</code> inside arbitrary expressions like <code>1 + *</code>.</p>
+
+  <h2 id="sec-demo">Live demo: tokenizer and AST explorer</h2>
+  <p>This live front-end implements FerricDB's exact lexing policies (lowercase-folded identifiers,
+  <code>--</code> line comments, <code>''</code> string unescaping, unterminated-string errors) and
+  unified 8-level Pratt parser over <code>SELECT … [FROM …] [WHERE …] [GROUP BY …] [ORDER BY …]
+  [LIMIT …]</code>. Try the presets or edit the SQL directly — including intentional errors like
+  <code>SELECT 'unterminated</code> or <code>SELECT 1 + *;</code>.</p>
 
   <div class="widget" id="fe-demo">
-    <p class="widget-title">Tokenizer + AST explorer</p>
-    <p class="widget-sub">Edit the SQL; tokens and the parse tree update live. Errors appear with
-    a position pointer.</p>
+    <p class="widget-title">Tokenizer + Pratt AST explorer</p>
+    <p class="widget-sub">Edit the SQL; tokens and the parsed AST update live with every keystroke.</p>
     <div class="controls">
-      <button class="btn" type="button" data-preset="SELECT name, age FROM users WHERE age &gt;= 18 AND NOT banned ORDER BY age DESC LIMIT 10;">sample query</button>
+      <button class="btn" type="button" data-preset="SELECT name, age FROM users WHERE age &gt;= 18 AND NOT banned IS NULL ORDER BY age DESC LIMIT 10;">sample query</button>
       <button class="btn" type="button" data-preset="SELECT 1 + 2 * 3;">1 + 2 * 3</button>
       <button class="btn" type="button" data-preset="SELECT (1 + 2) * 3;">(1 + 2) * 3</button>
-      <button class="btn" type="button" data-preset="SELECT * FROM t WHERE a OR b AND c;">a OR b AND c</button>
+      <button class="btn" type="button" data-preset="SELECT * FROM t WHERE a + 1 &gt; b AND NOT c IS NULL;">Fig 2 precedence</button>
+      <button class="btn" type="button" data-preset="-- aggregate + cast example&#10;SELECT nation, COUNT(*), CAST(SUM(total) AS FLOAT) AS rev FROM orders GROUP BY nation;">COUNT(*) &amp; CAST</button>
       <button class="btn" type="button" id="fe-reset">↺ Reset</button>
     </div>
-    <textarea id="fe-input" rows="3" spellcheck="false" style="width:100%;font-family:var(--mono);font-size:0.9rem;background:var(--code-bg);color:var(--code-text);border:1px solid var(--border);border-radius:6px;padding:0.6rem;"></textarea>
+    <label for="fe-input" class="muted" style="display:block;font-size:0.86rem;margin-bottom:0.3rem;">SQL input:</label>
+    <textarea id="fe-input" rows="3" spellcheck="false" aria-label="SQL input for tokenizer and AST explorer" style="width:100%;font-family:var(--mono);font-size:0.9rem;background:var(--code-bg);color:var(--code-text);border:1px solid var(--border);border-radius:6px;padding:0.6rem;"></textarea>
     <div class="grid-2">
       <div>
         <p class="widget-sub" style="margin-top:0.8rem"><strong>Token stream</strong></p>
@@ -239,22 +514,32 @@ fn parse_select(&amp;mut self) -&gt; Result&lt;Statement&gt; { /* one clause at 
     </div>
   </div>
 
-  <p>Compare the two arithmetic presets: same tokens except two parentheses, entirely different
-  trees. The parenthesis never appears in the AST — it exists only to steer the parser. That is
-  the deepest fact about syntax trees: they record structure, not spelling.</p>
+  <p>Compare the <code>1 + 2 * 3</code> and <code>(1 + 2) * 3</code> presets: identical literals,
+  two extra parenthesis tokens, completely different trees — and neither parenthesis survives into
+  the AST. Parentheses exist solely to reset <code>min_bp = 0</code> during parsing. Also notice
+  the <code>COUNT(*) &amp; CAST</code> preset: the <code>--</code> comment vanishes during lexing,
+  <code>COUNT(*)</code> produces <code>Function(count)</code> with zero arguments, and every
+  literal node carries its concrete value.</p>
 
   <h2 id="sec-ast">Designing the AST</h2>
-  <p>The abstract syntax tree is the contract between the front-end and everything downstream,
-  and Rust's enums are nearly a domain-specific language for writing one. FerricDB's
-  (abridged from <code>crates/sql</code> — the workspace stubs have the full set):</p>
+  <p>The abstract syntax tree in <code>course/ferricdb/crates/sql/src/ast.rs</code> is the frozen
+  syntactic contract between <code>ferricdb-sql</code> and <code>ferricdb-exec</code>. Every
+  statement variant the course will ever need is declared up front in Milestone&nbsp;3 so you never
+  have to refactor the enum definitions later — you grow the parser into them milestone by
+  milestone:</p>
 
   <pre><code>pub enum Statement {
     CreateTable { name: String, columns: Vec&lt;ColumnDef&gt; },
+    DropTable { name: String },
     Insert { table: String, columns: Option&lt;Vec&lt;String&gt;&gt;, rows: Vec&lt;Vec&lt;Expr&gt;&gt; },
     Select(Box&lt;Select&gt;),
     Update { table: String, set: Vec&lt;(String, Expr)&gt;, filter: Option&lt;Expr&gt; },
-    Begin, Commit, Rollback,           // parsed now, executed in Milestone 8
-    // … DropTable, Delete, CreateIndex, Analyze, Explain, Vacuum
+    Delete { table: String, filter: Option&lt;Expr&gt; },
+    Begin, Commit, Rollback,                             // parsed MS3, executed MS8
+    CreateIndex { name: String, table: String, column: String }, // MS5
+    Analyze { table: Option&lt;String&gt; },                   // MS7
+    Explain { analyze: bool, inner: Box&lt;Statement&gt; },    // MS7
+    Vacuum,                                              // MS8
 }
 
 pub enum Expr {
@@ -262,106 +547,165 @@ pub enum Expr {
     Column(Option&lt;String&gt;, String),    // (qualifier, name): users.age or age
     Unary(UnaryOp, Box&lt;Expr&gt;),
     Binary(Box&lt;Expr&gt;, BinaryOp, Box&lt;Expr&gt;),
-    IsNull(Box&lt;Expr&gt;, bool),           // IS NULL / IS NOT NULL
+    IsNull(Box&lt;Expr&gt;, bool),           // false = IS NULL, true = IS NOT NULL
     Cast(Box&lt;Expr&gt;, DataType),
-    Function(String, Vec&lt;Expr&gt;),       // aggregates arrive in Milestone 6
+    Function(String, Vec&lt;Expr&gt;),       // lowercase; COUNT(*) = Function("count", vec![])
 }</code></pre>
 
-  <p>Notice what is <em>not</em> here: no page ids, no column indexes, no types on expressions.
-  The AST is faithful to the text. <code>SELECT nonexistent FROM ghosts</code> parses perfectly —
-  and should, because "is this grammatical?" and "does this name anything?" are different
-  questions with different owners. Postgres draws the same line: its parser explicitly does not
-  touch the catalog; semantic checking belongs to the analyzer.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  <p>Notice what is deliberately absent from <code>ast::Statement</code> and <code>ast::Expr</code>:
+  no page ids, no table OIDs, no column offsets, and no inferred types on expressions.
+  <code>SELECT ghost FROM nowhere</code> parses cleanly without error — and should, because
+  "is this sentence grammatical?" and "does this table exist right now?" are separate questions
+  with separate owners. PostgreSQL enforces this exact boundary: its parser never touches the
+  system catalogs; semantic validation belongs strictly to the analyzer.<sup class="cite"><a href="#ref-3">3</a></sup>
+  The one small normalization the parser does apply is purely syntactic: mapping SQL type synonyms
+  (<code>INT</code> → <code>DataType::Integer</code>, <code>DOUBLE</code> →
+  <code>DataType::Float</code>, <code>VARCHAR</code> → <code>DataType::Text</code>) and marking
+  <code>PRIMARY KEY</code> columns as <code>nullable: false</code> inside
+  <code>ColumnDef</code>.</p>
 
-  <h2 id="sec-binding">Binding: names meet the catalog</h2>
-  <p>The binder walks the AST with the catalog in hand and settles every question the parser
-  deferred. It resolves <code>users</code> to a table (or fails with a good error), resolves
-  <code>age</code> to column 1 of that table with type <code>Integer</code> (or fails —
-  ambiguous if two FROM tables have an <code>age</code>, unknown if none do), types every
-  expression bottom-up (<code>age &gt;= 18</code>: Integer vs Integer ⇒ Boolean ✓;
-  <code>age + name</code> ⇒ type error), and checks statement-shape rules like INSERT arity —
-  three columns declared, three values per row supplied. Out comes a
-  <code>BoundStatement</code> in which every column reference is a
-  <code>(table_index, column_index)</code> pair and every expression knows its type. This mirrors
-  Postgres's analyzer, which turns the parse tree into a query tree with names resolved against
-  the system catalogs.<sup class="cite"><a href="#ref-3">3</a></sup></p>
+  <h2 id="sec-binding">Binding: names meet the self-hosted catalog</h2>
+  <p>The <strong>binder</strong> (<code>course/ferricdb/crates/exec/src/binder.rs</code>) walks the
+  parsed AST with a <code>&amp;Catalog</code> reference and settles every semantic question the
+  parser deferred, mirroring PostgreSQL's analyzer.<sup class="cite"><a href="#ref-3">3</a></sup>
+  Its responsibilities break into four clean checks:</p>
 
-  <p>The catalog itself is the best kind of dogfooding: FerricDB stores it <em>in the
-  database</em> — two bootstrap heap tables, <code>__tables</code> and <code>__columns</code>, at
-  fixed page ids, describing every table including themselves. Postgres does the same with
-  <code>pg_class</code> and <code>pg_attribute</code>. Milestone 3's guidance walks the
-  chicken-and-egg: the bootstrap schemas must be compile-time constants, because you cannot look
-  up the schema of <code>__columns</code> inside <code>__columns</code> until you already know
-  it.</p>
+  <ol>
+    <li><strong>Flattening the <code>FROM</code> scope &amp; resolving columns.</strong> Each base
+      table in the <code>FROM</code> clause is looked up via <code>catalog.table(name)</code> and
+      assigned a positional <code>table_idx: usize</code> (<code>0</code>, <code>1</code>, …) in left-to-right order,
+      remembering its optional alias (e.g., <code>users AS u</code>). A qualified reference
+      <code>u.age</code> searches only the table whose alias or name is <code>u</code>; an
+      unqualified reference <code>age</code> searches every table in scope and rejects with
+      <code>Error::Bind</code> if zero tables have it (unknown column) or two or more tables share
+      it (ambiguous column). Every surviving column becomes
+      <code>BoundExpr::Column { table, column, data_type }</code> — from this point onward, neither
+      the planner nor the executor ever does string lookups on column names.</li>
+    <li><strong>Bottom-up type checking &amp; implicit numeric widening.</strong> Every
+      <code>BoundExpr</code> has a deterministic inferred type: comparisons yield
+      <code>DataType::Boolean</code>, arithmetic requires numeric operands, <code>WHERE</code> and
+      <code>JOIN … ON</code> predicates must type-check to <code>Boolean</code> (rejecting
+      <code>WHERE id</code> or <code>SELECT name + 1</code> with <code>Error::Bind</code>), and
+      <code>INSERT</code> rows must match the target column list in arity, types, and
+      <code>NOT NULL</code> constraints. One practical SQL convenience FerricDB adopts (exercised
+      heavily in Milestone&nbsp;6): an <strong><code>Integer</code> expression implicitly widens to
+      <code>Float</code></strong> when inserted or updated into a <code>FLOAT</code> column or
+      combined with a <code>FLOAT</code> in arithmetic or comparisons (such as
+      <code>INSERT INTO orders (o_total) VALUES (100)</code> or <code>o_total &gt; 100</code>).</li>
+    <li><strong>Wildcard expansion &amp; output schemas.</strong> <code>SELECT *</code> expands
+      into every column of every <code>FROM</code> table in order; explicit projections carry their
+      alias (or column name / synthesized name) into <code>BoundSelect::schema</code>, which flows
+      into <code>LogicalPlan::Projection::schema</code> and finally into
+      <code>QueryResult::schema</code>.</li>
+    <li><strong>Separating aggregates &amp; <code>BoundExpr::InputRef</code> (Milestone&nbsp;6).</strong>
+      When Milestone&nbsp;6 adds <code>GROUP BY</code> and aggregate functions (<code>COUNT</code>,
+      <code>SUM</code>, <code>AVG</code>, <code>MIN</code>, <code>MAX</code>), the binder extracts
+      aggregates into <code>BoundSelect::aggregates: Vec&lt;AggExpr&gt;</code>. Because
+      <code>LogicalPlan::Aggregate</code> replaces the base-table row layout with
+      <code>[group_by_0, …, agg_0, …]</code>, post-aggregate projections and <code>ORDER BY</code>
+      expressions reference columns by flat offset using
+      <code>BoundExpr::InputRef { index, data_type }</code>.</li>
+  </ol>
 
-  <h2 id="sec-philosophies">Two philosophies: plan trees vs bytecode</h2>
-  <p>Every SQL front-end ends at "a checked representation of the query" — but what happens next
-  splits the database world into two schools.</p>
+  <h3>The self-hosted catalog bootstrap trick</h3>
+  <p>Where does the catalog itself live? If it were an in-memory <code>HashMap</code>, restarting
+  FerricDB would wipe every table definition even though the heap pages are still sitting safely on
+  disk. Production relational databases store the catalog <em>as tables inside the database
+  itself</em> — PostgreSQL uses <code>pg_class</code> (tables and indexes) and
+  <code>pg_attribute</code> (columns).<sup class="cite"><a href="#ref-3">3</a></sup><sup class="cite"><a href="#ref-6">6</a></sup>
+  FerricDB follows the exact same dogfooding pattern with internal heap tables
+  (<code>__tables</code> and <code>__columns</code>, plus index and statistics metadata in
+  Milestones&nbsp;5 and&nbsp;7) rooted at fixed bootstrap page ids.</p>
+
+  <div class="callout note">
+    <span class="callout-title">Breaking the bootstrap chicken-and-egg</span>
+    <p>You cannot read <code>__columns</code> to discover the schema of <code>__columns</code>!
+    Every self-hosted database breaks the cycle the same way: the schemas and root page ids of the
+    bootstrap system tables are <strong>compile-time constants</strong> inside
+    <code>crates/catalog</code>. On an empty file, <code>Catalog::bootstrap</code> allocates and
+    formats those fixed pages; on an existing file, it reads them with the compiled-in bootstrap
+    schemas, reconstructs the in-memory cache of every user table (filtering out internal
+    <code>__*</code> tables from <code>Catalog::tables()</code>), and resumes handing out OIDs
+    above the highest existing OID.</p>
+  </div>
+
+  <h2 id="sec-philosophies">Two philosophies: plan trees vs. bytecode</h2>
+  <p>Every SQL front-end ends with a validated, typed representation of the query. What happens
+  immediately afterward divides relational database engines into two classic architectural
+  schools:</p>
 
   <div class="tabs">
     <div class="tab-list" role="tablist">
-      <button role="tab" aria-selected="true">PostgreSQL: plan trees</button>
-      <button role="tab" aria-selected="false">SQLite: bytecode</button>
+      <button type="button" role="tab" aria-selected="true">PostgreSQL: plan trees</button>
+      <button type="button" role="tab" aria-selected="false">SQLite: VDBE bytecode</button>
     </div>
     <div class="tab-panel">
-      <p>Postgres transforms tree to tree to tree: parse tree → query tree → plan tree, and the
-      executor walks the final tree directly, each node an operator pulling rows from its
-      children.<sup class="cite"><a href="#ref-3">3</a></sup> The representation stays
-      structural all the way down, which makes it natural to inspect (<code>EXPLAIN</code> prints
-      the tree), transform (the optimizer rewrites trees), and extend (a new operator is a new
-      node type). <strong>FerricDB follows this school</strong>: your Milestone 4 planner emits a
-      <code>LogicalPlan</code> tree and your executor is a tree of iterators.</p>
+      <p>PostgreSQL keeps its intermediate representation as explicit trees from start to finish:
+      <strong>parse tree → query tree → plan tree</strong>, and its executor walks the final plan
+      tree directly, pulling tuples up through nested operator nodes.<sup class="cite"><a href="#ref-3">3</a></sup>
+      Keeping the query structural makes algebraic rewrites (predicate pushdown, projection
+      pruning), cost-based join enumeration, human-readable <code>EXPLAIN</code> output, and adding
+      new physical operators straightforward. <strong>FerricDB follows this school:</strong>
+      Milestone&nbsp;4 lowers <code>BoundStatement</code> into a <code>LogicalPlan</code> tree and
+      executes it with Volcano iterators, and Milestone&nbsp;7 optimizes that same tree.</p>
     </div>
     <div class="tab-panel" hidden>
-      <p>SQLite compiles SQL all the way to <em>bytecode</em> and runs it on a virtual machine
-      (the VDBE): <code>sqlite3_prepare_v2()</code> is literally a compiler, and a prepared
-      statement is a container for one bytecode program.<sup class="cite"><a href="#ref-2">2</a></sup>
-      Its parser is generated by Lemon — SQLite's own YACC-style generator, chosen for a
-      less error-prone input syntax and a reentrant, thread-safe output — rather than written by
-      hand.<sup class="cite"><a href="#ref-2">2</a></sup> Bytecode buys SQLite compact prepared
-      statements and a tiny, fast interpreter loop — the right trade for an embedded engine that
-      compiles every statement it runs. The cost is opacity: transforming a bytecode program is
-      much harder than transforming a tree, which is one reason optimizer-heavy systems stay
-      structural. cstack's tutorial builds the miniature version of this design: a
-      "compiler" producing a statement struct and a "virtual machine" executing
-      it.<sup class="cite"><a href="#ref-4">4</a></sup></p>
+      <p>SQLite takes a compiler architecture all the way down: its tokenizer and Lemon-generated
+      parser (SQLite's own LALR(1) generator, written for a cleaner input grammar and reentrant,
+      thread-safe output) feed a code generator that compiles SQL into register-based
+      <strong>bytecode</strong> executed by the Virtual Database Engine (VDBE).<sup class="cite"><a href="#ref-2">2</a></sup>
+      Calling <code>sqlite3_prepare_v2()</code> literally compiles a statement into a tiny bytecode
+      program (which you can inspect with SQLite's <code>EXPLAIN</code>). Bytecode produces compact
+      prepared statements and a tight interpreter loop well suited to an embedded engine, at the
+      expense of making complex multi-stage plan rewrites harder than tree-to-tree passes.
+      cstack's tutorial demonstrates the smallest possible version of this compiler-plus-VM
+      split.<sup class="cite"><a href="#ref-4">4</a></sup></p>
     </div>
   </div>
 
   <h2 id="sec-quiz">Check your understanding</h2>
 
-  <fieldset class="quiz" data-explain="The parser owns grammar; the binder owns meaning. A parser that consults the catalog can no longer be tested without a database, and schema changes would alter what parses. Postgres draws the identical line between its parser and analyzer.">
-    <legend class="quiz-q">SELECT ghost FROM nowhere parses without error. Is that a bug?</legend>
-    <label><input type="radio" name="q1"> Yes — the parser should reject unknown tables immediately</label>
-    <label><input type="radio" name="q1" data-correct> No — grammaticality and name resolution are separate stages; the binder rejects it</label>
-    <label><input type="radio" name="q1"> Yes, but only for SELECT; other statements defer checks</label>
+  <fieldset class="quiz" data-explain="The parser owns syntax; the binder owns semantics. If the parser consulted the catalog, you could not unit-test grammar rules without a live database, and schema DDL would alter what is grammatical. PostgreSQL maintains the exact same split between its parser and analyzer.">
+    <legend class="quiz-q">1. <code>SELECT ghost FROM nowhere</code> parses with zero errors. Is that a bug in your Milestone&nbsp;3 parser?</legend>
+    <label><input type="radio" name="q1"> Yes — the parser must validate every table name before returning an AST</label>
+    <label><input type="radio" name="q1" data-correct> No — syntax and schema resolution are separate stages; the binder rejects unknown tables</label>
+    <label><input type="radio" name="q1"> Yes, for <code>SELECT</code> only; DDL statements defer validation</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="Recursing with the operator's own power + 1 means an operator of equal power coming up next fails the bp < min_bp test and returns to the outer loop — so a - b - c groups as (a - b) - c. Recursing with the same power would make it right-associative.">
-    <legend class="quiz-q">In the Pratt loop, why does the recursion use bp + 1 rather than bp?</legend>
-    <label><input type="radio" name="q2"> To reserve power values for future operators</label>
-    <label><input type="radio" name="q2" data-correct> It makes equal-power operators left-associative: a − b − c parses as (a − b) − c</label>
-    <label><input type="radio" name="q2"> To prevent infinite recursion on malformed input</label>
+  <fieldset class="quiz" data-explain="Recursing with bp + 1 forces the inner call to stop if the next operator has equal binding power (bp < bp + 1), returning to the outer loop so a - b - c groups left-to-right as (a - b) - c. Passing bp instead of bp + 1 makes an operator right-associative.">
+    <legend class="quiz-q">2. In Pratt parsing, why does the infix loop recurse for <code>rhs</code> with <code>min_bp = bp + 1</code> rather than <code>bp</code>?</legend>
+    <label><input type="radio" name="q2"> To reserve odd integers for postfix operators</label>
+    <label><input type="radio" name="q2" data-correct> To make equal-precedence operators left-associative: <code>a - b - c</code> parses as <code>(a - b) - c</code></label>
+    <label><input type="radio" name="q2"> To prevent stack overflow on parenthesized expressions</label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="AND (power 2) binds tighter than OR (power 1), so b AND c forms first: a OR (b AND c). This matches SQL everywhere — and it is why WHERE clauses mixing OR and AND without parentheses are a classic source of bugs in hand-written queries, too.">
-    <legend class="quiz-q">How does a OR b AND c parse?</legend>
-    <label><input type="radio" name="q3"> (a OR b) AND c — left to right</label>
-    <label><input type="radio" name="q3" data-correct> a OR (b AND c) — AND binds tighter</label>
-    <label><input type="radio" name="q3"> It is a parse error without parentheses</label>
+  <fieldset class="quiz" data-explain="In FerricDB's 8-level table, IS NULL has postfix power 4, prefix NOT has power 3, AND has power 2, and OR has power 1. Therefore c IS NULL binds tightest, NOT wraps (c IS NULL), AND joins b with (NOT (c IS NULL)), and OR sits at the root: a OR (b AND (NOT (c IS NULL))).">
+    <legend class="quiz-q">3. Under FerricDB's 8-level binding-power table, how does <code>a OR b AND NOT c IS NULL</code> parse?</legend>
+    <label><input type="radio" name="q3"> <code>((a OR b) AND (NOT c)) IS NULL</code></label>
+    <label><input type="radio" name="q3" data-correct> <code>a OR (b AND (NOT (c IS NULL)))</code></label>
+    <label><input type="radio" name="q3"> <code>a OR ((b AND NOT c) IS NULL)</code></label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
 
-  <fieldset class="quiz" data-explain="SQLite compiles statements to bytecode run by the VDBE — sqlite3_prepare_v2 is the compiler. Postgres keeps a structural plan tree that the executor walks. FerricDB follows the Postgres school because tree representations are what its optimizer (Milestone 7) transforms.">
-    <legend class="quiz-q">What does SQLite's front-end ultimately produce?</legend>
-    <label><input type="radio" name="q4"> A plan tree the executor walks node by node</label>
-    <label><input type="radio" name="q4" data-correct> A bytecode program executed by a virtual machine (the VDBE)</label>
-    <label><input type="radio" name="q4"> Machine code, JIT-compiled per query</label>
+  <fieldset class="quiz" data-explain="A self-hosted catalog stores user-table metadata in system heap tables (__tables, __columns), but you cannot look up __columns's schema inside __columns before reading it. Hard-coding the bootstrap schemas and fixed page ids in code breaks the circularity cleanly.">
+    <legend class="quiz-q">4. How does a self-hosted system catalog break the chicken-and-egg problem when reopening a database file?</legend>
+    <label><input type="radio" name="q4"> It stores the catalog as a separate JSON file outside the database</label>
+    <label><input type="radio" name="q4" data-correct> The bootstrap system tables' schemas and root page ids are compile-time constants</label>
+    <label><input type="radio" name="q4"> It scans every heap page and infers column types from tuple bytes</label>
+    <button type="button" class="quiz-check">Check answer</button>
+    <div class="quiz-feedback" role="status"></div>
+  </fieldset>
+
+  <fieldset class="quiz" data-explain="Unquoted identifiers fold to lowercase (matching PostgreSQL), while case inside single-quoted string literals is preserved and doubled quotes ('') unescape to a single quote. Thus Users becomes Ident(&quot;users&quot;), COUNT(*) parses as Function(&quot;count&quot;, vec![]), and 'O''Brien' becomes StringLit(&quot;O'Brien&quot;).">
+    <legend class="quiz-q">5. How does FerricDB's lexer handle unquoted identifiers versus single-quoted string literals?</legend>
+    <label><input type="radio" name="q5"> Both are folded to lowercase, and strings escape quotes with <code>\'</code></label>
+    <label><input type="radio" name="q5"> Identifiers preserve original case, and strings are folded to lowercase</label>
+    <label><input type="radio" name="q5" data-correct> Unquoted identifiers fold to lowercase; string literals preserve case and unescape <code>''</code> to <code>'</code></label>
     <button type="button" class="quiz-check">Check answer</button>
     <div class="quiz-feedback" role="status"></div>
   </fieldset>
@@ -370,42 +714,47 @@ pub enum Expr {
     <h2 id="sec-sources">Primary sources</h2>
     <div class="refs">
       <ol>
-        <li id="ref-1">apache/datafusion-sqlparser-rs, README — the design statement: a Pratt
-          (top-down operator-precedence) expression parser inside a hand-written recursive
-          descent statement parser.
+        <li id="ref-1">apache/datafusion-sqlparser-rs, README — Pratt (top-down operator-precedence)
+          expression parser inside a hand-written recursive-descent statement parser in Rust.
           <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">https://github.com/apache/datafusion-sqlparser-rs</a></li>
-        <li id="ref-2">SQLite, "Architecture of SQLite" — the tokenizer→parser→code
-          generator→virtual machine pipeline, the Lemon parser generator, and SQL compiled to
-          bytecode.
+        <li id="ref-2">SQLite, "Architecture of SQLite" — push tokenizer → Lemon parser → code
+          generator → VDBE bytecode virtual machine.
           <a href="https://sqlite.org/arch.html" rel="external">https://sqlite.org/arch.html</a></li>
-        <li id="ref-3">Hironobu Suzuki, The Internals of PostgreSQL, §3.1 — the five query
-          processing subsystems: parser, analyzer, rewriter, planner, executor.
+        <li id="ref-3">Hironobu Suzuki, <em>The Internals of PostgreSQL</em>, §3.1 — the five
+          query-processing subsystems (parser, analyzer, rewriter, planner, executor) and catalog
+          lookup during semantic analysis.
           <a href="https://www.interdb.jp/pg/pgsql03/01.html" rel="external">https://www.interdb.jp/pg/pgsql03/01.html</a></li>
-        <li id="ref-4">cstack, "Let's Build a Simple Database", Part 2 — the world's simplest
-          SQL compiler and virtual machine.
+        <li id="ref-4">cstack, "Let's Build a Simple Database", Part&nbsp;2 — a minimal SQL
+          front-end compiler and virtual machine split.
           <a href="https://cstack.github.io/db_tutorial/parts/part2.html" rel="external">https://cstack.github.io/db_tutorial/parts/part2.html</a></li>
+        <li id="ref-5">PostgreSQL Documentation, "SQL Syntax — Lexical Structure" — unquoted
+          identifier case folding, doubled-quote string escaping, <code>--</code> comments, and
+          operator precedence.
+          <a href="https://www.postgresql.org/docs/current/sql-syntax-lexical.html" rel="external">https://www.postgresql.org/docs/current/sql-syntax-lexical.html</a></li>
+        <li id="ref-6">PostgreSQL Documentation, "System Catalogs" — self-hosted metadata in
+          <code>pg_class</code> and <code>pg_attribute</code>.
+          <a href="https://www.postgresql.org/docs/current/catalogs.html" rel="external">https://www.postgresql.org/docs/current/catalogs.html</a></li>
       </ol>
     </div>
 
     <h2 id="sec-deeper">Go deeper</h2>
     <ul>
-      <li>The sqlparser-rs source — read <code>parser/mod.rs</code> for what a production-scale
-        version of your Milestone 3 parser looks like (then be glad your grammar is smaller).
+      <li>The <code>sqlparser-rs</code> source — skim <code>src/parser/mod.rs</code> to see how a
+        production Rust Pratt parser scales up the exact pattern you build in Milestone&nbsp;3.
         <a href="https://github.com/apache/datafusion-sqlparser-rs" rel="external">github.com/apache/datafusion-sqlparser-rs</a></li>
-      <li>The Internals of PostgreSQL, §3.1.1–3.1.2 — the parse-tree and query-tree structures
-        for a real SELECT, with figures.
+      <li><em>The Internals of PostgreSQL</em>, §3.1.1–§3.1.2 — concrete parse-tree and query-tree
+        figures for a real <code>SELECT</code> statement.
         <a href="https://www.interdb.jp/pg/pgsql03/01.html" rel="external">interdb.jp/pg/pgsql03/01.html</a></li>
-      <li>SQLite, "The SQLite Bytecode Engine" — the VDBE opcode reference; skim what
-        <code>EXPLAIN</code> shows for a simple query in SQLite and compare it with a Postgres
-        plan tree.
+      <li>SQLite, "The SQLite Bytecode Engine" — inspect VDBE opcodes and compare SQLite's
+        <code>EXPLAIN</code> output with PostgreSQL's plan trees.
         <a href="https://sqlite.org/opcode.html" rel="external">sqlite.org/opcode.html</a></li>
     </ul>
 
     <h2 id="sec-milestone">Milestone link</h2>
     <p>What to build now: <a href="../../project/milestone-03/index.html">Milestone 3 — SQL
-    Front-End: Lexer, Parser, AST, Catalog, Binder</a>. Grammar scope: CREATE TABLE, DROP TABLE,
-    INSERT, SELECT with WHERE/ORDER BY/LIMIT, UPDATE, DELETE, and BEGIN/COMMIT/ROLLBACK (parsed
-    now, executed in Milestone 8) — plus the self-hosting catalog this page previewed.</p>
+    Front-End: Lexer, Parser, AST, Catalog, Binder</a>. Implement <code>crates/sql</code>, the
+    self-hosted <code>crates/catalog</code>, and <code>crates/exec::binder</code>, then wire
+    <code>.ast</code>, <code>.tables</code>, and <code>.schema</code> into your REPL.</p>
 
     <nav class="prevnext">
       <a href="../../project/milestone-02/index.html"><span class="dir">← Previous</span> Milestone 2 · Buffer Pool Manager</a>
@@ -417,9 +766,14 @@ pub enum Expr {
 <script>
 document.addEventListener("DOMContentLoaded", function () {
   "use strict";
+  if (!window.Course) return;
 
-  var KEYWORDS = ["SELECT","FROM","WHERE","ORDER","BY","LIMIT","AND","OR","NOT",
-                  "IS","NULL","AS","TRUE","FALSE","ASC","DESC"];
+  var KEYWORDS = [
+    "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "BY", "LIMIT",
+    "AND", "OR", "NOT", "IS", "NULL", "AS", "ASC", "DESC", "CAST",
+    "BOOLEAN", "INT", "INTEGER", "FLOAT", "DOUBLE", "TEXT", "VARCHAR"
+  ];
+  var TYPES = ["BOOLEAN", "INT", "INTEGER", "FLOAT", "DOUBLE", "TEXT", "VARCHAR"];
   var TWO_CHAR = ["<=", ">=", "!=", "<>"];
   var ONE_CHAR = "=<>+-*/%(),;.";
 
@@ -428,31 +782,43 @@ document.addEventListener("DOMContentLoaded", function () {
     while (i < src.length) {
       var c = src[i];
       if (/\s/.test(c)) { i++; continue; }
+      // -- line comment
+      if (c === "-" && src[i + 1] === "-") {
+        i += 2;
+        while (i < src.length && src[i] !== "\n") i++;
+        continue;
+      }
       var start = i;
       if (/[A-Za-z_]/.test(c)) {
         while (i < src.length && /[A-Za-z0-9_]/.test(src[i])) i++;
         var word = src.slice(start, i);
         var up = word.toUpperCase();
-        toks.push(KEYWORDS.indexOf(up) >= 0
-          ? { type: "keyword", text: up, pos: start }
-          : { type: "ident", text: word, pos: start });
+        if (up === "TRUE" || up === "FALSE") {
+          toks.push({ type: "bool", text: up === "TRUE" ? "true" : "false", pos: start });
+        } else if (KEYWORDS.indexOf(up) >= 0) {
+          toks.push({ type: "keyword", text: up, pos: start });
+        } else {
+          // PostgreSQL / FerricDB convention: fold unquoted identifiers to lowercase
+          toks.push({ type: "ident", text: word.toLowerCase(), pos: start });
+        }
       } else if (/[0-9]/.test(c)) {
         while (i < src.length && /[0-9]/.test(src[i])) i++;
         var isFloat = false;
         if (src[i] === "." && /[0-9]/.test(src[i + 1] || "")) {
-          isFloat = true; i++;
+          isFloat = true;
+          i++;
           while (i < src.length && /[0-9]/.test(src[i])) i++;
         }
-        toks.push({ type: isFloat ? "float" : "integer",
-                    text: src.slice(start, i), pos: start });
+        toks.push({ type: isFloat ? "float" : "integer", text: src.slice(start, i), pos: start });
       } else if (c === "'") {
         i++;
-        var val = "";
+        var val = "", closed = false;
         while (i < src.length) {
           if (src[i] === "'" && src[i + 1] === "'") { val += "'"; i += 2; }
-          else if (src[i] === "'") { i++; break; }
+          else if (src[i] === "'") { i++; closed = true; break; }
           else { val += src[i]; i++; }
         }
+        if (!closed) throw { msg: "unterminated string literal", pos: start };
         toks.push({ type: "string", text: val, pos: start });
       } else if (TWO_CHAR.indexOf(src.substr(i, 2)) >= 0) {
         toks.push({ type: "op", text: src.substr(i, 2), pos: start });
@@ -467,62 +833,111 @@ document.addEventListener("DOMContentLoaded", function () {
     return toks;
   }
 
-  // ---- Pratt parser over the token stream ----
+  // ---- Pratt parser (unified 8-level binding-power table) ----
   function Parser(toks) { this.toks = toks; this.i = 0; }
   Parser.prototype.peek = function () { return this.toks[this.i] || null; };
   Parser.prototype.next = function () { return this.toks[this.i++] || null; };
+  Parser.prototype.isKw = function (kw) {
+    var t = this.peek();
+    return !!(t && t.type === "keyword" && t.text === kw);
+  };
+  Parser.prototype.isPunct = function (ch) {
+    var t = this.peek();
+    return !!(t && t.type === "punct" && t.text === ch);
+  };
+  Parser.prototype.isOp = function (op) {
+    var t = this.peek();
+    return !!(t && t.type === "op" && t.text === op);
+  };
   Parser.prototype.err = function (msg) {
     var t = this.peek();
-    throw { msg: msg + (t ? " (found '" + t.text + "')" : " (found end of input)"),
+    throw { msg: msg + (t ? " (found " + t.type + " '" + t.text + "')" : " (found end of input)"),
             pos: t ? t.pos : -1 };
   };
   Parser.prototype.expectKw = function (kw) {
-    var t = this.next();
-    if (!t || t.type !== "keyword" || t.text !== kw) {
-      this.i--; this.err("expected " + kw);
-    }
+    if (!this.isKw(kw)) this.err("expected keyword " + kw);
+    return this.next();
+  };
+  Parser.prototype.expectPunct = function (ch) {
+    if (!this.isPunct(ch)) this.err("expected '" + ch + "'");
+    return this.next();
   };
 
-  var BP = { "OR": 1, "AND": 2, "=": 4, "!=": 4, "<>": 4, "<": 4, "<=": 4,
-             ">": 4, ">=": 4, "+": 5, "-": 5, "*": 6, "/": 6, "%": 6 };
+  var BP = {
+    "OR": 1, "AND": 2,
+    "=": 5, "!=": 5, "<>": 5, "<": 5, "<=": 5, ">": 5, ">=": 5,
+    "+": 6, "-": 6,
+    "*": 7, "/": 7, "%": 7
+  };
 
   Parser.prototype.parseExpr = function (minBp) {
     var t = this.next(), lhs;
     if (!t) this.err("expected an expression");
-    if (t.type === "integer" || t.type === "float") lhs = { node: "Literal", v: t.text };
-    else if (t.type === "string") lhs = { node: "Literal", v: "'" + t.text + "'" };
-    else if (t.type === "keyword" && (t.text === "TRUE" || t.text === "FALSE"))
+    if (t.type === "integer" || t.type === "float" || t.type === "bool") {
       lhs = { node: "Literal", v: t.text };
-    else if (t.type === "keyword" && t.text === "NULL") lhs = { node: "Literal", v: "NULL" };
-    else if (t.type === "keyword" && t.text === "NOT")
+    } else if (t.type === "string") {
+      lhs = { node: "Literal", v: "'" + t.text + "'" };
+    } else if (t.type === "keyword" && t.text === "NULL") {
+      lhs = { node: "Literal", v: "NULL" };
+    } else if (t.type === "keyword" && t.text === "NOT") {
       lhs = { node: "Unary(Not)", kids: [this.parseExpr(3)] };
-    else if (t.type === "op" && t.text === "-")
-      lhs = { node: "Unary(Neg)", kids: [this.parseExpr(7)] };
-    else if (t.type === "punct" && t.text === "(") {
+    } else if (t.type === "op" && t.text === "-") {
+      lhs = { node: "Unary(Neg)", kids: [this.parseExpr(8)] };
+    } else if (t.type === "keyword" && t.text === "CAST") {
+      this.expectPunct("(");
+      var inner = this.parseExpr(0);
+      this.expectKw("AS");
+      var ty = this.next();
+      if (!ty || ty.type !== "keyword" || TYPES.indexOf(ty.text) < 0) {
+        if (ty) this.i--;
+        this.err("expected a SQL type name after AS");
+      }
+      this.expectPunct(")");
+      lhs = { node: "Cast(" + ty.text + ")", kids: [inner] };
+    } else if (t.type === "punct" && t.text === "(") {
       lhs = this.parseExpr(0);
-      var close = this.next();
-      if (!close || close.text !== ")") { this.i--; this.err("expected )"); }
-    }
-    else if (t.type === "ident") {
-      if (this.peek() && this.peek().text === "." ) {
+      this.expectPunct(")");
+    } else if (t.type === "ident") {
+      if (this.isPunct("(")) {
+        // Function call (e.g. COUNT(*), SUM(total))
+        this.next();
+        var args = [];
+        if (this.isOp("*") && t.text === "count") {
+          this.next(); // COUNT(*) → Function("count", [])
+        } else if (!this.isPunct(")")) {
+          for (;;) {
+            args.push(this.parseExpr(0));
+            if (this.isPunct(",")) { this.next(); continue; }
+            break;
+          }
+        }
+        this.expectPunct(")");
+        lhs = { node: "Function(" + t.text + ")", kids: args };
+      } else if (this.isPunct(".")) {
         this.next();
         var col = this.next();
-        if (!col || col.type !== "ident") { this.i--; this.err("expected a column name after ."); }
+        if (!col || col.type !== "ident") {
+          if (col) this.i--;
+          this.err("expected a column name after '.'");
+        }
         lhs = { node: "Column(" + t.text + "." + col.text + ")" };
-      } else lhs = { node: "Column(" + t.text + ")" };
+      } else {
+        lhs = { node: "Column(" + t.text + ")" };
+      }
+    } else {
+      this.i--;
+      this.err("expected an expression");
     }
-    else if (t.type === "op" && t.text === "*") lhs = { node: "Wildcard(*)" };
-    else { this.i--; this.err("expected an expression"); }
 
     for (;;) {
       var nt = this.peek();
       if (!nt) break;
-      // IS [NOT] NULL postfix
+      // Postfix IS [NOT] NULL at binding power 4
       if (nt.type === "keyword" && nt.text === "IS") {
         if (4 < minBp) break;
         this.next();
         var neg = false;
-        if (this.peek() && this.peek().text === "NOT") { this.next(); neg = true; }
+        if (this.isKw("NOT")) { this.next(); neg = true; }
         this.expectKw("NULL");
         lhs = { node: neg ? "IsNotNull" : "IsNull", kids: [lhs] };
         continue;
@@ -545,56 +960,93 @@ document.addEventListener("DOMContentLoaded", function () {
     var root = { node: "Select", kids: [] };
     var proj = { node: "projection", kids: [] };
     for (;;) {
-      var e = this.parseExpr(0);
-      if (this.peek() && this.peek().type === "keyword" && this.peek().text === "AS") {
+      var item;
+      if (this.isOp("*")) {
         this.next();
-        var alias = this.next();
-        if (!alias || alias.type !== "ident") { this.i--; this.err("expected an alias after AS"); }
-        e = { node: "Alias(" + alias.text + ")", kids: [e] };
+        item = { node: "Wildcard(*)" };
+      } else {
+        item = this.parseExpr(0);
+        if (this.isKw("AS")) {
+          this.next();
+          var alias = this.next();
+          if (!alias || alias.type !== "ident") {
+            if (alias) this.i--;
+            this.err("expected an alias after AS");
+          }
+          item = { node: "Alias(" + alias.text + ")", kids: [item] };
+        }
       }
-      proj.kids.push(e);
-      if (this.peek() && this.peek().text === ",") { this.next(); continue; }
+      proj.kids.push(item);
+      if (this.isPunct(",")) { this.next(); continue; }
       break;
     }
     root.kids.push(proj);
-    if (this.peek() && this.peek().text === "FROM") {
+    if (this.isKw("FROM")) {
       this.next();
       var tbl = this.next();
-      if (!tbl || tbl.type !== "ident") { this.i--; this.err("expected a table name"); }
-      root.kids.push({ node: "from: " + tbl.text });
+      if (!tbl || tbl.type !== "ident") {
+        if (tbl) this.i--;
+        this.err("expected a table name after FROM");
+      }
+      var fromLabel = tbl.text;
+      if (this.isKw("AS")) {
+        this.next();
+        var ta = this.next();
+        if (!ta || ta.type !== "ident") {
+          if (ta) this.i--;
+          this.err("expected a table alias after AS");
+        }
+        fromLabel += " AS " + ta.text;
+      }
+      root.kids.push({ node: "from: " + fromLabel });
     }
-    if (this.peek() && this.peek().text === "WHERE") {
+    if (this.isKw("WHERE")) {
       this.next();
       root.kids.push({ node: "filter", kids: [this.parseExpr(0)] });
     }
-    if (this.peek() && this.peek().text === "ORDER") {
-      this.next(); this.expectKw("BY");
+    if (this.isKw("GROUP")) {
+      this.next();
+      this.expectKw("BY");
+      var gb = { node: "group_by", kids: [] };
+      for (;;) {
+        gb.kids.push(this.parseExpr(0));
+        if (this.isPunct(",")) { this.next(); continue; }
+        break;
+      }
+      root.kids.push(gb);
+    }
+    if (this.isKw("ORDER")) {
+      this.next();
+      this.expectKw("BY");
       var ob = { node: "order_by", kids: [] };
       for (;;) {
         var k = this.parseExpr(0);
         var dir = "ASC";
-        if (this.peek() && (this.peek().text === "ASC" || this.peek().text === "DESC"))
-          dir = this.next().text;
+        if (this.isKw("ASC") || this.isKw("DESC")) dir = this.next().text;
         ob.kids.push({ node: dir, kids: [k] });
-        if (this.peek() && this.peek().text === ",") { this.next(); continue; }
+        if (this.isPunct(",")) { this.next(); continue; }
         break;
       }
       root.kids.push(ob);
     }
-    if (this.peek() && this.peek().text === "LIMIT") {
+    if (this.isKw("LIMIT")) {
       this.next();
       var n = this.next();
-      if (!n || n.type !== "integer") { this.i--; this.err("expected an integer after LIMIT"); }
+      if (!n || n.type !== "integer") {
+        if (n) this.i--;
+        this.err("expected an integer after LIMIT");
+      }
       root.kids.push({ node: "limit: " + n.text });
     }
-    if (this.peek() && this.peek().text === ";") this.next();
+    while (this.isPunct(";")) this.next();
     if (this.peek()) this.err("unexpected trailing input");
     return root;
   };
 
   function renderTree(node, depth) {
     var pad = new Array(depth + 1).join("  ");
-    var out = pad + (depth ? "└ " : "") + node.node + "\n";
+    var label = node.node + (node.v != null ? "(" + node.v + ")" : "");
+    var out = pad + (depth ? "└ " : "") + label + "\n";
     (node.kids || []).forEach(function (k) { out += renderTree(k, depth + 1); });
     return out;
   }
@@ -602,7 +1054,9 @@ document.addEventListener("DOMContentLoaded", function () {
   var input = document.getElementById("fe-input");
   var tokBox = document.getElementById("fe-tokens");
   var astBox = document.getElementById("fe-ast");
-  var DEFAULT = "SELECT name, age FROM users WHERE age >= 18 AND NOT banned ORDER BY age DESC LIMIT 10;";
+  if (!input || !tokBox || !astBox) return;
+
+  var DEFAULT = "SELECT name, age FROM users WHERE age >= 18 AND NOT banned IS NULL ORDER BY age DESC LIMIT 10;";
 
   function update() {
     var src = input.value;
@@ -619,6 +1073,10 @@ document.addEventListener("DOMContentLoaded", function () {
           return String(t.pos).padStart(3) + "  " + t.type.padEnd(8) + " " + t.text;
         }).join("\n")
       : "(no tokens)";
+    if (!toks.length) {
+      astBox.textContent = "(empty statement)";
+      return;
+    }
     try {
       var ast = new Parser(toks).parseSelect();
       astBox.textContent = renderTree(ast, 0);
